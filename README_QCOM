@@ -30,9 +30,9 @@ After Cloning/downloading the above submodules, copy the content to respective s
 
 Please make sure that versions of openocd repo & submodules are as per release notes
 
-=============================
+============================
 Commands to build
-=============================
+============================
 Open ucrt64.exe from the msys folder and cd to the root of openocd.
 
 Before building the opeocd, make sure that boost library,include paths are correct inside <root>\src\jtag\drivers\eud\Makefile.am (LIBADD,CPPFLAGS)
