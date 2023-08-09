@@ -30,7 +30,10 @@ noinst_LTLIBRARIES += %D%/libtarget.la
 	%D%/dsp5680xx.c \
 	%D%/hla_target.c \
 	$(ARMV8_SRC) \
-	$(MIPS64_SRC)
+	$(MIPS64_SRC) \
+	$(HEXAGON_SRC) \
+	$(HEXAGON_ADSP_SRC) \
+	$(HEXAGON_CDSP_SRC)
 
 if HAVE_CAPSTONE
 %C%_libtarget_la_CPPFLAGS += $(CAPSTONE_CFLAGS)
@@ -90,7 +93,8 @@ ARMV8_SRC = \
 	%D%/aarch64.c \
 	%D%/a64_disassembler.c \
 	%D%/armv8.c \
-	%D%/armv8_cache.c
+	%D%/armv8_cache.c \
+	%D%/aarch64_coproc_reg.c         
 
 ARM_DEBUG_SRC = \
 	%D%/arm_dpm.c \
@@ -165,6 +169,15 @@ ARC_SRC = \
         %D%/arc_cmd.c \
         %D%/arc_jtag.c \
         %D%/arc_mem.c
+
+HEXAGON_SRC = \
+        %D%/hexagon.c 
+		
+HEXAGON_CDSP_SRC = \
+        %D%/hexagon_cdsp.c 
+		
+HEXAGON_ADSP_SRC = \
+        %D%/hexagon_adsp.c 
 
 %C%_libtarget_la_SOURCES += \
 	%D%/algorithm.h \
@@ -260,7 +273,12 @@ ARC_SRC = \
 	%D%/arc_cmd.h \
 	%D%/arc_jtag.h \
 	%D%/arc_mem.h \
-	%D%/rtt.h
+	%D%/rtt.h \
+	%D%/hexagon.h \
+	%D%/hexagon_adsp.h \
+	%D%/hexagon_cdsp.h \
+	%D%/aarch64_system_register.h \
+	%D%/aarch64_system_registers_defs.h		
 
 include %D%/openrisc/Makefile.am
 include %D%/riscv/Makefile.am

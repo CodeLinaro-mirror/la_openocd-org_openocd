@@ -24,6 +24,9 @@
  *                                                                         *
  *   Copyright (C) 2011 Andreas Fritiofson                                 *
  *   andreas.fritiofson@gmail.com                                          *
+ *                                                                         *
+ *   Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
+ *   All rights reserved.                                                  *
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -64,6 +67,8 @@ static int target_get_gdb_fileio_info_default(struct target *target,
 		struct gdb_fileio_info *fileio_info);
 static int target_gdb_fileio_end_default(struct target *target, int retcode,
 		int fileio_errno, bool ctrl_c);
+int target_profiling_default(struct target *target, uint32_t *samples,
+		uint32_t max_num_samples, uint32_t *num_samples, uint32_t seconds);
 
 /* targets */
 extern struct target_type arm7tdmi_target;
@@ -81,6 +86,9 @@ extern struct target_type xtensa_chip_target;
 extern struct target_type cortexm_target;
 extern struct target_type cortexa_target;
 extern struct target_type aarch64_target;
+extern struct target_type hexagon_target;
+extern struct target_type hexagon_cdsp_target;
+extern struct target_type hexagon_adsp_target;
 extern struct target_type cortexr4_target;
 extern struct target_type arm11_target;
 extern struct target_type ls1_sap_target;
@@ -148,6 +156,9 @@ static struct target_type *target_types[] = {
 	&arcv2_target,
 	&aarch64_target,
 	&mips_mips64_target,
+	&hexagon_target,
+	&hexagon_cdsp_target,
+	&hexagon_adsp_target,
 	NULL,
 };
 
@@ -3065,7 +3076,11 @@ static int handle_target(void *priv)
 			}
 			if (target->backoff.times > 0) {
 				LOG_USER("Polling target %s failed, trying to reexamine", target_name(target));
-				target_reset_examined(target);
+				if(target->examined==false)
+				{
+					target_reset_examined(target);
+					
+				}
 				retval = target_examine_one(target);
 				/* Target examination could have failed due to unstable connection,
 				 * but we set the examined flag anyway to repoll it later */

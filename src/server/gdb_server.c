@@ -20,7 +20,10 @@
  *   Hsiangkai Wang <hkwang@andestech.com>                                 *
  *                                                                         *
  *   Copyright (C) 2013 Franck Jullien                                     *
- *   elec4fun@gmail.com                                                    *
+ *   elec4fun@gmail.com                                                    * 
+ *                                                                         *
+ *   Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
+ *   All rights reserved.                                                  *
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -40,6 +43,12 @@
 #include <jtag/jtag.h>
 #include "rtos/rtos.h"
 #include "target/smp.h"
+#include "target/arm.h"
+#include "target/hexagon.h"
+#include "target/hexagon_cdsp.h"
+
+#define GDB 0
+#define LLDB 1
 
 /**
  * @file
@@ -115,6 +124,8 @@ static void gdb_log_callback(void *priv, const char *file, unsigned line,
 
 static void gdb_sig_halted(struct connection *connection);
 
+static int gdb_qregister_packet(struct connection *connection, char const *packet, int packet_size);
+
 /* number of gdb connections, mainly to suppress gdb related debugging spam
  * in helper/log.c when no gdb connections are actually active */
 int gdb_actual_connections;
@@ -142,6 +153,249 @@ static int gdb_use_target_description = 1;
 
 /* current processing free-run type, used by file-I/O */
 static char gdb_running_type;
+
+char *hexagon_regiterinfo[] = {
+	"name:r00;alt-name:R0;bitsize:32;variable-size:0;offset:0;encoding:uint;format:hex;set:Thread Registers;gcc:0;dwarf:0;generic:;",
+	"name:r01;alt-name:R1;bitsize:32;variable-size:0;offset:4;encoding:uint;format:hex;set:Thread Registers;gcc:1;dwarf:1;generic:;",
+	"name:r02;alt-name:R2;bitsize:32;variable-size:0;offset:8;encoding:uint;format:hex;set:Thread Registers;gcc:2;dwarf:2;generic:;",
+	"name:r03;alt-name:R3;bitsize:32;variable-size:0;offset:12;encoding:uint;format:hex;set:Thread Registers;gcc:3;dwarf:3;generic:;",
+	"name:r04;alt-name:R4;bitsize:32;variable-size:0;offset:16;encoding:uint;format:hex;set:Thread Registers;gcc:4;dwarf:4;generic:;",
+	"name:r05;alt-name:R5;bitsize:32;variable-size:0;offset:20;encoding:uint;format:hex;set:Thread Registers;gcc:5;dwarf:5;generic:;",
+	"name:r06;alt-name:R6;bitsize:32;variable-size:0;offset:24;encoding:uint;format:hex;set:Thread Registers;gcc:6;dwarf:6;generic:;",
+	"name:r07;alt-name:R7;bitsize:32;variable-size:0;offset:28;encoding:uint;format:hex;set:Thread Registers;gcc:7;dwarf:7;generic:;",
+	"name:r08;alt-name:R8;bitsize:32;variable-size:0;offset:32;encoding:uint;format:hex;set:Thread Registers;gcc:8;dwarf:8;generic:;",
+	"name:r09;alt-name:R9;bitsize:32;variable-size:0;offset:36;encoding:uint;format:hex;set:Thread Registers;gcc:9;dwarf:9;generic:;",
+	"name:r10;alt-name:R10;bitsize:32;variable-size:0;offset:40;encoding:uint;format:hex;set:Thread Registers;gcc:10;dwarf:10;generic:;",
+	"name:r11;alt-name:R11;bitsize:32;variable-size:0;offset:44;encoding:uint;format:hex;set:Thread Registers;gcc:11;dwarf:11;generic:;",
+	"name:r12;alt-name:R12;bitsize:32;variable-size:0;offset:48;encoding:uint;format:hex;set:Thread Registers;gcc:12;dwarf:12;generic:;",
+	"name:r13;alt-name:R13;bitsize:32;variable-size:0;offset:52;encoding:uint;format:hex;set:Thread Registers;gcc:13;dwarf:13;generic:;",
+	"name:r14;alt-name:R14;bitsize:32;variable-size:0;offset:56;encoding:uint;format:hex;set:Thread Registers;gcc:14;dwarf:14;generic:;",
+	"name:r15;alt-name:R15;bitsize:32;variable-size:0;offset:60;encoding:uint;format:hex;set:Thread Registers;gcc:15;dwarf:15;generic:;",
+	"name:r16;alt-name:R16;bitsize:32;variable-size:0;offset:64;encoding:uint;format:hex;set:Thread Registers;gcc:16;dwarf:16;generic:;",
+	"name:r17;alt-name:R17;bitsize:32;variable-size:0;offset:68;encoding:uint;format:hex;set:Thread Registers;gcc:17;dwarf:17;generic:;",
+	"name:r18;alt-name:R18;bitsize:32;variable-size:0;offset:72;encoding:uint;format:hex;set:Thread Registers;gcc:18;dwarf:18;generic:;",
+	"name:r19;alt-name:R19;bitsize:32;variable-size:0;offset:76;encoding:uint;format:hex;set:Thread Registers;gcc:19;dwarf:19;generic:;",
+	"name:r20;alt-name:R20;bitsize:32;variable-size:0;offset:80;encoding:uint;format:hex;set:Thread Registers;gcc:20;dwarf:20;generic:;",
+	"name:r21;alt-name:R21;bitsize:32;variable-size:0;offset:84;encoding:uint;format:hex;set:Thread Registers;gcc:21;dwarf:21;generic:;",
+	"name:r22;alt-name:R22;bitsize:32;variable-size:0;offset:88;encoding:uint;format:hex;set:Thread Registers;gcc:21;dwarf:22;generic:;",
+	"name:r23;alt-name:R23;bitsize:32;variable-size:0;offset:92;encoding:uint;format:hex;set:Thread Registers;gcc:23;dwarf:23;generic:;",
+	"name:r24;alt-name:R24;bitsize:32;variable-size:0;offset:96;encoding:uint;format:hex;set:Thread Registers;gcc:24;dwarf:24;generic:;",
+	"name:r25;alt-name:R25;bitsize:32;variable-size:0;offset:100;encoding:uint;format:hex;set:Thread Registers;gcc:25;dwarf:25;generic:;",
+	"name:r26;alt-name:R26;bitsize:32;variable-size:0;offset:104;encoding:uint;format:hex;set:Thread Registers;gcc:26;dwarf:26;generic:;",
+	"name:r27;alt-name:R27;bitsize:32;variable-size:0;offset:108;encoding:uint;format:hex;set:Thread Registers;gcc:27;dwarf:27;generic:;",
+	"name:r28;alt-name:R28;bitsize:32;variable-size:0;offset:112;encoding:uint;format:hex;set:Thread Registers;gcc:28;dwarf:28;generic:;",
+	"name:r29;alt-name:sp;bitsize:32;variable-size:0;offset:116;encoding:uint;format:hex;set:Thread Registers;gcc:29;dwarf:29;generic:sp;",
+	"name:r30;alt-name:fp;bitsize:32;variable-size:0;offset:120;encoding:uint;format:hex;set:Thread Registers;gcc:30;dwarf:30;generic:fp;",
+	"name:r31;alt-name:lr;bitsize:32;variable-size:0;offset:124;encoding:uint;format:hex;set:Thread Registers;gcc:31;dwarf:31;generic:ra;",
+	"name:sa0;alt-name:R32;bitsize:32;variable-size:0;offset:128;encoding:uint;format:hex;set:Thread Registers;gcc:67;dwarf:67;generic:;",
+	"name:lc0;alt-name:R33;bitsize:32;variable-size:0;offset:132;encoding:uint;format:hex;set:Thread Registers;gcc:68;dwarf:68;generic:;",
+	"name:sa1;alt-name:R34;bitsize:32;variable-size:0;offset:136;encoding:uint;format:hex;set:Thread Registers;gcc:69;dwarf:69;generic:;",
+	"name:lc1;alt-name:R35;bitsize:32;variable-size:0;offset:140;encoding:uint;format:hex;set:Thread Registers;gcc:70;dwarf:70;generic:;",
+	"name:p3_0;alt-name:R36;bitsize:32;variable-size:0;offset:144;encoding:uint;format:hex;set:Thread Registers;gcc:71;dwarf:71;generic:;",
+	"name:m0;alt-name:R37;bitsize:32;variable-size:0;offset:148;encoding:uint;format:hex;set:Thread Registers;gcc:72;dwarf:72;generic:;",
+	"name:m1;alt-name:R38;bitsize:32;variable-size:0;offset:152;encoding:uint;format:hex;set:Thread Registers;gcc:73;dwarf:73;generic:;",
+	"name:usr;alt-name:R39;bitsize:32;variable-size:0;offset:156;encoding:uint;format:hex;set:Thread Registers;gcc:74;dwarf:74;generic:;",
+	"name:pc;alt-name:R40;bitsize:32;variable-size:0;offset:160;encoding:uint;format:hex;set:Thread Registers;gcc:75;dwarf:75;generic:pc;",
+	"name:ugp;alt-name:R41;bitsize:32;variable-size:0;offset:164;encoding:uint;format:hex;set:Thread Registers;gcc:76;dwarf:76;generic:;",
+	"name:gp;alt-name:R42;bitsize:32;variable-size:0;offset:168;encoding:uint;format:hex;set:Thread Registers;gcc:77;dwarf:77;generic:;",
+	"name:cs0;alt-name:R43;bitsize:32;variable-size:0;offset:172;encoding:uint;format:hex;set:Thread Registers;gcc:78;dwarf:78;generic:;",
+	"name:cs1;alt-name:R44;bitsize:32;variable-size:0;offset:176;encoding:uint;format:hex;set:Thread Registers;gcc:79;dwarf:79;generic:;",
+	"name:upcyclelo;alt-name:R45;bitsize:32;variable-size:0;offset:180;encoding:uint;format:hex;set:Thread Registers;gcc:80;dwarf:80;generic:;",
+	"name:upcyclehi;alt-name:R46;bitsize:32;variable-size:0;offset:184;encoding:uint;format:hex;set:Thread Registers;gcc:81;dwarf:81;generic:;",
+	"name:framelimit;alt-name:R47;bitsize:32;variable-size:0;offset:188;encoding:uint;format:hex;set:Thread Registers;gcc:82;dwarf:82;generic:;",
+	"name:framekey;alt-name:R48;bitsize:32;variable-size:0;offset:192;encoding:uint;format:hex;set:Thread Registers;gcc:83;dwarf:83;generic:;",
+	"name:pktcountlo;alt-name:R49;bitsize:32;variable-size:0;offset:196;encoding:uint;format:hex;set:Thread Registers;gcc:84;dwarf:84;generic:;",
+	"name:pktcounthi;alt-name:R50;bitsize:32;variable-size:0;offset:200;encoding:uint;format:hex;set:Thread Registers;gcc:85;dwarf:85;generic:;",
+	"name:utimerlo;alt-name:R51;bitsize:32;variable-size:0;offset:204;encoding:uint;format:hex;set:Thread Registers;gcc:86;dwarf:86;generic:;",
+	"name:utimerhi;alt-name:R52;bitsize:32;variable-size:0;offset:208;encoding:uint;format:hex;set:Thread Registers;gcc:87;dwarf:87;generic:;",
+	"name:sgp0;alt-name:R53;bitsize:32;variable-size:0;offset:212;encoding:uint;format:hex;set:Thread Registers;gcc:124;dwarf:124;generic:;",
+	"name:sgp1;alt-name:R54;bitsize:32;variable-size:0;offset:216;encoding:uint;format:hex;set:Thread Registers;gcc:125;dwarf:125;generic:;",
+	"name:stid;alt-name:R55;bitsize:32;variable-size:0;offset:220;encoding:uint;format:hex;set:Thread Registers;gcc:126;dwarf:126;generic:;",
+	"name:elr;alt-name:R56;bitsize:32;variable-size:0;offset:224;encoding:uint;format:hex;set:Thread Registers;gcc:127;dwarf:127;generic:;",
+	"name:badva0;alt-name:R57;bitsize:32;variable-size:0;offset:228;encoding:uint;format:hex;set:Thread Registers;gcc:128;dwarf:128;generic:;",
+	"name:badva1;alt-name:R58;bitsize:32;variable-size:0;offset:232;encoding:uint;format:hex;set:Thread Registers;gcc:129;dwarf:129;generic:;",
+	"name:ssr;alt-name:R59;bitsize:32;variable-size:0;offset:236;encoding:uint;format:hex;set:Thread Registers;gcc:130;dwarf:130;generic:;",
+	"name:ccr;alt-name:R60;bitsize:32;variable-size:0;offset:240;encoding:uint;format:hex;set:Thread Registers;gcc:131;dwarf:131;generic:;",
+	"name:htid;alt-name:R61;bitsize:32;variable-size:0;offset:244;encoding:uint;format:hex;set:Thread Registers;gcc:132;dwarf:132;generic:;",
+	"name:badva;alt-name:R62;bitsize:32;variable-size:0;offset:248;encoding:uint;format:hex;set:Thread Registers;gcc:133;dwarf:133;generic:;",
+	"name:imask;alt-name:R63;bitsize:32;variable-size:0;offset:252;encoding:uint;format:hex;set:Thread Registers;gcc:134;dwarf:134;generic:;",
+	"name:gevb;alt-name:R64;bitsize:32;variable-size:0;offset:256;encoding:uint;format:hex;set:Thread Registers;gcc:75;dwarf:75;generic:;",
+	"name:evb;alt-name:;bitsize:32;variable-size:0;offset:260;encoding:uint;format:hex;set:Global Registers;gcc:135;dwarf:135;generic:;",
+	"name:modectl;alt-name:;bitsize:32;variable-size:0;offset:264;encoding:uint;format:hex;set:Global Registers;gcc:136;dwarf:136;generic:;",
+	"name:syscfg;alt-name:;bitsize:32;variable-size:0;offset:268;encoding:uint;format:hex;set:Global Registers;gcc:137;dwarf:137;generic:;",
+	"name:ipendad;alt-name:;bitsize:32;variable-size:0;offset:272;encoding:uint;format:hex;set:Global Registers;gcc:138;dwarf:138;generic:;",
+	"name:vid;alt-name:;bitsize:32;variable-size:0;offset:276;encoding:uint;format:hex;set:Global Registers;gcc:139;dwarf:139;generic:;",
+	"name:vid1;alt-name:;bitsize:32;variable-size:0;offset:280;encoding:uint;format:hex;set:Global Registers;gcc:140;dwarf:140;generic:;",
+	"name:bestwait;alt-name:;bitsize:32;variable-size:0;offset:284;encoding:uint;format:hex;set:Global Registers;gcc:0;dwarf:0;generic:;",
+	"name:schedcfg;alt-name:;bitsize:32;variable-size:0;offset:288;encoding:uint;format:hex;set:Global Registers;gcc:0;dwarf:0;generic:;",
+	"name:cfgbase;alt-name:;bitsize:32;variable-size:0;offset:292;encoding:uint;format:hex;set:Global Registers;gcc:143;dwarf:143;generic:;",
+	"name:diag;alt-name:;bitsize:32;variable-size:0;offset:296;encoding:uint;format:hex;set:Global Registers;gcc:144;dwarf:144;generic:;",
+	"name:rev;alt-name:;bitsize:32;variable-size:0;offset:300;encoding:uint;format:hex;set:Global Registers;gcc:145;dwarf:145;generic:;",
+	"name:pcyclelo;alt-name:;bitsize:32;variable-size:0;offset:304;encoding:uint;format:hex;set:Global Registers;gcc:146;dwarf:146;generic:;",
+	"name:pcyclehi;alt-name:;bitsize:32;variable-size:0;offset:308;encoding:uint;format:hex;set:Global Registers;gcc:147;dwarf:147;generic:;",
+	"E45"};
+
+/* qregister response packet for aarch64, arm and hexagon register */
+char *qregiterinfo_aarch64[] = {
+	"name:x0;bitsize:64;offset:0;encoding:uint;format:hex;set:General;",
+	"name:x1;bitsize:64;offset:8;encoding:uint;format:hex;set:General;",
+	"name:x2;bitsize:64;offset:16;encoding:uint;format:hex;set:General;",
+	"name:x3;bitsize:64;offset:24;encoding:uint;format:hex;set:General;",
+	"name:x4;bitsize:64;offset:32;encoding:uint;format:hex;set:General;",
+	"name:x5;bitsize:64;offset:40;encoding:uint;format:hex;set:General;",
+	"name:x6;bitsize:64;offset:48;encoding:uint;format:hex;set:General;",
+	"name:x7;bitsize:64;offset:56;encoding:uint;format:hex;set:General;",
+	"name:x8;bitsize:64;offset:64;encoding:uint;format:hex;set:General;",
+	"name:x9;bitsize:64;offset:72;encoding:uint;format:hex;set:General;",
+	"name:x10;bitsize:64;offset:80;encoding:uint;format:hex;set:General;",
+	"name:x11;bitsize:64;offset:88;encoding:uint;format:hex;set:General;",
+	"name:x12;bitsize:64;offset:96;encoding:uint;format:hex;set:General;",
+	"name:x13;bitsize:64;offset:104;encoding:uint;format:hex;set:General;",
+	"name:x14;bitsize:64;offset:112;encoding:uint;format:hex;set:General;",
+	"name:x15;bitsize:64;offset:120;encoding:uint;format:hex;set:General;",
+	"name:x16;bitsize:64;offset:128;encoding:uint;format:hex;set:General;",
+	"name:x17;bitsize:64;offset:136;encoding:uint;format:hex;set:General;",
+	"name:x18;bitsize:64;offset:144;encoding:uint;format:hex;set:General;",
+	"name:x19;bitsize:64;offset:152;encoding:uint;format:hex;set:General;",
+	"name:x20;bitsize:64;offset:160;encoding:uint;format:hex;set:General;",
+	"name:x21;bitsize:64;offset:168;encoding:uint;format:hex;set:General;",
+	"name:x22;bitsize:64;offset:176;encoding:uint;format:hex;set:General;",
+	"name:x23;bitsize:64;offset:184;encoding:uint;format:hex;set:General;",
+	"name:x24;bitsize:64;offset:192;encoding:uint;format:hex;set:General;",
+	"name:x25;bitsize:64;offset:200;encoding:uint;format:hex;set:General;",
+	"name:x26;bitsize:64;offset:208;encoding:uint;format:hex;set:General;",
+	"name:x27;bitsize:64;offset:216;encoding:uint;format:hex;set:General;",
+	"name:x28;bitsize:64;offset:224;encoding:uint;format:hex;set:General;",
+	"name:x29;bitsize:64;offset:232;encoding:uint;format:hex;set:General;",
+	"name:x30;bitsize:64;offset:240;encoding:uint;format:hex;set:General;",
+	"name:sp;bitsize:64;offset:248;encoding:uint;format:hex;set:General;",
+	"name:pc;bitsize:64;offset:256;encoding:uint;format:hex;set:General;",
+	"name:cpsr;bitsize:32;offset:260;encoding:uint;format:hex;set:General;",
+	"name:v0;bitsize:128;offset:276;encoding:uint;format:hex;set:simdfp;",
+	"name:v1;bitsize:128;offset:292;encoding:uint;format:hex;set:simdfp;",
+	"name:v2;bitsize:128;offset:308;encoding:uint;format:hex;set:simdfp;",
+	"name:v3;bitsize:128;offset:324;encoding:uint;format:hex;set:simdfp;",
+	"name:v4;bitsize:128;offset:340;encoding:uint;format:hex;set:simdfp;",
+	"name:v5;bitsize:128;offset:356;encoding:uint;format:hex;set:simdfp;",
+	"name:v6;bitsize:128;offset:372;encoding:uint;format:hex;set:simdfp;",
+	"name:v7;bitsize:128;offset:398;encoding:uint;format:hex;set:simdfp;",
+	"name:v8;bitsize:128;offset:414;encoding:uint;format:hex;set:simdfp;",
+	"name:v9;bitsize:128;offset:430;encoding:uint;format:hex;set:simdfp;",
+	"name:v10;bitsize:128;offset:446;encoding:uint;format:hex;set:simdfp;",
+	"name:v11;bitsize:128;offset:462;encoding:uint;format:hex;set:simdfp;",
+	"name:v12;bitsize:128;offset:478;encoding:uint;format:hex;set:simdfp;",
+	"name:v13;bitsize:128;offset:494;encoding:uint;format:hex;set:simdfp;",
+	"name:v14;bitsize:128;offset:510;encoding:uint;format:hex;set:simdfp;",
+	"name:v15;bitsize:128;offset:526;encoding:uint;format:hex;set:simdfp;",
+	"name:v16;bitsize:128;offset:542;encoding:uint;format:hex;set:simdfp;",
+	"name:v17;bitsize:128;offset:558;encoding:uint;format:hex;set:simdfp;",
+	"name:v18;bitsize:128;offset:574;encoding:uint;format:hex;set:simdfp;",
+	"name:v19;bitsize:128;offset:590;encoding:uint;format:hex;set:simdfp;",
+	"name:v20;bitsize:128;offset:606;encoding:uint;format:hex;set:simdfp;",
+	"name:v21;bitsize:128;offset:622;encoding:uint;format:hex;set:simdfp;",
+	"name:v22;bitsize:128;offset:638;encoding:uint;format:hex;set:simdfp;",
+	"name:v23;bitsize:128;offset:654;encoding:uint;format:hex;set:simdfp;",
+	"name:v24;bitsize:128;offset:670;encoding:uint;format:hex;set:simdfp;",
+	"name:v25;bitsize:128;offset:686;encoding:uint;format:hex;set:simdfp;",
+	"name:v26;bitsize:128;offset:702;encoding:uint;format:hex;set:simdfp;",
+	"name:v27;bitsize:128;offset:718;encoding:uint;format:hex;set:simdfp;",
+	"name:v28;bitsize:128;offset:734;encoding:uint;format:hex;set:simdfp;",
+	"name:v29;bitsize:128;offset:750;encoding:uint;format:hex;set:simdfp;",
+	"name:v30;bitsize:128;offset:766;encoding:uint;format:hex;set:simdfp;",
+	"name:v31;bitsize:128;offset:782;encoding:uint;format:hex;set:simdfp;",
+	"name:fpsr;bitsize:32;offset:786;encoding:uint;format:hex;set:simdfp;",
+	"name:fpcr;bitsize:32;offset:790;encoding:uint;format:hex;set:simdfp;",
+	"name:ELR_EL1;bitsize:64;offset:798;encoding:uint;format:hex;set:banked;",
+	"name:ESR_EL1;bitsize:32;offset:802;encoding:uint;format:hex;set:banked;",
+	"name:SPSR_EL1;bitsize:32;offset:806;encoding:uint;format:hex;set:banked;",
+	"name:ELR_EL2;bitsize:64;offset:814;encoding:uint;format:hex;set:banked;",
+	"name:ESR_EL2;bitsize:32;offset:818;encoding:uint;format:hex;set:banked;",
+	"name:SPSR_EL2;bitsize:64;offset:826;encoding:uint;format:hex;set:banked;",
+	"name:ELR_EL3;bitsize:64;offset:834;encoding:uint;format:hex;set:banked;",
+	"name:ESR_EL3;bitsize:32;offset:838;encoding:uint;format:hex;set:banked;",
+	"name:SPSR_EL3;bitsize:64;offset:846;encoding:uint;format:hex;set:banked;",
+	"E45"};
+
+char *qregiterinfo_aarch32[] = {
+	"name:r0;bitsize:32;offset:0;encoding:uint;format:hex;set:General;",
+	"name:r1;bitsize:32;offset:4;encoding:uint;format:hex;set:General;",
+	"name:r2;bitsize:32;offset:8;encoding:uint;format:hex;set:General;",
+	"name:r3;bitsize:32;offset:12;encoding:uint;format:hex;set:General;",
+	"name:r4;bitsize:32;offset:16;encoding:uint;format:hex;set:General;",
+	"name:r5;bitsize:32;offset:20;encoding:uint;format:hex;set:General;",
+	"name:r6;bitsize:32;offset:24;encoding:uint;format:hex;set:General;",
+	"name:r7;bitsize:32;offset:28;encoding:uint;format:hex;set:General;",
+	"name:r8;bitsize:32;offset:32;encoding:uint;format:hex;set:General;",
+	"name:r9;bitsize:32;offset:36;encoding:uint;format:hex;set:General;",
+	"name:r10;bitsize:32;offset:40;encoding:uint;format:hex;set:General;",
+	"name:r11;bitsize:32;offset:44;encoding:uint;format:hex;set:General;",
+	"name:r12;bitsize:32;offset:48;encoding:uint;format:hex;set:General;",
+	"name:r13;bitsize:32;offset:52;encoding:uint;format:hex;set:General;",
+	"name:r14;bitsize:32;offset:56;encoding:uint;format:hex;set:General;",
+	"name:pc;bitsize:32;offset:60;encoding:uint;format:hex;set:General;",
+	"name:cpsr;bitsize:32;offset:64;encoding:uint;format:hex;set:vfp;",
+	"name:do;bitsize:64;offset:72;encoding:uint;format:hex;set:vfp;",
+	"name:d1;bitsize:64;offset:80;encoding:uint;format:hex;set:vfp;",
+	"name:d2;bitsize:64;offset:88;encoding:uint;format:hex;set:vfp;",
+	"name:d3;bitsize:64;offset:96;encoding:uint;format:hex;set:vfp;",
+	"name:d4;bitsize:64;offset:104;encoding:uint;format:hex;set:vfp;",
+	"name:d5;bitsize:64;offset:112;encoding:uint;format:hex;set:vfp;",
+	"name:d6;bitsize:64;offset:120;encoding:uint;format:hex;set:vfp;",
+	"name:d7;bitsize:64;offset:128;encoding:uint;format:hex;set:vfp;",
+	"name:d8;bitsize:64;offset:136;encoding:uint;format:hex;set:vfp;",
+	"name:d9;bitsize:64;offset:144;encoding:uint;format:hex;set:vfp;",
+	"name:d10;bitsize:64;offset:152;encoding:uint;format:hex;set:vfp;",
+	"name:d11;bitsize:64;offset:160;encoding:uint;format:hex;set:vfp;",
+	"name:d12;bitsize:64;offset:168;encoding:uint;format:hex;set:vfp;",
+	"name:d13;bitsize:64;offset:174;encoding:uint;format:hex;set:vfp;",
+	"name:d14;bitsize:64;offset:182;encoding:uint;format:hex;set:vfp;",
+	"name:d15;bitsize:64;offset:190;encoding:uint;format:hex;set:vfp;",
+	"name:d16;bitsize:32;offset:198;encoding:uint;format:hex;set:vfp;",
+	"name:d17;bitsize:128;offset:206;encoding:uint;format:hex;set:vfp;",
+	"name:d18;bitsize:128;offset:214;encoding:uint;format:hex;set:vfp;",
+	"name:d19;bitsize:128;offset:222;encoding:uint;format:hex;set:vfp;",
+	"name:d20;bitsize:128;offset:230;encoding:uint;format:hex;set:vfp;",
+	"name:d21;bitsize:128;offset:238;encoding:uint;format:hex;set:vfp;",
+	"name:d22;bitsize:128;offset:246;encoding:uint;format:hex;set:vfp;",
+	"name:d23;bitsize:128;offset:254;encoding:uint;format:hex;set:vfp;",
+	"name:d24;bitsize:128;offset:262;encoding:uint;format:hex;set:vfp;",
+	"name:d25;bitsize:128;offset:270;encoding:uint;format:hex;set:vfp;",
+	"name:d26;bitsize:128;offset:278;encoding:uint;format:hex;set:vfp;",
+	"name:d27;bitsize:128;offset:286;encoding:uint;format:hex;set:vfp;",
+	"name:d28;bitsize:128;offset:294;encoding:uint;format:hex;set:vfp;",
+	"name:d29;bitsize:128;offset:302;encoding:uint;format:hex;set:vfp;",
+	"name:d30;bitsize:128;offset:310;encoding:uint;format:hex;set:vfp;",
+	"name:d31;bitsize:128;offset:318;encoding:uint;format:hex;set:vfp;",
+	"name:fpscr;bitsize:32;offset:322;encoding:uint;format:hex;set:float;",
+	"E45"};
+
+/*  current_target_hexagon variable contains info if current debug target is hexagon modem*/
+unsigned int current_target_hexagon = 0;
+
+/*  hexagon_no_of_threads  variable contains info regarding no of HW threads in system*/
+unsigned int hexagon_no_of_threads = 0;
+
+/*  current_target_hexagon variable contains info if current debug target is hexagon cdsp*/
+unsigned int current_target_hexagon_cdsp = 0;
+
+/*  current_target_hexagon variable contains info if current debug target is hexagon adsp*/
+unsigned int current_target_hexagon_adsp = 0;
+
+/* current_thread_id_hexagon variable contains the info for current selected HW thread*/
+unsigned int current_thread_id_hexagon = 1;
+
+#define HEXAGON_LLDB_PER_THREAD_REGISTER_COUNT 78
+// unsigned int hexagon_pc , hexagon_sp, hexagon_fp;
+char hexagon_pc[15], hexagon_sp[15], hexagon_fp[15];
+
+extern void hexagon_update_sp_pc_fp_gdb_server_adsp(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
+extern void hexagon_update_sp_pc_fp_gdb_server_cdsp(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
+extern void hexagon_update_sp_pc_fp_gdb_server(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
+extern uint32_t hexagon_no_of_hw_threads(void);
+extern uint32_t hexagon_no_of_hw_threads_cdsp(void);
+extern uint32_t hexagon_no_of_hw_threads_adsp(void);
+
+static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection);
 
 static int gdb_last_signal(struct target *target)
 {
@@ -650,6 +904,18 @@ static inline int fetch_packet(struct connection *connection,
 	checksum[1] = character;
 	checksum[2] = 0;
 
+	/*Hexagon untrusted mode changes*/
+	if (is_hexagon_untrusted == true)
+	{
+		retval = hexagon_untrusted_update_packet(buffer, count);
+		if (retval != ERROR_OK)
+			return retval;
+		retval = hexagon_untrusted_update_packet_checksum(checksum);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	/*hexagon untrusted changes end*/
 	if (!noack)
 		*checksum_ok = (my_checksum == strtoul(checksum, NULL, 16));
 
@@ -781,6 +1047,7 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 	char sig_reply[65];
 	char stop_reason[32];
 	char current_thread[25];
+	char hexagon_thread_info[60];
 	int sig_reply_len;
 	int signal_var;
 
@@ -829,12 +1096,31 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		}
 
 		current_thread[0] = '\0';
-		if (target->rtos)
-			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx64 ";",
-					target->rtos->current_thread);
 
-		sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s",
-				signal_var, stop_reason, current_thread);
+		if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+		{
+			gdb_hexagon_fetch_fp_pc_sp(connection);
+			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx32 ";",
+					 current_thread_id_hexagon);
+			/*snprintf(hexagon_thread_info, sizeof(hexagon_thread_info), "28:%x;1e:%x;1d:%x;",
+					hexagon_pc,hexagon_fp,hexagon_sp);*/
+			snprintf(hexagon_thread_info, sizeof(hexagon_thread_info), "28:%s;1e:%s;1d:%s;",
+					 hexagon_pc, hexagon_fp, hexagon_sp);
+			sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s%s",
+									 signal_var, stop_reason, current_thread, hexagon_thread_info);
+			LOG_DEBUG("sig_reply %s", (char *)sig_reply);
+			LOG_DEBUG("stop_reason %s", (char *)stop_reason);
+			LOG_DEBUG("signal_var =  0x%X", signal_var);
+		}
+		else
+		{
+			if (target->rtos != NULL)
+				snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx64 ";",
+						 target->rtos->current_thread);
+
+			sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s",
+									 signal_var, stop_reason, current_thread);
+		}
 
 		gdb_connection->ctrl_c = false;
 	}
@@ -990,6 +1276,24 @@ static int gdb_new_connection(struct connection *connection)
 	connection->priv = gdb_connection;
 	connection->cmd_ctx->current_target = target;
 
+	if (strncmp(target->type->name, "hexagon_cdsp", 12) == 0)
+	{
+		current_target_hexagon_cdsp = 1;
+		hexagon_no_of_threads = hexagon_no_of_hw_threads_cdsp();
+		LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
+	}
+	else if (strncmp(target->type->name, "hexagon_adsp", 12) == 0)
+	{
+		current_target_hexagon_adsp = 1;
+		hexagon_no_of_threads = hexagon_no_of_hw_threads_adsp();
+	}
+	else if (strncmp(target->type->name, "hexagon", 7) == 0)
+	{
+		current_target_hexagon = 1;
+		hexagon_no_of_threads = hexagon_no_of_hw_threads();
+	}
+	LOG_DEBUG("current_target_hexagon_cdsp=%d", current_target_hexagon_cdsp);
+	LOG_DEBUG("current_target_hexagon=%d", current_target_hexagon);
 	/* initialize gdb connection information */
 	gdb_connection->buf_p = gdb_connection->buffer;
 	gdb_connection->buf_cnt = 0;
@@ -1107,7 +1411,10 @@ static int gdb_connection_closed(struct connection *connection)
 	 * cleaning up connection.
 	 */
 	log_remove_callback(gdb_log_callback, connection);
-
+	current_target_hexagon = 0;
+	current_target_hexagon_cdsp = 0;
+	current_target_hexagon_adsp = 0;
+	hexagon_no_of_threads = 0;
 	gdb_actual_connections--;
 	LOG_DEBUG("GDB Close, Target: %s, state: %s, gdb_actual_connections=%d",
 		target_name(target),
@@ -1355,6 +1662,40 @@ static int gdb_set_registers_packet(struct connection *connection,
 	return ERROR_OK;
 }
 
+/*Hexagon*/
+static int gdb_qregister_packet(struct connection *connection,
+								char const *packet, int packet_size)
+{
+	struct target *target = get_target_from_connection(connection);
+	struct arm *arm = target_to_arm(target);
+	char *reg_packet = NULL;
+	int reg_num;
+	// struct reg **reg_list;
+	// int reg_list_size;
+	// int retval;
+
+	reg_num = strtoul(packet + 13, NULL, 16);
+
+#ifdef _DEBUG_GDB_IO_
+	LOG_DEBUG("-");
+#endif
+	if (strncmp(target->type->name, "hexagon", 7) == 0)
+	{
+		reg_packet = hexagon_regiterinfo[reg_num];
+	}
+	if (arm->core_state == ARM_STATE_AARCH64)
+	{
+		reg_packet = qregiterinfo_aarch64[reg_num];
+	}
+	if (arm->core_state == ARM_STATE_ARM)
+	{
+		reg_packet = qregiterinfo_aarch32[reg_num];
+	}
+	gdb_put_packet(connection, reg_packet, strlen(reg_packet));
+
+	return ERROR_OK;
+}
+
 static int gdb_get_register_packet(struct connection *connection,
 	char const *packet, int packet_size)
 {
@@ -1363,7 +1704,7 @@ static int gdb_get_register_packet(struct connection *connection,
 	int reg_num = strtoul(packet + 1, NULL, 16);
 	struct reg **reg_list;
 	int reg_list_size;
-	int retval;
+	int retval, temp_reg_num;
 
 #ifdef _DEBUG_GDB_IO_
 	LOG_DEBUG("-");
@@ -1381,6 +1722,53 @@ static int gdb_get_register_packet(struct connection *connection,
 		!reg_list[reg_num]->exist || reg_list[reg_num]->hidden) {
 		LOG_ERROR("gdb requested a non-existing register (reg_num=%d)", reg_num);
 		return ERROR_SERVER_REMOTE_CLOSED;
+	}
+	if (current_thread_id_hexagon > 1 && (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp))
+	{
+		temp_reg_num = reg_num;
+		// LOG_DEBUG("reg_list_size = %d reg_num =  %d and  current_thread_id_hexagon = %d ", reg_list_size,reg_num,current_thread_id_hexagon);
+		reg_num = HEXAGON_LLDB_PER_THREAD_REGISTER_COUNT * (current_thread_id_hexagon - 1) + reg_num;
+		// value = (unsigned int *)reg_list[reg_num]->value;
+		//	LOG_DEBUG("reg_num after calculation = %d and value = %d", reg_num,*value);
+		if (temp_reg_num == 40)
+		{
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num - 11]);
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num - 10]);
+		}
+		else if (temp_reg_num == 29)
+		{
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num + 1]);
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 11]);
+		}
+		else if (temp_reg_num == 30)
+		{
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num - 1]);
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 10]);
+		}
+	}
+	if (current_thread_id_hexagon == 1 && (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp))
+	{
+		if (reg_num == 40)
+		{
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num - 11]);
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num - 10]);
+		}
+		else if (reg_num == 29)
+		{
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num + 1]);
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 11]);
+		}
+		else if (reg_num == 30)
+		{
+			gdb_str_to_target(target, hexagon_fp, reg_list[reg_num]);
+			gdb_str_to_target(target, hexagon_sp, reg_list[reg_num - 1]);
+			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 10]);
+		}
 	}
 
 	if (!reg_list[reg_num]->valid) {
@@ -1402,6 +1790,36 @@ static int gdb_get_register_packet(struct connection *connection,
 	free(reg_packet);
 
 	return ERROR_OK;
+}
+
+static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection)
+{
+
+	struct target *target = get_target_from_connection(connection);
+	unsigned int sp, fp, pc;
+	struct reg reg_list = {0};
+	if (current_target_hexagon)
+	{
+		hexagon_update_sp_pc_fp_gdb_server(current_thread_id_hexagon - 1, &pc, &fp, &sp);
+	}
+	else if (current_target_hexagon_cdsp)
+	{
+		hexagon_update_sp_pc_fp_gdb_server_cdsp(current_thread_id_hexagon - 1, &pc, &fp, &sp);
+	}
+	else if (current_target_hexagon_adsp)
+	{
+		hexagon_update_sp_pc_fp_gdb_server_adsp(current_thread_id_hexagon - 1, &pc, &fp, &sp);
+	}
+
+	reg_list.size = 32;
+	reg_list.value = &fp;
+	gdb_str_to_target(target, hexagon_fp, &reg_list);
+
+	reg_list.value = &sp;
+	gdb_str_to_target(target, hexagon_sp, &reg_list);
+
+	reg_list.value = &pc;
+	gdb_str_to_target(target, hexagon_pc, &reg_list);
 }
 
 static int gdb_set_register_packet(struct connection *connection,
@@ -1458,7 +1876,45 @@ static int gdb_set_register_packet(struct connection *connection,
 
 	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	retval = reg_list[reg_num]->type->set(reg_list[reg_num], bin_buf);
+	if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+	{
+
+		// struct reg *reg;
+		struct hex_reg *arch_info;
+		uint32_t hwthrd, temp_regnum;
+
+		LOG_DEBUG("reg_num before modification =  %d", reg_num);
+
+		if (reg_num >= 37 && reg_num <= 50)
+			reg_num = reg_num + 1;
+		else if (reg_num >= 51 && reg_num <= 64)
+			reg_num = reg_num + 11;
+		else if (reg_num >= 65 && reg_num <= 67)
+			reg_num = reg_num + 15;
+		else if (reg_num >= 68 && reg_num <= 71)
+			reg_num = reg_num + 16;
+		else if (reg_num == 72)
+			reg_num = reg_num + 17;
+		else if (reg_num >= 73 && reg_num <= 77)
+			reg_num = reg_num + 18;
+
+		LOG_DEBUG("reg_num after  modification =  %d", reg_num);
+		// reg = reg_list[reg_num];
+		arch_info = reg_list[reg_num]->arch_info;
+		LOG_DEBUG("arch_info->num =  %d", arch_info->num);
+		hwthrd = arch_info->hwthrd;
+		temp_regnum = arch_info->num;
+		arch_info->num = reg_num;
+		arch_info->hwthrd = current_thread_id_hexagon - 1;
+		reg_list[reg_num]->type->set(reg_list[reg_num], bin_buf);
+		arch_info->hwthrd = hwthrd;
+		arch_info->num = temp_regnum;
+	}
+	else
+	{
+		retval = reg_list[reg_num]->type->set(reg_list[reg_num], bin_buf);
+	}
+
 	if (retval != ERROR_OK && gdb_report_register_access_error) {
 		LOG_DEBUG("Couldn't set register %s.", reg_list[reg_num]->name);
 		free(bin_buf);
@@ -3045,8 +3501,22 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 				parse = endp;
 			}
 		} else {
-			thread_id = 0;
-		}
+			thread_id = 0; }
+			
+			if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+			{
+				/*if(current_thread_id_hexagon != current_thread_id_hexagon)
+				{
+					fake_step = true;
+					LOG_INFO("fake_step = true for hexagon target'");
+				}*/
+				if (thread_id >= 1 && thread_id <= 6)
+				{
+					current_thread_id_hexagon = thread_id;
+				}
+				LOG_DEBUG("current_thread_id_hexagon = %lld'", thread_id);
+			}
+			
 
 		if (target->rtos) {
 			/* FIXME: why is this necessary? rtos state should be up-to-date here already! */
@@ -3503,6 +3973,19 @@ static int gdb_input_inner(struct connection *connection)
 	static bool warn_use_ext;
 
 	target = get_target_from_connection(connection);
+#if GDB == 1
+	struct arm *arm = target_to_arm(target);
+	int current_target_arm = 0;
+
+	if (arm->core_state == ARM_STATE_AARCH64)
+	{
+		current_target_arm = 1;
+	}
+	if (arm->core_state == ARM_STATE_ARM)
+	{
+		current_target_arm = 1;
+	}
+#endif
 
 	/* drain input buffer. If one of the packets fail, then an error
 	 * packet is replied, if applicable.
@@ -3524,61 +4007,234 @@ static int gdb_input_inner(struct connection *connection)
 		/* terminate with zero */
 		gdb_packet_buffer[packet_size] = '\0';
 
-		if (packet_size > 0) {
+
+		if (packet_size > 0 && is_hexagon_untrusted == true)
+		{
+			if (packet[0] == 'D')
+			{
+				gdb_detach(connection);
+				return ERROR_OK;
+			}
+			char rsp_response[1024];
+			/*hexagon untrusted changes*/
+			uint16_t len_of_response;
+			retval = hexagon_untrusted_forward_rsp(get_target_from_connection(connection), rsp_response, &len_of_response);
+			if (retval != ERROR_OK)
+				return retval;
+
+			char *start_pos = strchr(rsp_response, '$');
+			char *end_pos = strchr(rsp_response, '#');
+			retval = gdb_put_packet(connection, start_pos + 1, (int)(end_pos - start_pos) - 1);
+			if (retval != ERROR_OK)
+			{
+				LOG_ERROR("Unable to write GDB Network!");
+				return retval;
+			}
+
+			if ((gdb_con->noack_mode == 0) && (strncmp(packet, "QStartNoAckMode", 15) == 0))
+			{
+				gdb_con->noack_mode = 1;
+			}
+
+			return ERROR_OK;
+		}
+		if (packet_size > 0 && is_hexagon_untrusted == false) {
 
 			gdb_log_incoming_packet(connection, gdb_packet_buffer);
 
 			retval = ERROR_OK;
-			switch (packet[0]) {
-				case 'T':	/* Is thread alive? */
-					gdb_thread_packet(connection, packet, packet_size);
-					break;
-				case 'H':	/* Set current thread ( 'c' for step and continue,
-							 * 'g' for all other operations ) */
-					gdb_thread_packet(connection, packet, packet_size);
-					break;
-				case 'q':
-				case 'Q':
-					retval = gdb_thread_packet(connection, packet, packet_size);
-					if (retval == GDB_THREAD_PACKET_NOT_CONSUMED)
-						retval = gdb_query_packet(connection, packet, packet_size);
-					break;
-				case 'g':
-					retval = gdb_get_registers_packet(connection, packet, packet_size);
-					break;
-				case 'G':
-					retval = gdb_set_registers_packet(connection, packet, packet_size);
-					break;
-				case 'p':
-					retval = gdb_get_register_packet(connection, packet, packet_size);
-					break;
-				case 'P':
-					retval = gdb_set_register_packet(connection, packet, packet_size);
-					break;
-				case 'm':
-					retval = gdb_read_memory_packet(connection, packet, packet_size);
-					break;
-				case 'M':
-					retval = gdb_write_memory_packet(connection, packet, packet_size);
-					break;
-				case 'z':
-				case 'Z':
-					retval = gdb_breakpoint_watchpoint_packet(connection, packet, packet_size);
-					break;
-				case '?':
-					gdb_last_signal_packet(connection, packet, packet_size);
-					/* '?' is sent after the eventual '!' */
-					if (!warn_use_ext && !gdb_con->extended_protocol) {
-						warn_use_ext = true;
-						LOG_WARNING("Prefer GDB command \"target extended-remote :%s\" instead of \"target remote :%s\"",
-									connection->service->port, connection->service->port);
-					}
-					break;
-				case 'c':
-				case 's':
+			switch (packet[0])
+			{
+			case 'T': /* Is thread alive? */
+				if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+				{
+					gdb_put_packet(connection, "OK", 2); /* thread alive */
+				}
+				else
 				{
 					gdb_thread_packet(connection, packet, packet_size);
-					gdb_con->output_flag = GDB_OUTPUT_ALL;
+				}
+				break;
+			case 'H': /* Set current thread ( 'c' for step and continue,
+					   * 'g' for all other operations ) */
+				if ((strncmp(packet, "Hg", 2) == 0) && (current_target_hexagon || current_target_hexagon_cdsp ||
+														current_target_hexagon_adsp))
+				{
+					LOG_DEBUG("current_target_hexagon =%d and current_target_hexagon_cdsp = %d", current_target_hexagon,
+							  current_target_hexagon_cdsp);
+					sscanf(packet, "Hg%16" SCNx32, &current_thread_id_hexagon);
+					LOG_DEBUG("current_thread_id_hexagon = 0x%x ", current_thread_id_hexagon);
+					gdb_put_packet(connection, "OK", 2);
+					break;
+				}
+				gdb_thread_packet(connection, packet, packet_size);
+				break;
+			case 'q':
+			case 'Q':
+#if LLDB == 1
+				if (strncmp(packet, "qRegisterInfo", 13) == 0)
+				{
+					retval = gdb_qregister_packet(connection, packet, packet_size);
+					break;
+				}
+				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon)
+				{
+					LOG_DEBUG("current_target_hexagon =%d ", current_target_hexagon);
+					if (hexagon_no_of_threads == 6)
+					{
+						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
+						break;
+					}
+					else if (hexagon_no_of_threads == 4)
+					{
+						gdb_put_packet(connection, "m1,2,3,4", 8);
+						break;
+					}
+					else if (hexagon_no_of_threads == 2)
+					{
+						gdb_put_packet(connection, "m1,2", 4);
+						break;
+					}
+				}
+				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon_cdsp)
+				{
+					LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
+					LOG_DEBUG("current_target_hexagon_cdsp =%d ", current_target_hexagon_cdsp);
+					if (hexagon_no_of_threads == 6)
+					{
+						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
+						break;
+					}
+					else if (hexagon_no_of_threads == 4)
+					{
+						gdb_put_packet(connection, "m1,2,3,4", 8);
+						break;
+					}
+					else if (hexagon_no_of_threads == 2)
+					{
+						gdb_put_packet(connection, "m1,2", 4);
+						break;
+					}
+				}
+				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon_adsp)
+				{
+					if (hexagon_no_of_threads == 6)
+					{
+						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
+						break;
+					}
+					else if (hexagon_no_of_threads == 4)
+					{
+						gdb_put_packet(connection, "m1,2,3,4", 8);
+						break;
+					}
+					else if (hexagon_no_of_threads == 2)
+					{
+						gdb_put_packet(connection, "m1,2", 4);
+						break;
+					}
+				}
+				/*if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_arm)
+				{
+						gdb_put_packet(connection, "m1", 2);
+						break;
+				}
+				if (strncmp(packet, "qC", 2) == 0 && current_target_arm)
+				{
+						gdb_put_packet(connection, "QC1", 3);
+						break;
+				}*/
+				if (strncmp(packet, "qC", 2) == 0 && (current_target_hexagon || current_target_hexagon_adsp ||
+													  current_target_hexagon_cdsp))
+				{
+					if (current_thread_id_hexagon == 1)
+					{
+						gdb_put_packet(connection, "QC1", 3);
+						break;
+					}
+					else if (current_thread_id_hexagon == 2)
+					{
+						gdb_put_packet(connection, "QC2", 3);
+						break;
+					}
+					else if (current_thread_id_hexagon == 3)
+					{
+						gdb_put_packet(connection, "QC3", 3);
+						break;
+					}
+					else if (current_thread_id_hexagon == 4)
+					{
+						gdb_put_packet(connection, "QC4", 3);
+						break;
+					}
+					else if (current_thread_id_hexagon == 5)
+					{
+						gdb_put_packet(connection, "QC5", 3);
+						break;
+					}
+					else if (current_thread_id_hexagon == 6)
+					{
+						gdb_put_packet(connection, "QC6", 3);
+						break;
+					}
+				}
+#endif
+#if GDB == 1
+				if (current_target_arm)
+				{
+					if (strncmp(packet, "qfThreadInfo", 12) == 0)
+					{
+						gdb_put_packet(connection, "m1", 2);
+						break;
+					}
+					if (strncmp(packet, "qC", 2) == 0)
+					{
+						gdb_put_packet(connection, "QC1", 3);
+						break;
+					}
+				}
+#endif
+				retval = gdb_thread_packet(connection, packet, packet_size);
+				if (retval == GDB_THREAD_PACKET_NOT_CONSUMED)
+					retval = gdb_query_packet(connection, packet, packet_size);
+				break;
+			case 'g':
+				retval = gdb_get_registers_packet(connection, packet, packet_size);
+				break;
+			case 'G':
+				retval = gdb_set_registers_packet(connection, packet, packet_size);
+				break;
+			case 'p':
+				retval = gdb_get_register_packet(connection, packet, packet_size);
+				break;
+			case 'P':
+				retval = gdb_set_register_packet(connection, packet, packet_size);
+				break;
+			case 'm':
+				retval = gdb_read_memory_packet(connection, packet, packet_size);
+				break;
+			case 'M':
+				retval = gdb_write_memory_packet(connection, packet, packet_size);
+				break;
+			case 'z':
+			case 'Z':
+				retval = gdb_breakpoint_watchpoint_packet(connection, packet, packet_size);
+				break;
+			case '?':
+				gdb_last_signal_packet(connection, packet, packet_size);
+				/* '?' is sent after the eventual '!' */
+				if (!warn_use_ext && !gdb_con->extended_protocol)
+				{
+					warn_use_ext = true;
+					LOG_WARNING("Prefer GDB command \"target extended-remote %s\" instead of \"target remote %s\"",
+								connection->service->port, connection->service->port);
+				}
+				break;
+			case 'c':
+			case 's':
+			{
+				gdb_thread_packet(connection, packet, packet_size);
+				log_add_callback(gdb_log_callback, connection);
 
 					if (gdb_con->mem_write_error) {
 						LOG_ERROR("Memory write failure!");
@@ -3672,7 +4328,28 @@ static int gdb_input_inner(struct connection *connection)
 					break;
 
 				case 'j':
-					/* DEPRECATED */
+					if ((strncmp(packet, "jThreadsInfo", 12) == 0) && (current_target_hexagon || current_target_hexagon_adsp ||
+																	   current_target_hexagon_cdsp))
+					{
+						gdb_put_packet(connection, "", 0);
+						break;
+					}
+					if ((strncmp(packet, "jThreadExtendedInfo", 19) == 0) && (current_target_hexagon || current_target_hexagon_adsp ||
+																			  current_target_hexagon_cdsp))
+					{
+						gdb_put_packet(connection, "", 0);
+						break;
+					}
+					/*if ((strncmp(packet, "jThreadsInfo", 12) == 0) && current_target_arm)
+					{
+						gdb_put_packet(connection, "", 0);
+						break;
+					}
+					if ((strncmp(packet, "jThreadExtendedInfo", 19) == 0) && current_target_arm)
+					{
+						gdb_put_packet(connection, "", 0);
+						break;
+					}*/
 					/* packet supported only by smp target i.e cortex_a.c*/
 					/* handle smp packet replying coreid played to gbd */
 					gdb_read_smp_packet(connection, packet, packet_size);
