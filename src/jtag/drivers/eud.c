@@ -1,9 +1,9 @@
 /**************************************************************************
-*	Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
-*   All rights reserved.                                                  * 
-*   SPDX-License-Identifier: GPL-2.0-or-later                             * 
-*																		  *
-***************************************************************************/
+ *	Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
+ *   All rights reserved.                                                  *
+ *   SPDX-License-Identifier: GPL-2.0-or-later                             *
+ *																		  *
+ ***************************************************************************/
 
 // Macro to enable / disable QUTS
 #define QUTS_GATEWAY
@@ -104,12 +104,12 @@ EUD_ERR_t (*fSWD_GetJTAGID)(swd_eud_device *, uint32_t *);
 EUD_ERR_t (*fGetDeviceIDArray)(uint32_t *, uint32_t *);
 swd_eud_device *(*fEUDInitializeDeviceSWD)(uint32_t, uint32_t, EUD_ERR_t *);
 swd_eud_device *(*fEUDInitializeDeviceJTG)(uint32_t, uint32_t, EUD_ERR_t *);
-#endif
-
-static swd_eud_device *gpSWDDevice = NULL;
-static uint32_t gDeviceId = 0;
 // EUD library handler
 static void *eudLibHandler = NULL;
+static swd_eud_device *gpSWDDevice = NULL;
+#endif
+
+static uint32_t gDeviceId = 0;
 static uint32_t cmd_count;
 #define CTRLSTAT_CHECK_ENABLED 1
 #define CTRLSTAT_READ_ENABLED 1
@@ -120,12 +120,15 @@ int EudSWDInitWrapper(void);
 int SwdReadWrapper(uint32_t, uint32_t, uint32_t *);
 int SwdWriteWrapper(uint32_t, uint32_t, uint32_t);
 int EudQuitWrapper(void);
-void Jtag_to_SWD();
-int SwdFlush();
+void Jtag_to_SWD(void);
+int SwdFlush(void);
+int BitbangWrapper(uint32_t bitBangVal, uint32_t *returnPtr);
 #endif
 
+static void kill_process(void);
+
 #ifdef KILLPROCESS
-static void kill_process()
+static void kill_process(void)
 {
     // pid_t ppid = getppid();
     // pid_t pid  = getpid();
@@ -138,7 +141,7 @@ static void kill_process()
 #if 1
 int eud_switch_seq(enum swd_special_seq seq)
 {
-    EUD_ERR_t err;
+    EUD_ERR_t err = EUD_SUCCESS;
     // LOG_DEBUG("eud_switch_seq\n");
     switch (seq)
     {
@@ -194,7 +197,6 @@ static void eud_ensure_dbg_sys_pwr_is_on(void)
     uint32_t A2_3 = 0;
     EUD_ERR_t err;
     uint32_t val;
-
 
 #ifdef QUTS_GATEWAY
     static int call_count = 0;
@@ -302,7 +304,6 @@ static void eud_swd_read(uint8_t cmd, uint32_t *value, uint32_t ap_delay_hint)
     uint32_t APnDP = 0;
     uint32_t A2_3 = 0;
     EUD_ERR_t err;
-    uint32_t val;
 
     (void)ap_delay_hint;
     APnDP = (cmd >> 1) & 0x1;
@@ -358,6 +359,7 @@ static void eud_swd_read(uint8_t cmd, uint32_t *value, uint32_t ap_delay_hint)
     }
 #endif
 #ifndef QUTS_GATEWAY
+    uint32_t val = 0;
     err = fSWDRead(gpSWDDevice, APnDP, A2_3, &val);
 #endif
     if (err != EUD_SUCCESS)
@@ -386,7 +388,7 @@ static void eud_swd_write(uint8_t cmd, uint32_t value, uint32_t ap_delay_hint)
     uint32_t APnDP = 0;
     uint32_t A2_3 = 0;
     EUD_ERR_t err;
-    static int j;
+    // static int j;
 
     (void)ap_delay_hint;
     APnDP = (cmd >> 1) & 0x1;
@@ -414,7 +416,6 @@ static void eud_swd_write(uint8_t cmd, uint32_t value, uint32_t ap_delay_hint)
     if (!(((APnDP == 0) && ((A2_3 == 0) || (A2_3 == 1)))))
         eud_ensure_dbg_sys_pwr_is_on();
 #endif
-
 
     cmd_count += 5;
 #ifndef QUTS_GATEWAY
@@ -459,7 +460,7 @@ int eud_AssertReset(void)
 #ifndef QUTS_GATEWAY
     err = fSWDBitBang(gpSWDDevice, swd_bitbang_value, &return_val);
 #else
-    LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper call val: %ld \n", swd_bitbang_value);
+    LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper call val: %" PRIu32 " \n", swd_bitbang_value);
     err = BitbangWrapper(swd_bitbang_value, &return_val);
     LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper end \n");
 #endif
@@ -476,7 +477,7 @@ int eud_AssertReset(void)
 #ifndef QUTS_GATEWAY
     err = fSWDBitBang(gpSWDDevice, swd_bitbang_value, &return_val);
 #else
-    LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper call val: %ld \n", swd_bitbang_value);
+    LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper call val: %" PRIu32 " \n", swd_bitbang_value);
     err = BitbangWrapper(swd_bitbang_value, &return_val);
     LOG_DEBUG("OCD: Bitbang eud_AssertReset wrapper end \n");
 #endif
@@ -535,7 +536,7 @@ int eud_DeAssertReset(void)
 #ifndef QUTS_GATEWAY
     err = fSWDBitBang(gpSWDDevice, swd_bitbang_value, &return_val);
 #else
-    LOG_DEBUG("OCD: Bitbang eud_DeAssertReset wrapper call val: %ld \n", swd_bitbang_value);
+    LOG_DEBUG("OCD: Bitbang eud_DeAssertReset wrapper call val: %" PRIu32 " \n", swd_bitbang_value);
     err = BitbangWrapper(swd_bitbang_value, &return_val);
     LOG_DEBUG("OCD: Bitbang eud_DeAssertReset wrapper end \n");
 #endif
@@ -703,7 +704,7 @@ static int eud_speed_div(int speed, int *khz)
 static int eud_set_speed(int speed)
 {
     // LOG_DEBUG("eud_set_speed call \n");
-    EUD_ERR_t err;
+    EUD_ERR_t err = EUD_SUCCESS;
 
 #ifndef QUTS_GATEWAY
     err = fSWDSetFrequency(gpSWDDevice, 0x2);
@@ -772,13 +773,16 @@ static int eud_quit(void)
 #endif
 #ifdef QUTS_GATEWAY
     int err = EudQuitWrapper();
+    if (err != ERROR_OK)
+        return -1;
 #endif
     return ERROR_OK;
 }
 
+#ifndef QUTS_GATEWAY
 static int eud_lib_init(void)
 {
-     LOG_DEBUG("eud_lib_init call \n");
+    LOG_DEBUG("eud_lib_init call \n");
     int retStatus = ERROR_FAIL;
 #ifndef QUTS_GATEWAY
 #if defined(__WIN32) || defined(__WIN64)
@@ -874,16 +878,18 @@ static int eud_lib_init(void)
 #endif
     return retStatus;
 }
+#endif
 
 static int eud_swd_init(void)
 {
     // LOG_DEBUG("eud swd init start");
     EUD_ERR_t err = EUD_SUCCESS;
-    uint32_t arr[100] = {0}, len;
+    uint32_t arr[100] = {0};
 
     // Load EUD executable and exported functions
 
 #ifndef QUTS_GATEWAY
+    uint32_t len = 0;
     int initStatus = eud_lib_init();
     if (initStatus != ERROR_OK)
         return initStatus;
