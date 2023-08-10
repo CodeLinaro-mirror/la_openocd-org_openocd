@@ -4,10 +4,11 @@
 *   SPDX-License-Identifier: GPL-2.0-or-later                             * 
 *																		  *
 ***************************************************************************/
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-
+	
 #include "breakpoints.h"
 #include "aarch64.h"
 #include "register.h"
@@ -23,9 +24,35 @@
 #include "jtag/swd.h"
 #include "hexagon_cdsp.h"
 
+
+# include<time.h>
+clock_t start, end, func_start, func_end;
+clock_t start_buffer, end_buffer;
+
+double execution=0;
+double buffer_execution=0;
+uint64_t refresh_indicator;
+extern uint64_t thread_id_thread_select;
+extern uint64_t breakpoint_address_thread_select;
+
+#if 0
+    #define HEXAGON_DEBUG_LOGS
+#endif
+
+
 /****************************Global /static variable declartions**************************/
 
 int hvx_register_cdsp[32][16] = {-1};
+
+uint32_t qurtk_vtlb_main_addr = 0x0; 
+target_addr_t qurtk_vtlb_entries = 0x0; 
+target_addr_t bitmap_addr ;
+target_addr_t QURTK_vtlb_revision=0x0;
+uint64_t revision_num;
+// target_addr_t vtlb_entries ;
+bool bitmap_init=false;
+extern void decToBinary(unsigned int n, unsigned int binaryNum[]);
+int hexagon_update_modified_vtlb_entry(struct target *target);
 
 typedef struct hexagon_config
 {
@@ -41,13 +68,16 @@ hexagon_config gHexConfig_cdsp =
         .numTlbEntries = 128,
 };
 
-uint32_t (*gpPerHwThrdReg_cdsp)[HEXAGON_PER_THREAD_REGS_CDSP] = {0};
+uint64_t (*gpPerHwThrdReg_cdsp)[HEXAGON_PER_THREAD_REGS_CDSP] = {0};
 
-static uint32_t **gpSbpHaltedThreadsPC_cdsp;
+static uint64_t **gpSbpHaltedThreadsPC_cdsp;
 
 char (*gpHexagonThreadNameArray_cdsp)[20];
 
 tlb_entries_cdsp *gpHexagonTlbEntries_cdsp;
+
+uint64_t qurtk_vtlb_bitmap= 0x0; 
+
 
 static int initConfig(hexagon_config *pHexCfg)
 {
@@ -57,8 +87,8 @@ static int initConfig(hexagon_config *pHexCfg)
     LOG_INFO("InitConfig is called here");
 
     gpHexagonThreadNameArray_cdsp = malloc((pHexCfg->maxHwThreads + 1) * sizeof(*gpHexagonThreadNameArray_cdsp));
-    gpPerHwThrdReg_cdsp = (uint32_t(*)[HEXAGON_PER_THREAD_REGS_CDSP])malloc(pHexCfg->maxHwThreads * sizeof(*gpPerHwThrdReg_cdsp));
-    gpSbpHaltedThreadsPC_cdsp = (uint32_t **)malloc(pHexCfg->maxHwThreads * sizeof(uint32_t));
+    gpPerHwThrdReg_cdsp = (uint64_t(*)[HEXAGON_PER_THREAD_REGS_CDSP])malloc(pHexCfg->maxHwThreads * sizeof(*gpPerHwThrdReg_cdsp));
+    gpSbpHaltedThreadsPC_cdsp = (uint64_t **)malloc(pHexCfg->maxHwThreads * sizeof(uint64_t));
     gpHexagonTlbEntries_cdsp = (tlb_entries_cdsp *)malloc(pHexCfg->numTlbEntries * sizeof(tlb_entries_cdsp));
 
     if (gpHexagonThreadNameArray_cdsp == NULL || gpPerHwThrdReg_cdsp == NULL || gpSbpHaltedThreadsPC_cdsp == NULL || gpHexagonTlbEntries_cdsp == NULL)
@@ -86,7 +116,7 @@ static int initConfig(hexagon_config *pHexCfg)
     }
     strcpy(gpHexagonThreadNameArray_cdsp[i], "GLOBAL");
 
-    memset(gpSbpHaltedThreadsPC_cdsp, 0, (pHexCfg->maxHwThreads * sizeof(uint32_t)));
+    memset(gpSbpHaltedThreadsPC_cdsp, 0, (pHexCfg->maxHwThreads * sizeof(uint64_t)));
     memset(gpPerHwThrdReg_cdsp, 0, (pHexCfg->maxHwThreads * sizeof(*gpPerHwThrdReg_cdsp)));
     memset(gpHexagonTlbEntries_cdsp, 0, (pHexCfg->numTlbEntries * sizeof(tlb_entries_cdsp)));
 
@@ -200,7 +230,8 @@ static const hexagon_reg_cdsp hexagon_per_hwt_regs_cdsp[] = {
 
 };
 
-uint32_t global_reg_cdsp[HEXAGON_MMODE_GLOBAL_MAX_CDSP - HEXAGON_MMODE_PERTHRD_MAX_CDSP] = {0};
+uint32_t global_reg_cdsp[HEXAGON_MMODE_GLOBAL_MAX_CDSP-HEXAGON_MMODE_PERTHRD_MAX_CDSP]={0};
+
 
 static const hexagon_reg_cdsp hexagon_global_regs_cdsp[] = {
     /** Monitor Mode Global Control Registers **/
@@ -231,146 +262,147 @@ static const hexagon_reg_cdsp hexagon_global_regs_cdsp[] = {
 
 /* R0-R31  registers */
 uint32_t stuff_inst_gpr_read_cdsp[] = {
-    0x6700c029, /* isdbmbxout = r0  */
-    0x6701c029, /* isdbmbxout = r1  */
-    0x6702c029, /* isdbmbxout = r2  */
-    0x6703c029, /* isdbmbxout = r3  */
-    0x6704c029, /* isdbmbxout = r4  */
-    0x6705c029, /* isdbmbxout = r5  */
-    0x6706c029, /* isdbmbxout = r6  */
-    0x6707c029, /* isdbmbxout = r7  */
-    0x6708c029, /* isdbmbxout = r8  */
-    0x6709c029, /* isdbmbxout = r9  */
-    0x670ac029, /* isdbmbxout = r10 */
-    0x670bc029, /* isdbmbxout = r11 */
-    0x670cc029, /* isdbmbxout = r12 */
-    0x670dc029, /* isdbmbxout = r13 */
-    0x670ec029, /* isdbmbxout = r14 */
-    0x670fc029, /* isdbmbxout = r15 */
-    0x6710c029, /* isdbmbxout = r16 */
-    0x6711c029, /* isdbmbxout = r17 */
-    0x6712c029, /* isdbmbxout = r18 */
-    0x6713c029, /* isdbmbxout = r19 */
-    0x6714c029, /* isdbmbxout = r20 */
-    0x6715c029, /* isdbmbxout = r21 */
-    0x6716c029, /* isdbmbxout = r22 */
-    0x6717c029, /* isdbmbxout = r23 */
-    0x6718c029, /* isdbmbxout = r24 */
-    0x6719c029, /* isdbmbxout = r25 */
-    0x671ac029, /* isdbmbxout = r26 */
-    0x671bc029, /* isdbmbxout = r27 */
-    0x671cc029, /* isdbmbxout = r28 */
-    0x671dc029, /* isdbmbxout = r29 */
-    0x671ec029, /* isdbmbxout = r30 */
-    0x671fc029  /* isdbmbxout = r31 */
+	    
+        0x6700c029,	/* isdbmbxout = r0  */
+		0x6701c029,	/* isdbmbxout = r1  */
+		0x6702c029,	/* isdbmbxout = r2  */
+		0x6703c029,	/* isdbmbxout = r3  */
+		0x6704c029,	/* isdbmbxout = r4  */
+		0x6705c029,	/* isdbmbxout = r5  */
+		0x6706c029,	/* isdbmbxout = r6  */
+		0x6707c029,	/* isdbmbxout = r7  */
+		0x6708c029,	/* isdbmbxout = r8  */
+		0x6709c029,	/* isdbmbxout = r9  */
+		0x670ac029,	/* isdbmbxout = r10 */
+		0x670bc029,	/* isdbmbxout = r11 */
+		0x670cc029,	/* isdbmbxout = r12 */
+		0x670dc029,	/* isdbmbxout = r13 */
+		0x670ec029,	/* isdbmbxout = r14 */
+		0x670fc029,	/* isdbmbxout = r15 */
+		0x6710c029,	/* isdbmbxout = r16 */
+		0x6711c029,	/* isdbmbxout = r17 */
+		0x6712c029,	/* isdbmbxout = r18 */
+		0x6713c029,	/* isdbmbxout = r19 */
+		0x6714c029,	/* isdbmbxout = r20 */
+		0x6715c029,	/* isdbmbxout = r21 */
+		0x6716c029,	/* isdbmbxout = r22 */
+		0x6717c029,	/* isdbmbxout = r23 */
+		0x6718c029,	/* isdbmbxout = r24 */
+		0x6719c029,	/* isdbmbxout = r25 */
+		0x671ac029,	/* isdbmbxout = r26 */
+		0x671bc029,	/* isdbmbxout = r27 */
+		0x671cc029,	/* isdbmbxout = r28 */
+		0x671dc029,	/* isdbmbxout = r29 */
+		0x671ec029,	/* isdbmbxout = r30 */
+		0x671fc029  /* isdbmbxout = r31 */
 };
 
 /* Control registers */
-uint32_t stuff_inst_ctrl_reg_read_cdsp[][2] = {
-    {0x6a00c007, 0x6707c029}, /* r7 = sa0, isdbmbxout = r7 */
-    {0x6a01c007, 0x6707c029}, /* r7 = lc0, isdbmbxout = r7 */
-    {0x6a02c007, 0x6707c029}, /* r7 = sa1, isdbmbxout = r7 */
-    {0x6a03c007, 0x6707c029}, /* r7 = lc1, isdbmbxout = r7 */
-    {0x6a04c007, 0x6707c029}, /* r7 = p3:0 isdbmbxout = r7 */
-    {0x0, 0x0},               /* Invalid: C5 reserved 	 */
-    {0x6a06c007, 0x6707c029}, /* r7 = m0,  isdbmbxout = r7 */
-    {0x6a07c007, 0x6707c029}, /* r7 = m1,  isdbmbxout = r7 */
-    {0x6a08c007, 0x6707c029}, /* r7 = usr, isdbmbxout = r7 */
-    {0x6a09c007, 0x6707c029}, /* r7 = pc,  isdbmbxout = r7 */
-    {0x6a0ac007, 0x6707c029}, /* r7 = ugp, isdbmbxout = r7 */
-    {0x6a0bc007, 0x6707c029}, /* r7 = gp,  isdbmbxout = r7 */
-    {0x6a0cc007, 0x6707c029}, /* r7 = cs0, isdbmbxout = r7 */
-    {0x6a0dc007, 0x6707c029}, /* r7 = cs1, isdbmbxout = r7 */
-    {0x6a0ec007, 0x6707c029}, /* r7 = upcyclelo, isdbmbxout = r7 */
-    {0x6a0fc007, 0x6707c029}, /* r7 = upcyclehi, isdbmbxout = r7 */
-    {0x6a10c007, 0x6707c029}, /* r7 = framelimit,isdbmbxout = r7 */
-    {0x6a11c007, 0x6707c029}, /* r7 = framekey,  isdbmbxout = r7 */
-    {0x6a12c007, 0x6707c029}, /* r7 = pktcountlo,isdbmbxout = r7 */
-    {0x6a13c007, 0x6707c029}, /* r7 = pktcounthi,isdbmbxout = r7 */
-    {0x0, 0x0},               /* Invalid: C20 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C21 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C22 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C23 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C24 reserved	 */
-    {0x0, 0x0},               /* Invalid: C25 reserved	 */
-    {0x0, 0x0},               /* Invalid: C26 reserved	 */
-    {0x0, 0x0},               /* Invalid: C27 reserved	 */
-    {0x0, 0x0},               /* Invalid: C28 reserved	 */
-    {0x0, 0x0},               /* Invalid: C29 reserved	 */
-    {0x6a1ec007, 0x6707c029}, /* r7 = utimerlo,  isdbmbxout = r7 */
-    {0x6a1fc007, 0x6707c029}  /* r7 = utimerhi,  isdbmbxout = r7 */
+uint32_t stuff_inst_ctrl_reg_read_cdsp[][2] =  {
+		{0x6a00c007,0x6707c029},	/* r7 = sa0, isdbmbxout = r7 */
+		{0x6a01c007,0x6707c029},	/* r7 = lc0, isdbmbxout = r7 */
+		{0x6a02c007,0x6707c029}, 	/* r7 = sa1, isdbmbxout = r7 */
+		{0x6a03c007,0x6707c029},	/* r7 = lc1, isdbmbxout = r7 */
+		{0x6a04c007,0x6707c029}, 	/* r7 = p3:0 isdbmbxout = r7 */
+		{0x0, 0x0},					/* Invalid: C5 reserved 	 */
+		{0x6a06c007,0x6707c029},	/* r7 = m0,  isdbmbxout = r7 */
+		{0x6a07c007,0x6707c029}, 	/* r7 = m1,  isdbmbxout = r7 */
+		{0x6a08c007,0x6707c029},	/* r7 = usr, isdbmbxout = r7 */
+		{0x6a09c007,0x6707c029},	/* r7 = pc,  isdbmbxout = r7 */ 
+		{0x6a0ac007,0x6707c029},	/* r7 = ugp, isdbmbxout = r7 */
+		{0x6a0bc007,0x6707c029}, 	/* r7 = gp,  isdbmbxout = r7 */
+		{0x6a0cc007,0x6707c029},	/* r7 = cs0, isdbmbxout = r7 */
+		{0x6a0dc007,0x6707c029}, 	/* r7 = cs1, isdbmbxout = r7 */
+		{0x6a0ec007,0x6707c029}, 	/* r7 = upcyclelo, isdbmbxout = r7 */
+		{0x6a0fc007,0x6707c029}, 	/* r7 = upcyclehi, isdbmbxout = r7 */
+		{0x6a10c007,0x6707c029}, 	/* r7 = framelimit,isdbmbxout = r7 */
+		{0x6a11c007,0x6707c029},  	/* r7 = framekey,  isdbmbxout = r7 */
+		{0x6a12c007,0x6707c029},	/* r7 = pktcountlo,isdbmbxout = r7 */	
+		{0x6a13c007,0x6707c029}, 	/* r7 = pktcounthi,isdbmbxout = r7 */
+		{0x0, 0x0}, 				/* Invalid: C20 reserved 	 */
+		{0x0, 0x0}, 				/* Invalid: C21 reserved 	 */
+		{0x0, 0x0}, 				/* Invalid: C22 reserved 	 */
+		{0x0, 0x0}, 				/* Invalid: C23 reserved 	 */
+		{0x0, 0x0}, 				/* Invalid: C24 reserved	 */
+		{0x0, 0x0}, 				/* Invalid: C25 reserved	 */
+		{0x0, 0x0}, 				/* Invalid: C26 reserved	 */
+		{0x0, 0x0}, 				/* Invalid: C27 reserved	 */
+		{0x0, 0x0}, 				/* Invalid: C28 reserved	 */
+		{0x0, 0x0}, 				/* Invalid: C29 reserved	 */
+		{0x6a1ec007,0x6707c029},  	/* r7 = utimerlo,  isdbmbxout = r7 */
+		{0x6a1fc007,0x6707c029} 	/* r7 = utimerhi,  isdbmbxout = r7 */
 };
 
 /* Per thread control registers */
-uint32_t stuff_inst_mmode_reg_read_cdsp[][2] = {
-    {0x6e80c007, 0x6707c029}, /* r7 = sgp0, isdbmbxout = r7  */
-    {0x6e81c007, 0x6707c029}, /* r7 = sgp1, isdbmbxout = r7  */
-    {0x6e82c007, 0x6707c029}, /* r7 = stid, isdbmbxout = r7  */
-    {0x6e83c007, 0x6707c029}, /* r7 = elr,  isdbmbxout = r7  */
-    {0x6e84c007, 0x6707c029}, /* r7 = badva0,isdbmbxout = r7 */
-    {0x6e85c007, 0x6707c029}, /* r7 = badva1,isdbmbxout = r7 */
-    {0x6e86c007, 0x6707c029}, /* r7 = ssr,  isdbmbxout = r7  */
-    {0x6e87c007, 0x6707c029}, /* r7 = ccr,  isdbmbxout = r7  */
-    {0x6e88c007, 0x6707c029}, /* r7 = htid, isdbmbxout = r7  */
-    {0x6e89c007, 0x6707c029}, /* r7 = badva,isdbmbxout = r7  */
-    {0x6e8ac007, 0x6707c029}, /* r7 = imask,isdbmbxout = r7  */
-    {0x6e8bc007, 0x6707c029}, /* r7 = gevb, isdbmbxout = r7  */
-    {0x0, 0x0},               /* Invalid: S12 reserved */
-    {0x0, 0x0},               /* Invalid: S13 reserved */
-    {0x0, 0x0},               /* Invalid: S14 reserved */
-    {0x0, 0x0},               /* Invalid: S15 reserved */
+uint32_t stuff_inst_mmode_reg_read_cdsp[][2] = { 
+		{0x6e80c007,0x6707c029},	/* r7 = sgp0, isdbmbxout = r7  */
+		{0x6e81c007,0x6707c029},	/* r7 = sgp1, isdbmbxout = r7  */
+		{0x6e82c007,0x6707c029}, 	/* r7 = stid, isdbmbxout = r7  */
+		{0x6e83c007,0x6707c029},	/* r7 = elr,  isdbmbxout = r7  */
+		{0x6e84c007,0x6707c029}, 	/* r7 = badva0,isdbmbxout = r7 */
+		{0x6e85c007,0x6707c029},	/* r7 = badva1,isdbmbxout = r7 */
+		{0x6e86c007,0x6707c029}, 	/* r7 = ssr,  isdbmbxout = r7  */
+		{0x6e87c007,0x6707c029},	/* r7 = ccr,  isdbmbxout = r7  */
+		{0x6e88c007,0x6707c029}, 	/* r7 = htid, isdbmbxout = r7  */
+		{0x6e89c007,0x6707c029},	/* r7 = badva,isdbmbxout = r7  */
+		{0x6e8ac007,0x6707c029}, 	/* r7 = imask,isdbmbxout = r7  */
+		{0x6e8bc007,0x6707c029},	/* r7 = gevb, isdbmbxout = r7  */
+		{0x0, 0x0}, 			/* Invalid: S12 reserved */
+		{0x0, 0x0}, 			/* Invalid: S13 reserved */
+		{0x0, 0x0}, 			/* Invalid: S14 reserved */
+		{0x0, 0x0}, 			/* Invalid: S15 reserved */		
 };
 
-uint32_t stuff_inst_mmode_imask_reg_read_cdsp[][3] = {
-    {0x7800c027, 0x6607c007, 0x6707c029}, /* r7 = #1, r7 = getimask(r7), isdbmbxout = r7 */
-    {0x7800c047, 0x6607c007, 0x6707c029}, /* r7 = #2, r7 = getimask(r7), isdbmbxout = r7 */
-    {0x7800c087, 0x6607c007, 0x6707c029}, /* r7 = #4, r7 = getimask(r7), isdbmbxout = r7 */
-    {0x7800c107, 0x6607c007, 0x6707c029}, /* r7 = #8, r7 = getimask(r7), isdbmbxout = r7 */
-    {0x7800c207, 0x6607c007, 0x6707c029}, /* r7 = #16,r7 = getimask(r7), isdbmbxout = r7 */
-    {0x7800c407, 0x6607c007, 0x6707c029}  /* r7 = #32,r7 = getimask(r7), isdbmbxout = r7 */
-};
+ uint32_t stuff_inst_mmode_imask_reg_read_cdsp[][3] = {
+	 {0x7800c027,0x6607c007,0x6707c029}, /* r7 = #1, r7 = getimask(r7), isdbmbxout = r7 */
+	 {0x7800c047,0x6607c007,0x6707c029}, /* r7 = #2, r7 = getimask(r7), isdbmbxout = r7 */
+	 {0x7800c087,0x6607c007,0x6707c029}, /* r7 = #4, r7 = getimask(r7), isdbmbxout = r7 */
+	 {0x7800c107,0x6607c007,0x6707c029}, /* r7 = #8, r7 = getimask(r7), isdbmbxout = r7 */
+	 {0x7800c207,0x6607c007,0x6707c029}, /* r7 = #16,r7 = getimask(r7), isdbmbxout = r7 */
+	 {0x7800c407,0x6607c007,0x6707c029}  /* r7 = #32,r7 = getimask(r7), isdbmbxout = r7 */
+}; 
 
 /* Global control registers */
 uint32_t stuff_inst_global_reg_read_cdsp[][2] = {
-    {0x6e90c007, 0x6707c029}, /* r7 = evb, isdbmbxout = r7 */
-    {0x6e91c007, 0x6707c029}, /* r7 = modectl, isdbmbxout = r7 */
-    {0x6e92c007, 0x6707c029}, /* r7 = syscfg, isdbmbxout = r7 */
-    {0x0, 0x0},               /* Invalid: S19 reserved	  */
-    {0x6e94c007, 0x6707c029}, /* r7 = ipendad, isdbmbxout = r7 */
-    {0x6e95c007, 0x6707c029}, /* r7 = vid, isdbmbxout = r7 */
-    {0x6e96c007, 0x6707c029}, /* r7 = vid1, isdbmbxout = r7 */
-    {0x6e97c007, 0x6707c029}, /* r7 = bestwait, isdbmbxout = r7 */
-    {0x0, 0x0},               /* Invalid: S24 reserved	  */
-    {0x6e99c007, 0x6707c029}, /* r7 = schedcfg, isdbmbxout = r7 */
-    {0x0, 0x0},               /* Invalid: S26 reserved	  */
-    {0x6e9bc007, 0x6707c029}, /* r7 = cfgbase, isdbmbxout = r7 */
-    {0x6e9cc007, 0x6707c029}, /* r7 = diag, isdbmbxout = r7 */
-    {0x6e9dc007, 0x6707c029}, /* r7 = rev, isdbmbxout = r7 */
-    {0x6e9ec007, 0x6707c029}, /* r7 = pcyclelo, isdbmbxout = r7 */
-    {0x6e9fc007, 0x6707c029}  /* r7 = pcyclehi, isdbmbxout = r7 */
+		{0x6e90c007,0x6707c029}, /* r7 = evb, isdbmbxout = r7 */	
+		{0x6e91c007,0x6707c029}, /* r7 = modectl, isdbmbxout = r7 */	
+		{0x6e92c007,0x6707c029}, /* r7 = syscfg, isdbmbxout = r7 */	
+		{0x0, 0x0}, 			 /* Invalid: S19 reserved	  */			
+		{0x6e94c007,0x6707c029}, /* r7 = ipendad, isdbmbxout = r7 */
+		{0x6e95c007,0x6707c029}, /* r7 = vid, isdbmbxout = r7 */	
+		{0x6e96c007,0x6707c029}, /* r7 = vid1, isdbmbxout = r7 */	
+		{0x6e97c007,0x6707c029}, /* r7 = bestwait, isdbmbxout = r7 */
+		{0x0, 0x0}, 			 /* Invalid: S24 reserved	  */			
+		{0x6e99c007,0x6707c029}, /* r7 = schedcfg, isdbmbxout = r7 */	
+		{0x0, 0x0}, 			 /* Invalid: S26 reserved	  */			
+		{0x6e9bc007,0x6707c029}, /* r7 = cfgbase, isdbmbxout = r7 */	
+		{0x6e9cc007,0x6707c029}, /* r7 = diag, isdbmbxout = r7 */	
+		{0x6e9dc007,0x6707c029}, /* r7 = rev, isdbmbxout = r7 */	
+		{0x6e9ec007,0x6707c029}, /* r7 = pcyclelo, isdbmbxout = r7 */	
+		{0x6e9fc007,0x6707c029}	 /* r7 = pcyclehi, isdbmbxout = r7 */	
 };
 
-uint32_t stuff_inst_sfr_cdsp[][2] =
-    {{0x7800c027, 0x6607c007},
-     {0x7800c047, 0x6607c007},
-     {0x7800c087, 0x6607c007},
-     {0x7800c107, 0x6607c007},
-     {0x7800c207, 0x6607c007},
-     {0x7800c407, 0x6607c007},
-     {0x6a0ac007, 0x6707c029},
-     {0x6a0bc007, 0x6707c029},
-     {0x6e86c007, 0x6707c029},
-     {0x6e84c007, 0x6707c029},
-     {0x6e85c007, 0x6707c029},
-     {0x6e92c007, 0x6707c029},
-     {0x6e91c007, 0x6707c029},
-     {0x6e9ec007, 0x6707c029},
-     {0x6e9fc007, 0x6707c029},
-     {0x6e90c007, 0x6707c029},
-     {0x6e9cc007, 0x6707c029},
-     {0x6e94c007, 0x6707c029},
-     {0x6e9dc007, 0x6707c029},
-     {0x6e9bc007, 0x6707c029}};
+uint32_t stuff_inst_sfr_cdsp[][2] = 
+		{{0x7800c027,0x6607c007},
+		 {0x7800c047,0x6607c007},
+		 {0x7800c087,0x6607c007},
+		 {0x7800c107,0x6607c007},
+		 {0x7800c207,0x6607c007},
+		 {0x7800c407,0x6607c007},
+		 {0x6a0ac007,0x6707c029},
+		 {0x6a0bc007,0x6707c029},
+		 {0x6e86c007,0x6707c029},
+		 {0x6e84c007,0x6707c029},
+		 {0x6e85c007,0x6707c029},
+		 {0x6e92c007,0x6707c029},
+		 {0x6e91c007,0x6707c029},
+		 {0x6e9ec007,0x6707c029},
+		 {0x6e9fc007,0x6707c029},
+		 {0x6e90c007,0x6707c029},
+		 {0x6e9cc007,0x6707c029},
+		 {0x6e94c007,0x6707c029},
+		 {0x6e9dc007,0x6707c029},
+		 {0x6e9bc007,0x6707c029}};
 
 /********************************************/
 /** Stuff instruction for register writing **/
@@ -378,90 +410,90 @@ uint32_t stuff_inst_sfr_cdsp[][2] =
 
 /* R0-R31  registers */
 uint32_t stuff_inst_gpr_write_cdsp[] = {
-    0x6ea8c000, /* r0  = isdbmbxin */
-    0x6ea8c001, /* r1  = isdbmbxin */
-    0x6ea8c002, /* r2  = isdbmbxin */
-    0x6ea8c003, /* r3  = isdbmbxin */
-    0x6ea8c004, /* r4  = isdbmbxin */
-    0x6ea8c005, /* r5  = isdbmbxin */
-    0x6ea8c006, /* r6  = isdbmbxin */
-    0x6ea8c007, /* r7  = isdbmbxin */
-    0x6ea8c008, /* r8  = isdbmbxin */
-    0x6ea8c009, /* r9  = isdbmbxin */
-    0x6ea8c00A, /* r10 = isdbmbxin */
-    0x6ea8c00B, /* r11 = isdbmbxin */
-    0x6ea8c00C, /* r12 = isdbmbxin */
-    0x6ea8c00D, /* r13 = isdbmbxin */
-    0x6ea8c00E, /* r14 = isdbmbxin */
-    0x6ea8c00F, /* r15 = isdbmbxin */
-    0x6ea8c010, /* r16 = isdbmbxin */
-    0x6ea8c011, /* r17 = isdbmbxin */
-    0x6ea8c012, /* r18 = isdbmbxin */
-    0x6ea8c013, /* r19 = isdbmbxin */
-    0x6ea8c014, /* r20 = isdbmbxin */
-    0x6ea8c015, /* r21 = isdbmbxin */
-    0x6ea8c016, /* r22 = isdbmbxin */
-    0x6ea8c017, /* r23 = isdbmbxin */
-    0x6ea8c018, /* r24 = isdbmbxin */
-    0x6ea8c019, /* r25 = isdbmbxin */
-    0x6ea8c01A, /* r26 = isdbmbxin */
-    0x6ea8c01B, /* r27 = isdbmbxin */
-    0x6ea8c01C, /* r28 = isdbmbxin */
-    0x6ea8c01D, /* r29 = isdbmbxin */
-    0x6ea8c01E, /* r30 = isdbmbxin */
-    0x6ea8c01F, /* r31 = isdbmbxin */
+	    	0x6ea8c000,	/* r0  = isdbmbxin */
+		0x6ea8c001,	/* r1  = isdbmbxin */
+		0x6ea8c002,	/* r2  = isdbmbxin */
+	    	0x6ea8c003,	/* r3  = isdbmbxin */
+		0x6ea8c004,	/* r4  = isdbmbxin */
+		0x6ea8c005,	/* r5  = isdbmbxin */
+	    	0x6ea8c006,	/* r6  = isdbmbxin */
+		0x6ea8c007,	/* r7  = isdbmbxin */
+		0x6ea8c008,	/* r8  = isdbmbxin */
+	    	0x6ea8c009,	/* r9  = isdbmbxin */
+		0x6ea8c00A,	/* r10 = isdbmbxin */
+		0x6ea8c00B,	/* r11 = isdbmbxin */
+	    	0x6ea8c00C,	/* r12 = isdbmbxin */
+		0x6ea8c00D,	/* r13 = isdbmbxin */
+		0x6ea8c00E,	/* r14 = isdbmbxin */
+	    	0x6ea8c00F,	/* r15 = isdbmbxin */
+		0x6ea8c010,	/* r16 = isdbmbxin */
+		0x6ea8c011,	/* r17 = isdbmbxin */
+		0x6ea8c012,	/* r18 = isdbmbxin */
+		0x6ea8c013,	/* r19 = isdbmbxin */
+		0x6ea8c014,	/* r20 = isdbmbxin */
+		0x6ea8c015,	/* r21 = isdbmbxin */		
+		0x6ea8c016,	/* r22 = isdbmbxin */
+		0x6ea8c017,	/* r23 = isdbmbxin */
+		0x6ea8c018,	/* r24 = isdbmbxin */
+		0x6ea8c019,	/* r25 = isdbmbxin */		
+		0x6ea8c01A,	/* r26 = isdbmbxin */
+		0x6ea8c01B,	/* r27 = isdbmbxin */		
+		0x6ea8c01C,	/* r28 = isdbmbxin */
+		0x6ea8c01D,	/* r29 = isdbmbxin */
+		0x6ea8c01E,	/* r30 = isdbmbxin */
+		0x6ea8c01F,	/* r31 = isdbmbxin */	
 };
 
 /* Control registers */
-uint32_t stuff_inst_ctrl_reg_write_cdsp[][2] = {
-    {0x6ea8c007, 0x6227c000}, /* r7 = isdbmbxin, sa0 = r7 */
-    {0x6ea8c007, 0x6227c001}, /* r7 = isdbmbxin, lc0 = r7 */
-    {0x6ea8c007, 0x6227c002}, /* r7 = isdbmbxin, sa1 = r7 */
-    {0x6ea8c007, 0x6227c003}, /* r7 = isdbmbxin, lc1 = r7 */
-    {0x6ea8c007, 0x6227c004}, /* r7 = isdbmbxin, p3:0 = r7*/
-    {0x0, 0x0},               /* Invalid: C5 reserved */
-    {0x6ea8c007, 0x6227c006}, /* r7 = isdbmbxin, m0 = r7  */
-    {0x6ea8c007, 0x6227c007}, /* r7 = isdbmbxin, m1 = r7  */
-    {0x6ea8c007, 0x6227c008}, /* r7 = isdbmbxin, usr = r7 */
-    {0x6ea8c007, 0x5287c000}, /* r7 = isdbmbxin, jump r7 (PC=r7)  */
-    {0x6ea8c007, 0x6227c00a}, /* r7 = isdbmbxin, ugp = r7 */
-    {0x6ea8c007, 0x6227c00b}, /* r7 = isdbmbxin, gp = r7  */
-    {0x6ea8c007, 0x6227c00c}, /* r7 = isdbmbxin, cs0 = r7 */
-    {0x6ea8c007, 0x6227c00d}, /* r7 = isdbmbxin, cs1 = r7 */
-    {0x6ea8c007, 0x6227c00e}, /* r7 = isdbmbxin, upcyclelo = r7 */
-    {0x6ea8c007, 0x6227c00f}, /* r7 = isdbmbxin, upcyclehi = r7 */
-    {0x6ea8c007, 0x6227c010}, /* r7 = isdbmbxin, framelimit= r7 */
-    {0x6ea8c007, 0x6227c011}, /* r7 = isdbmbxin, framekey = r7 */
-    {0x6ea8c007, 0x6227c012}, /* r7 = isdbmbxin, pktcountlo = r7 */
-    {0x6ea8c007, 0x6227c013}, /* r7 = isdbmbxin, pktcounthi = r7 */
-    {0x0, 0x0},               /* Invalid: C20 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C21 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C22 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C23 reserved 	 */
-    {0x0, 0x0},               /* Invalid: C24 reserved	 */
-    {0x0, 0x0},               /* Invalid: C25 reserved	 */
-    {0x0, 0x0},               /* Invalid: C26 reserved	 */
-    {0x0, 0x0},               /* Invalid: C27 reserved	 */
-    {0x0, 0x0},               /* Invalid: C28 reserved	 */
-    {0x0, 0x0},               /* Invalid: C29 reserved	 */
-    {0x6ea8c007, 0x6227c01e}, /* r7 = isdbmbxin, utimerlo = r7  */
-    {0x6ea8c007, 0x6227c01f}, /* r7 = isdbmbxin, utimerhi = r7 */
+uint32_t stuff_inst_ctrl_reg_write_cdsp[][2] =  {
+	{0x6ea8c007, 0x6227c000},	/* r7 = isdbmbxin, sa0 = r7 */
+	{0x6ea8c007, 0x6227c001},	/* r7 = isdbmbxin, lc0 = r7 */
+	{0x6ea8c007, 0x6227c002}, 	/* r7 = isdbmbxin, sa1 = r7 */
+	{0x6ea8c007, 0x6227c003}, 	/* r7 = isdbmbxin, lc1 = r7 */
+	{0x6ea8c007, 0x6227c004}, 	/* r7 = isdbmbxin, p3:0 = r7*/
+	{0x0, 0x0}, 				/* Invalid: C5 reserved */
+	{0x6ea8c007, 0x6227c006}, 	/* r7 = isdbmbxin, m0 = r7  */
+	{0x6ea8c007, 0x6227c007}, 	/* r7 = isdbmbxin, m1 = r7  */
+	{0x6ea8c007, 0x6227c008}, 	/* r7 = isdbmbxin, usr = r7 */
+	{0x6ea8c007, 0x5287c000},	/* r7 = isdbmbxin, jump r7 (PC=r7)  */ 
+	{0x6ea8c007, 0x6227c00a}, 	/* r7 = isdbmbxin, ugp = r7 */
+	{0x6ea8c007, 0x6227c00b}, 	/* r7 = isdbmbxin, gp = r7  */
+	{0x6ea8c007, 0x6227c00c}, 	/* r7 = isdbmbxin, cs0 = r7 */
+	{0x6ea8c007, 0x6227c00d}, 	/* r7 = isdbmbxin, cs1 = r7 */
+	{0x6ea8c007, 0x6227c00e}, 	/* r7 = isdbmbxin, upcyclelo = r7 */
+	{0x6ea8c007, 0x6227c00f}, 	/* r7 = isdbmbxin, upcyclehi = r7 */
+	{0x6ea8c007, 0x6227c010}, 	/* r7 = isdbmbxin, framelimit= r7 */
+	{0x6ea8c007, 0x6227c011}, 	/* r7 = isdbmbxin, framekey = r7 */
+	{0x6ea8c007, 0x6227c012},	/* r7 = isdbmbxin, pktcountlo = r7 */
+	{0x6ea8c007, 0x6227c013}, 	/* r7 = isdbmbxin, pktcounthi = r7 */
+	{0x0, 0x0}, 				/* Invalid: C20 reserved 	 */
+	{0x0, 0x0}, 				/* Invalid: C21 reserved 	 */
+	{0x0, 0x0}, 				/* Invalid: C22 reserved 	 */
+	{0x0, 0x0}, 				/* Invalid: C23 reserved 	 */
+	{0x0, 0x0}, 				/* Invalid: C24 reserved	 */
+	{0x0, 0x0}, 				/* Invalid: C25 reserved	 */
+	{0x0, 0x0}, 				/* Invalid: C26 reserved	 */
+	{0x0, 0x0}, 				/* Invalid: C27 reserved	 */
+	{0x0, 0x0}, 				/* Invalid: C28 reserved	 */
+	{0x0, 0x0}, 				/* Invalid: C29 reserved	 */
+	{0x6ea8c007, 0x6227c01e}, 	/* r7 = isdbmbxin, utimerlo = r7  */
+	{0x6ea8c007, 0x6227c01f}, 	/* r7 = isdbmbxin, utimerhi = r7 */
 };
 
 /* Per thread control registers */
-uint32_t stuff_inst_mmode_reg_write_cdsp[][2] = {
-    {0x6ea8c007, 0x6707c000}, /* r7 = isdbmbxin, sgp0 = r7 */
-    {0x6ea8c007, 0x6707c001}, /* r7 = isdbmbxin, sgp1 = r7 */
-    {0x6ea8c007, 0x6707c002}, /* r7 = isdbmbxin, stid = r7 */
-    {0x6ea8c007, 0x6707c003}, /* r7 = isdbmbxin, elr = r7  */
-    {0x6ea8c007, 0x6707c004}, /* r7 = isdbmbxin, badva0 = r7 */
-    {0x6ea8c007, 0x6707c005}, /* r7 = isdbmbxin, badva1 = r7 */
-    {0x6ea8c007, 0x6707c006}, /* r7 = isdbmbxin, ssr = r7 */
-    {0x6ea8c007, 0x6707c007}, /* r7 = isdbmbxin, ccr = r7 */
-    {0x0, 0x0},               /* Invalid: S12 reserved */
-    {0x0, 0x0},               /* Invalid: S13 reserved */
-    {0x0, 0x0},               /* Invalid: S14 reserved */
-    {0x0, 0x0},               /* Invalid: S15 reserved */
+uint32_t stuff_inst_mmode_reg_write_cdsp[][2] = { 
+	{0x6ea8c007, 0x6707c000}, 	/* r7 = isdbmbxin, sgp0 = r7 */
+	{0x6ea8c007, 0x6707c001}, 	/* r7 = isdbmbxin, sgp1 = r7 */
+	{0x6ea8c007, 0x6707c002},	/* r7 = isdbmbxin, stid = r7 */
+	{0x6ea8c007, 0x6707c003}, 	/* r7 = isdbmbxin, elr = r7  */
+	{0x6ea8c007, 0x6707c004}, 	/* r7 = isdbmbxin, badva0 = r7 */
+	{0x6ea8c007, 0x6707c005},	/* r7 = isdbmbxin, badva1 = r7 */
+	{0x6ea8c007, 0x6707c006}, 	/* r7 = isdbmbxin, ssr = r7 */
+	{0x6ea8c007, 0x6707c007}, 	/* r7 = isdbmbxin, ccr = r7 */
+	{0x0, 0x0}, 				/* Invalid: S12 reserved */
+	{0x0, 0x0}, 				/* Invalid: S13 reserved */
+	{0x0, 0x0}, 				/* Invalid: S14 reserved */
+	{0x0, 0x0}, 				/* Invalid: S15 reserved */	
 };
 
 /* Per thread control registers */
@@ -503,8 +535,8 @@ static const struct reg_arch_type hexagon_reg_type_cdsp = {
     .get = hexagon_get_core_reg_cdsp,
     .set = hexagon_set_core_reg_cdsp,
 };
-uint32_t hexagon_r0_used_stuff_cdsp = 0, hexagon_r1_used_stuff_cdsp = 0,
-         hexagon_r2_used_stuff_cdsp = 0, hexagon_r7_used_stuff_cdsp = 0;
+uint32_t hexagon_r0_used_stuff_cdsp = 0, hexagon_r1_used_stuff_cdsp = 0, 
+	hexagon_r2_used_stuff_cdsp = 0, hexagon_r7_used_stuff_cdsp = 0;
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
 int64_t hexagon_time_start_cdsp = 0, hexagon_time_total_cdsp = 0;
@@ -556,7 +588,7 @@ static int hexagon_mmu_cdsp(struct target *target, int *enabled);
 static int hexagon_init_arch_info_cdsp(struct target *target,
                                        struct hexagon_common_cdsp *hexagon, struct adiv5_dap *dap);
 static int hexagon_handle_target_request_cdsp(void *priv);
-static uint32_t hexagon_etm_on_cdsp(struct target *target);
+static uint64_t hexagon_etm_on_cdsp(struct target *target);
 static void hexagon_long_wait_loop_cdsp(void);
 static void hexagon_wait_loop_cdsp(void);
 static int hexagon_brkpt_setup_cdsp(struct hexagon_common_cdsp *hexagon);
@@ -567,12 +599,12 @@ struct reg *hexagon_reg_current_cdsp(struct hexa_info_cdsp *hexa_info, unsigned 
                                      struct reg_cache *cache);
 struct reg_cache *hexagon_build_reg_cache_cdsp(struct target *target, uint32_t hwthrd);
 static int hexagon_check_state_one_cdsp(struct target *target,
-                                        uint32_t mask, bool *halted, uint32_t *debug_thread);
+                                        uint64_t mask, bool *halted, uint64_t *debug_thread);
 int hexagon_read_current_registers_cdsp(struct target *target, uint32_t hwthrd);
 void hexagon_update_sp_pc_fp_gdb_server_cdsp(unsigned int hwthrd, unsigned int *pc,
                                              unsigned int *fp, unsigned int *sp);
 int hexagon_read_tlb_entry_cdsp(struct target *target);
-static void hexagon_update_tlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_t tlb_virtual, uint32_t index);
+static void hexagon_update_tlb_entry_in_structure_cdsp(uint64_t tlb_phy, uint64_t tlb_virtual, uint64_t index);
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
 void hexagon_start_time_cal_ms_cdsp(void);
@@ -585,7 +617,7 @@ int hexagon_read_mmode_registers_cdsp(struct target *target, uint32_t hwthrd);
 int hexagon_read_imask_register_cdsp(struct target *target, uint32_t hwthrd);
 static int hexagon_restore_stuff_used_reg_cdsp(struct target *target);
 int hexagon_read_global_ctrl_registers_cdsp(struct target *target);
-void hexagon_debug_reason_cdsp(struct target *target, uint32_t brkptinfo);
+void hexagon_debug_reason_cdsp(struct target *target, uint64_t brkptinfo);
 static int hexagon_write_gpr_register_cdsp(struct target *target, int regnum, uint32_t hwthrd, uint32_t value);
 static int hexagon_write_ctrl_register_cdsp(struct target *target, int regnum, uint32_t hwthrd, uint32_t value);
 static int hexagon_write_global_ctrl_register_cdsp(struct target *target, int regnum, uint32_t hwthrd, uint32_t value);
@@ -593,33 +625,33 @@ unsigned int get_phys_page_cdsp(unsigned int lo, unsigned int hi, unsigned int m
 unsigned int get_phys_mask_cdsp(unsigned int tlblo);
 static unsigned int hexagon_ct0_cdsp(unsigned int d);
 static unsigned int hexagon_clrbit_cdsp(unsigned int d, unsigned int bit);
-static unsigned int QURT_getPhysAddr_v2_cdsp(uint32_t pg_tlblo, uint32_t pg_tlbhi);
-static int hexagon_search_virtadd_in_tlb_cdsp(uint32_t virt, target_addr_t *phys);
-static int hexagon_search_virtadd_in_vtlb_cdsp(struct target *target, uint32_t virt_add, target_addr_t *phys);
-static void hexagon_memw_phys_read_cdsp(struct target *target, target_addr_t phy_address, uint32_t *value);
-static void hexagon_memw_read_cdsp(struct target *target, uint32_t virt_address, uint32_t *value);
-static void hexagon_memw_read_buffer_cdsp(struct target *target, uint32_t virt_address, uint32_t size, uint8_t *buffer);
+static unsigned int QURT_getPhysAddr_v2_cdsp(uint64_t pg_tlblo, uint64_t pg_tlbhi);
+static int hexagon_search_virtadd_in_tlb_cdsp(uint64_t virt, target_addr_t *phys);
+static int hexagon_search_virtadd_in_vtlb_cdsp(struct target *target, uint64_t virt_add, target_addr_t *phys);
+static void hexagon_memw_phys_read_cdsp(struct target *target, target_addr_t phy_address, uint64_t *value);
+static void hexagon_memw_read_cdsp(struct target *target, uint64_t virt_address, uint64_t *value);
+static void hexagon_memw_read_buffer_cdsp(struct target *target, uint64_t virt_address, uint32_t size, uint8_t *buffer);
 static void hexagon_populate_vtlb_entries_cdsp(struct target *target);
-static void hexagon_update_vtlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_t tlb_virtual, uint32_t index);
+static void hexagon_update_vtlb_entry_in_structure_cdsp(uint64_t tlb_phy, uint64_t tlb_virtual, uint64_t index);
 static void hexagon_populate_vtlb_refresh_entries_cdsp(struct target *target);
 static void hexagon_stuff_reg_restore_r7_cdsp(struct target *target);
 static void hexagon_stuff_reg_restore_r0_r1_r7_cdsp(struct target *target);
 static void hexagon_memw_phys_read_buffer_cdsp(struct target *target, target_addr_t phy_address, uint32_t size, uint8_t *buffer);
 static int hexagon_write_syscfg_register_cdsp(struct target *target, uint32_t value);
 static int hexagon_read_syscfg_register_cdsp(struct target *target);
-static int hexagon_memw_write_cdsp(struct target *target, uint32_t virt_address, uint32_t value, uint32_t size);
-static int hexagon_memw_write_buffer_cdsp(struct target *target, uint32_t virt_address, uint32_t size, const uint8_t *buffer);
-static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint *breakpoint, uint32_t bpconfig);
-static int hexagon_setup_isdb_config_cdsp(struct target *target, uint32_t old_isdbcfg0, uint8_t hbp_num);
-static int hexagon_memw_write_instruction_memory_cdsp(struct target *target, uint32_t virt_address, uint32_t value, uint8_t flag);
+static int hexagon_memw_write_cdsp(struct target *target, uint64_t virt_address, uint32_t value, uint32_t size);
+static int hexagon_memw_write_buffer_cdsp(struct target *target, uint64_t virt_address, uint32_t size, const uint8_t *buffer);
+static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint *breakpoint, uint64_t bpconfig);
+static int hexagon_setup_isdb_config_cdsp(struct target *target, uint64_t old_isdbcfg0, uint8_t hbp_num);
+static int hexagon_memw_write_instruction_memory_cdsp(struct target *target, uint64_t virt_address, uint32_t value, uint8_t flag);
 static int hexagon_unset_breakpoint_cdsp(struct target *target, struct breakpoint *breakpoint);
 static void hexagon_stuff_reg_restore_r0_r1_r2_r7_cdsp(struct target *target);
-static uint32_t hexagon_print_pc_cdsp(struct target *target);
+static uint64_t hexagon_print_pc_cdsp(struct target *target);
 static int hexagon_dump_isdb_reg_cdsp(struct hexa_info_cdsp *hexa_info);
-static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target);
+static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target, uint32_t hwthrd);
 static void hexagon_populate_vtlb_data_cdsp(struct target *target);
 static void hexagon_print_vtlb_entries_cdsp(void);
-uint32_t hexagon_no_of_hw_threads_cdsp(void);
+uint64_t hexagon_no_of_hw_threads_cdsp(void);
 int hexagon_read_hvx_registers_cdsp(struct target *target);
 int hexagon_write_hvx_registers_cdsp(struct target *target, uint32_t value);
 static void hexagon_hw_watchdog_disable_cdsp(struct target *target);
@@ -634,7 +666,7 @@ void hexagon_update_sp_pc_fp_gdb_server_cdsp(unsigned int hwthrd, unsigned int *
     *sp = gpPerHwThrdReg_cdsp[hwthrd][HEXAGON_SP_CDSP];
 }
 
-uint32_t hexagon_no_of_hw_threads_cdsp(void)
+uint64_t hexagon_no_of_hw_threads_cdsp(void)
 {
     int temp = gHexConfig_cdsp.maxHwThreads;
     LOG_DEBUG("hexagon_no_of_hw_threads_cdsp  = 0x%x  ", temp);
@@ -644,7 +676,7 @@ uint32_t hexagon_no_of_hw_threads_cdsp(void)
 static int hexagon_virt2phys_cdsp(struct target *target, target_addr_t virt, target_addr_t *phys)
 {
     int ret_val;
-    uint32_t virt_add;
+    uint64_t virt_add;
     virt_add = virt;
 
     //	LOG_DEBUG("virt address  = 0x%x  ", virt_add);
@@ -659,13 +691,14 @@ static int hexagon_virt2phys_cdsp(struct target *target, target_addr_t virt, tar
 }
 
 /* this function is use to convert the Virtual address to physical address using TLB entries*/
-static int hexagon_search_virtadd_in_tlb_cdsp(uint32_t virt, target_addr_t *phys)
+static int hexagon_search_virtadd_in_tlb_cdsp(uint64_t virt, target_addr_t *phys)
 {
     int i;
-    uint32_t offset = 0;
+    uint64_t offset = 0;
     uint64_t asid;
+    uint64_t temp_phy = 0;
 
-    for (i = 0; i < HEXAGON_TLB_ENTRIES_NUM_CDSP; i++)
+    for (i = 0; i < gHexConfig_cdsp.numTlbEntries; i++)
     {
         if ((virt >= gpHexagonTlbEntries_cdsp[i].virt_add_low) && (virt <= gpHexagonTlbEntries_cdsp[i].virt_add_high))
         {
@@ -674,18 +707,22 @@ static int hexagon_search_virtadd_in_tlb_cdsp(uint32_t virt, target_addr_t *phys
             {
                 offset = virt - gpHexagonTlbEntries_cdsp[i].virt_add_low;
                 *phys = gpHexagonTlbEntries_cdsp[i].phy_add_low + offset;
-                //	LOG_DEBUG("Physical address  = 0x%x  ", (uint32_t)*phys);
+                LOG_DEBUG("i=%d; virt =0x%llx ; virt_add_low = 0x%llx; phy_add_low = 0x%llx  ",i, virt, gpHexagonTlbEntries_cdsp[i].virt_add_low, gpHexagonTlbEntries_cdsp[i].phy_add_low);
+                LOG_DEBUG("Physical address  = 0x%x  ",*phys);
                 return ERROR_OK;
             }
             else
             {
                 offset = virt - gpHexagonTlbEntries_cdsp[i].virt_add_low;
                 *phys = gpHexagonTlbEntries_cdsp[i].phy_add_low + offset;
+                LOG_DEBUG("Physical address  = 0x%x  ",*phys);
+                LOG_DEBUG("i=%d; virt =0x%llx ; virt_add_low = 0x%llx; phy_add_low = 0x%llx  ",i, virt, gpHexagonTlbEntries_cdsp[i].virt_add_low, gpHexagonTlbEntries_cdsp[i].phy_add_low);
+
                 return ERROR_OK;
             }
         }
     }
-    if (i == HEXAGON_TLB_ENTRIES_NUM_CDSP)
+    if (i == gHexConfig_cdsp.numTlbEntries)
     {
         *phys = 0;
         LOG_DEBUG("Entry not found in TLB for virt address = 0x%x  ", virt);
@@ -695,13 +732,12 @@ static int hexagon_search_virtadd_in_tlb_cdsp(uint32_t virt, target_addr_t *phys
 }
 
 /* this function is use to convert the Virtual address to physical address using VTLB entries*/
-static int hexagon_search_virtadd_in_vtlb_cdsp(struct target *target, uint32_t virt_add, target_addr_t *phys)
+static int hexagon_search_virtadd_in_vtlb_cdsp(struct target *target, uint64_t virt_add, target_addr_t *phys)
 {
-    uint32_t offset = 0, i;
+    uint64_t offset = 0, i;
     tlb_entries_cdsp *temp = NULL;
-    uint64_t asid;
 
-    //	hexagon_populate_vtlb_refresh_entries_cdsp(target);
+    	// hexagon_populate_vtlb_refresh_entries_cdsp(target);
     //	LOG_INFO("hexagon_vtlb_data_cdsp.valid_vtlb_no_of_entries = 0x%x  ", hexagon_vtlb_data_cdsp.valid_vtlb_no_of_entries);
 
     if (hexagon_vtlb_data_cdsp.vtlb_no_of_entries == 0)
@@ -718,13 +754,14 @@ static int hexagon_search_virtadd_in_vtlb_cdsp(struct target *target, uint32_t v
             {
                 offset = virt_add - temp->virt_add_low;
                 *phys = temp->phy_add_low + offset;
-                //	LOG_DEBUG("Physical address  = 0x%x  ", (uint32_t)*phys);
+
                 return ERROR_OK;
             }
             else
             {
                 offset = virt_add - temp->virt_add_low;
                 *phys = temp->phy_add_low + offset;
+
                 return ERROR_OK;
             }
         }
@@ -797,7 +834,7 @@ static void hexagon_populate_vtlb_refresh_entries_cdsp(struct target *target)
 #endif
 
 #ifdef HEXAGON_VTLB_NEW_ARCH_CDSP
-    uint32_t output[2] = {0};
+    uint64_t output[2] = {0};
 
     hexagon_memw_read_cdsp(target, hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA - 16,
                            &hexagon_vtlb_data_cdsp.vtlb_current_counter);
@@ -808,13 +845,13 @@ static void hexagon_populate_vtlb_refresh_entries_cdsp(struct target *target)
     hexagon_memw_read_cdsp(target, hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA, &output[0]);
     hexagon_memw_read_cdsp(target, hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA + 4, &output[1]);
 
-    memcpy(&hexagon_vtlb_data_cdsp.qurtk_vtlb_main, &output, 8);
-    LOG_DEBUG("hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr = 0x%x ",
-              hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr);
+    // memcpy(&hexagon_vtlb_data_cdsp.qurtk_vtlb_main, &output, 8);
+    // LOG_DEBUG("hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr = 0x%x ",
+    //           hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr);
 
     hexagon_memw_read_cdsp(target, hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr, &output[0]);
     hexagon_memw_read_cdsp(target, hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr + 4, &output[1]);
-    memcpy(&hexagon_vtlb_data_cdsp.qurtk_vtlb_main_next, &output, 8);
+    // memcpy(&hexagon_vtlb_data_cdsp.qurtk_vtlb_main_next, &output, 8);
     LOG_DEBUG("hexagon_vtlb_data_cdsp.qurtk_vtlb_main_next.table_entries= 0x%x ",
               hexagon_vtlb_data_cdsp.qurtk_vtlb_main_next.table_entries);
     hexagon_vtlb_data_cdsp.vtlb_no_of_entries = hexagon_vtlb_data_cdsp.qurtk_vtlb_main_next.table_entries;
@@ -950,9 +987,10 @@ static void hexagon_populate_vtlb_data_cdsp(struct target *target)
 
     // QURTK_vtlb_main 		 	 D:FE01CED8--FE01CEDB
 
-    uint32_t qurtk_vtlb_main_addr = hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA;
     hexagon_vtlb_data_cdsp.valid_vtlb_no_of_entries = 0;
-    uint32_t output[2] = {0}, temp, temp1, temp2;
+    uint64_t output[2] = {0}, temp, temp1, temp2;
+
+    LOG_DEBUG("qurtk_vtlb_main_addr   = 0x%x ",qurtk_vtlb_main_addr);
 
     hexagon_memw_read_cdsp(target, qurtk_vtlb_main_addr,
                            &hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA);
@@ -1070,7 +1108,7 @@ static void hexagon_populate_vtlb_entries_cdsp(struct target *target)
     {
         hexagon_memw_read_cdsp(target, address, &output[0]);
         hexagon_memw_read_cdsp(target, address + 4, &output[1]);
-        //	LOG_DEBUG("Phy_page = 0x%08x and virtual page  = 0x%08x " , output[0],output[1]);
+        LOG_DEBUG("raw start range = 0x%08x and raw end range  = 0x%08x " , output[0],output[1]);
         hexagon_update_vtlb_entry_in_structure_cdsp(output[0], output[1], i);
         address = address + 8;
     }
@@ -1091,7 +1129,7 @@ static void hexagon_populate_vtlb_entries_cdsp(struct target *target)
 static void hexagon_print_vtlb_entries_cdsp(void)
 {
     tlb_entries_cdsp *temp = NULL;
-    uint32_t i;
+    uint64_t i;
     LOG_DEBUG("Printing the VTLB content");
 
     for (i = 0; i < hexagon_vtlb_data_cdsp.valid_vtlb_no_of_entries; i++)
@@ -1099,25 +1137,29 @@ static void hexagon_print_vtlb_entries_cdsp(void)
         temp = hexagon_vtlb_entries_cdsp + i;
         LOG_DEBUG("VA = 0x%x --> PA = 0x%x ", temp->virt_tlb_raw_data, temp->phys_tlb_raw_data);
         // LOG_DEBUG("VA Page = 0x%08x PA Page =  0x%08x and Page size = %d", temp->virt_page,temp->phy_page,temp->page_size);
-        LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x", temp->virt_add_low, temp->virt_add_high,
-                  (uint32_t)temp->phy_add_low, (uint32_t)temp->phy_add_high);
+        LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%llx -- 0x%llx", temp->virt_add_low, temp->virt_add_high,
+                  temp->phy_add_low, temp->phy_add_high);
+        LOG_DEBUG("phy page = 0x%lx \t virt page = 0x%lx and SID = 0x%lx ", temp->phy_page, temp->virt_page,
+                  temp->asid);
     }
 }
 
 /* this function update the tlb entry in global structure  hexagon_tlb_entries */
-static void hexagon_update_vtlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_t tlb_virtual, uint32_t index)
+static void hexagon_update_vtlb_entry_in_structure_cdsp(uint64_t tlb_phy, uint64_t tlb_virtual, uint64_t index)
 {
-    uint32_t mask, size = 0, virt_page, phy_page, virt_add, phy_add;
+    uint64_t mask, size = 0, virt_page, phy_page, virt_add, phy_add;
     uint8_t global_bit;
     char *page_size;
     tlb_entries_cdsp *temp = NULL;
     union pg_tlblo_t_cdsp tlblo;
     union pg_tlbhi_t_cdsp tlbhi;
 
+    uint64_t full_phys_add = 0;
+
     // LOG_DEBUG("hexagon_update_vtlb_entry_in_structure_cdsp  Enter");
     if ((index >= hexagon_vtlb_data_cdsp.vtlb_no_of_entries) || (hexagon_vtlb_data_cdsp.valid_vtlb_no_of_entries >= hexagon_vtlb_data_cdsp.vtlb_no_of_entries))
     {
-        LOG_DEBUG("Index is greate than hexagon_vtlb_data_cdsp.vtlb_no_of_entries");
+        // LOG_DEBUG("Index is greater than hexagon_vtlb_data_cdsp.vtlb_no_of_entries");
         return;
     }
     virt_page = VIRT_PAGE_CDSP(tlb_virtual);
@@ -1197,13 +1239,17 @@ static void hexagon_update_vtlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32
     temp->virt_add_high = virt_add + size;
 
     temp->phy_add_low = temp->phy_page << 12;
-    temp->phy_add_high = temp->phy_add_low + size;
-    // LOG_DEBUG("index = %d, VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x",index, temp->virt_add_low,temp->virt_add_high,temp->phy_add_low,temp->phy_add_high);
+
+    temp->phy_add_high = temp->phy_add_low+ size;
+    LOG_DEBUG("Phy after left shift = 0x%llx",temp->phy_add_low);
+    LOG_DEBUG("Phy page address before shift = 0x%llx",temp->phy_page);
+    LOG_DEBUG("index = %d, VA = 0x%lx -- 0x%lx and PA = 0x%llx -- 0x%llx", index, temp->virt_add_low,temp->virt_add_high,temp->phy_add_low,temp->phy_add_high);
+
     // LOG_DEBUG("hexagon_update_vtlb_entry_in_structure_cdsp Exit");
 }
 
 /* this interface is to read thebuffer via memw interface*/
-static void hexagon_memw_read_buffer_cdsp(struct target *target, uint32_t virt_address, uint32_t size, uint8_t *buffer)
+static void hexagon_memw_read_buffer_cdsp(struct target *target, uint64_t virt_address, uint32_t size, uint8_t *buffer)
 {
     uint32_t count, i;
     uint8_t *temp;
@@ -1219,7 +1265,7 @@ static void hexagon_memw_read_buffer_cdsp(struct target *target, uint32_t virt_a
         temp = buffer;
         for (i = 0; i < count; i++)
         {
-            hexagon_memw_read_cdsp(target, virt_address + 4 * i, (uint32_t *)temp);
+            hexagon_memw_read_cdsp(target, virt_address + 4 * i, (uint64_t *)temp);
             temp = temp + 4;
         }
     }
@@ -1230,25 +1276,25 @@ static void hexagon_memw_read_buffer_cdsp(struct target *target, uint32_t virt_a
 }
 
 /* this interface is to read the  memory via memw interface*/
-static void hexagon_memw_read_cdsp(struct target *target, uint32_t virt_address, uint32_t *value)
+static void hexagon_memw_read_cdsp(struct target *target, uint64_t virt_address, uint64_t *value)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts;
-    uint32_t stuff_inst[] = {0x6ea8c000, 0x9180c007, 0x6707c029};
+    uint32_t isdb_mmode_cmd, isdb_cmd_status, isdbsts;
+    uint64_t phy_addr;
+    uint64_t stuff_inst[] = {0x6ea8c000, 0x9180c007, 0x6707c029};
     /* Stuff instruction 0x6ea8c000-->{r0 =isdbmbxin} 0x9180c007-->{r7 = memw(r0+#0) } 0x6707c029-->{isdbmbxout=r7}*/
     int retval, i;
 
-    hexagon_r0_used_stuff_cdsp = 1;
-    hexagon_r7_used_stuff_cdsp = 1;
 
-    /*retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK)
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK"); */
+
+    isdb_mmode_cmd = 0x184;
 
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                      hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN_CDSP, virt_address);
+    
+
     if (retval != ERROR_OK)
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
     for (i = 0; i < 3; i++)
@@ -1292,18 +1338,22 @@ static void hexagon_memw_read_cdsp(struct target *target, uint32_t virt_address,
     }
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                     hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT_CDSP, value);
+
+    LOG_DEBUG("value read from mbx out IS 0x%x",value);
+
     if (retval != ERROR_OK)
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed ");
 }
 
 /* This function is used to read memory word using memw_phys instruction
     In this function we passed the physical address as an argument*/
-static void hexagon_memw_phys_read_cdsp(struct target *target, target_addr_t phy_address, uint32_t *value)
+static void hexagon_memw_phys_read_cdsp(struct target *target, target_addr_t phy_address, uint64_t *value)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts, phy_add[2], t_phy_address;
+    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts;
+    uint64_t phy_add[2], t_phy_address;
     uint32_t stuff_inst[] = {0x6ea8c000, 0x6ea8c001, 0x9200e107, 0x6707c029};
     int retval, i;
     // target_addr_t t_phy_address;
@@ -1323,13 +1373,16 @@ static void hexagon_memw_phys_read_cdsp(struct target *target, target_addr_t phy
 
     phy_add[0] = t_phy_address & 0x7ff;
     phy_add[1] = t_phy_address >> 11;
-    // LOG_DEBUG("physical address= 0x%x phy_add[0] = 0x%x  phy_add[1] = 0x%x",(uint32_t)phy_address, phy_add[0],phy_add[1]);
 
+
+    LOG_DEBUG("physical address= 0x%llx phy_add[0] = 0x%x  phy_add[1] = 0x%x",phy_address, phy_add[0],phy_add[1]);
     for (i = 0; i < 2; i++)
     {
-        /*	retval = enable_dbg_sys_pwr(swddp);
+        /*	
+        retval = enable_dbg_sys_pwr(swddp);
         if (retval != ERROR_OK)
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");*/
+                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
+        */
 
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                          hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN_CDSP, phy_add[i]);
@@ -1558,7 +1611,7 @@ static int hexagon_add_breakpoint_cdsp(struct target *target, struct breakpoint 
 {
     LOG_DEBUG("Entering %s\n", __FUNCTION__);
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
-    uint32_t bpconfig = 0;
+    uint64_t bpconfig = 0;
 
     bpconfig |= (1 << 17); // BRKPTPC match enable
                            //	bpconfig |=(0xff<<18);	//STID match enable, if not working properly, disable it & retry. Typical STID = 0x00ff00ff
@@ -1575,7 +1628,7 @@ static int hexagon_add_breakpoint_cdsp(struct target *target, struct breakpoint 
     return hexagon_set_breakpoint_cdsp(target, breakpoint, bpconfig); // address match enable
 }
 
-static int hexagon_setup_isdb_config_cdsp(struct target *target, uint32_t old_isdbcfg0, uint8_t hbp_num)
+static int hexagon_setup_isdb_config_cdsp(struct target *target, uint64_t old_isdbcfg0, uint8_t hbp_num)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
@@ -1618,12 +1671,12 @@ static int hexagon_setup_isdb_config_cdsp(struct target *target, uint32_t old_is
 }
 
 /** Setup hardware Breakpoint Register Pair bpconfig parameter will be considered for setting up on-chip breakpoints, otherwise ignored **/
-static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint *breakpoint, uint32_t bpconfig)
+static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint *breakpoint, uint64_t bpconfig)
 {
     LOG_DEBUG("Entering %s\n", __FUNCTION__);
     int retval;
     int brp_i = 0;
-    uint32_t control, isdbcfg0 = 0;
+    uint64_t control, isdbcfg0 = 0;
     uint8_t byte_addr_select = 0x0F;
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
@@ -1657,7 +1710,7 @@ static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint 
         }
         LOG_DEBUG(" %s\t :-------: %d\n", __FUNCTION__, __LINE__);
 
-        uint32_t bpt_value; // REVIEW: can be UINT32 as VA is 32bit, & VA+ASID takes 39 bit. NMI //for now considering only VA without ASID
+        uint64_t bpt_value; // REVIEW: can be UINT32 as VA is 32bit, & VA+ASID takes 39 bit. NMI //for now considering only VA without ASID
         LOG_DEBUG(" %s\t :-------: %d\t brp_i = %d\n", __FUNCTION__, __LINE__, brp_i);
         LOG_DEBUG(" %s\t :-------: %d\t brp_list = %x\n", __FUNCTION__, __LINE__, brp_list);
         LOG_DEBUG(" %s\t :-------: %d\t brp_list[brp_i] = %x\n", __FUNCTION__, __LINE__, brp_list[brp_i]);
@@ -1681,7 +1734,7 @@ static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint 
 
         // TODO: Check if T32 checks for system halted then sets HW BP, or during threads in RUN mode it sets the BP
         int retrycount;
-        uint32_t brkptpc, brkptcfg;
+        uint64_t brkptpc, brkptcfg;
 
         brkptpc = brkptcfg = retrycount = 0;
         retval = ERROR_OK;
@@ -1777,7 +1830,7 @@ static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint 
     {
         retval = ERROR_OK;
 
-        uint32_t first_instrn_addr, current_addr;
+        uint64_t first_instrn_addr, current_addr;
         first_instrn_addr = 0;
         current_addr = breakpoint->address;
         //		uint8_t code_arr[20]= {0};
@@ -1898,14 +1951,14 @@ static int hexagon_set_breakpoint_cdsp(struct target *target, struct breakpoint 
 /*This function write to instruction memory in this function if flag is passed as 1 means we are passing the value to write otherwise
 we need to use the brpkt instruction opcode to write into the meory*/
 
-static int hexagon_memw_write_instruction_memory_cdsp(struct target *target, uint32_t virt_address, uint32_t value, uint8_t flag)
+static int hexagon_memw_write_instruction_memory_cdsp(struct target *target, uint64_t virt_address, uint32_t value, uint8_t flag)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts;
-    uint32_t stuff_inst[] = {0x6ea8c000, 0x6ea8c007, 0xa180c700, 0xa000c000, 0xa800c000, 0x56c0c000, 0x57c0c002};
-    uint32_t address[2];
+    uint64_t stuff_inst[] = {0x6ea8c000, 0x6ea8c007, 0xa180c700, 0xa000c000, 0xa800c000, 0x56c0c000, 0x57c0c002};
+    uint64_t address[2];
     int retval, i;
     target_addr_t phy_addr = 0;
 
@@ -1922,7 +1975,7 @@ static int hexagon_memw_write_instruction_memory_cdsp(struct target *target, uin
     retval = hexagon_virt2phys_cdsp(target, virt_address, &phy_addr);
     if (retval == ERROR_FAIL)
     {
-        LOG_DEBUG("There is no TLB mapping for virtual address  = 0x%x ", (uint32_t)address);
+        LOG_DEBUG("There is no TLB mapping for virtual address  = 0x%x ", (uint64_t)address);
         return retval;
     }
     hexagon_r0_used_stuff_cdsp = 1;
@@ -2017,12 +2070,12 @@ static int hexagon_write_buffer_cdsp(struct target *target, target_addr_t addres
 
     retval = hexagon_virt2phys_cdsp(target, address, &phy_addr);
 #ifdef _DEBUG_HEXAGON_CDSP_
-    LOG_DEBUG("address  = 0x%x and size = %u , phy add = 0x%x", (uint32_t)address, size, (uint32_t)phy_addr);
+    LOG_DEBUG("address  = 0x%x and size = %u , phy add = 0x%x", (uint64_t)address, size, (uint64_t)phy_addr);
 #endif
 
     if (retval == ERROR_FAIL)
     {
-        LOG_DEBUG("There is no TLB mapping for virtual address	= 0x%x ", (uint32_t)address);
+        LOG_DEBUG("There is no TLB mapping for virtual address	= 0x%x ", (uint64_t)address);
         return retval;
     }
     if (size == 3)
@@ -2051,7 +2104,7 @@ static int hexagon_write_buffer_cdsp(struct target *target, target_addr_t addres
 }
 
 /*this function is use to write memory buffer using memw interface */
-static int hexagon_memw_write_buffer_cdsp(struct target *target, uint32_t virt_address, uint32_t size, const uint8_t *buffer)
+static int hexagon_memw_write_buffer_cdsp(struct target *target, uint64_t virt_address, uint32_t size, const uint8_t *buffer)
 {
     uint32_t count, i, value, retval = ERROR_OK;
     uint8_t *temp;
@@ -2068,14 +2121,14 @@ static int hexagon_memw_write_buffer_cdsp(struct target *target, uint32_t virt_a
 }
 
 /*This function used to write memory using memw interface  */
-static int hexagon_memw_write_cdsp(struct target *target, uint32_t virt_address, uint32_t value, uint32_t size)
+static int hexagon_memw_write_cdsp(struct target *target, uint64_t virt_address, uint32_t value, uint32_t size)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts, sys_cfg;
     uint32_t stuff_inst[] = {0x6ea8c000, 0x6ea8c007, 0xa180c700, 0xa000c000, 0xa800c000, 0xa840c000};
-    uint32_t address[2];
+    uint64_t address[2];
     int retval, i = 0;
 
     /* Stuff inst  0x6ea8c000-->{r0 = isdbmbxin }0x6ea8c007-->{r7 = isdbmbxin}
@@ -2188,8 +2241,11 @@ static int hexagon_read_buffer_cdsp(struct target *target, target_addr_t address
                                     uint32_t size, uint8_t *buffer)
 {
     int retval = ERROR_OK;
-    target_addr_t phy_addr = 0;
+    long long int phy_addr = 0;
     uint32_t value;
+    long long int temp_phy_addr = 0;
+
+    start_buffer = clock();
 
     if (address == 0x0)
     {
@@ -2201,7 +2257,7 @@ static int hexagon_read_buffer_cdsp(struct target *target, target_addr_t address
 #endif
 
     retval = hexagon_virt2phys_cdsp(target, address, &phy_addr);
-    LOG_DEBUG("hexagon_read_buffer_cdsp address  = 0x%x and size = %u , phy add = 0x%lx", (uint32_t)address, size, (uint32_t)phy_addr);
+    // LOG_DEBUG("hexagon_read_buffer_cdsp address  = 0x%x and size = %u , phy add = 0x%lx", (uint32_t)address, size, (uint32_t)phy_addr);
 
     if (retval == ERROR_FAIL)
     {
@@ -2212,7 +2268,7 @@ static int hexagon_read_buffer_cdsp(struct target *target, target_addr_t address
     if (size < 4)
     {
         hexagon_memw_phys_read_cdsp(target, phy_addr, &value);
-        //	hexagon_memw_read_cdsp(target, address, &value);
+        	// hexagon_memw_read_cdsp(target, address, &value);
         //	LOG_DEBUG("retrieved value using  hexagon_memw_phys_read for size < 4  = 0x%x ", value);
         switch (size)
         {
@@ -2239,10 +2295,12 @@ static int hexagon_read_buffer_cdsp(struct target *target, target_addr_t address
         hexagon_memw_phys_read_buffer_cdsp(target, phy_addr, size, buffer);
         // hexagon_memw_read_buffer_cdsp(target, address,size, buffer);
     }
-#ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
-    hexagon_end_time_cal_ms_cdsp();
-    LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total_cdsp);
-#endif
+
+
+    end_buffer = clock();
+    buffer_execution = ((double)(end_buffer - start_buffer))/CLOCKS_PER_SEC;
+    LOG_INFO("AFTER read_buffer %lf", buffer_execution);
+
     return retval;
 }
 
@@ -2264,7 +2322,7 @@ static void hexagon_memw_phys_read_buffer_cdsp(struct target *target, target_add
         temp = buffer;
         for (i = 0; i < count; i++)
         {
-            hexagon_memw_phys_read_cdsp(target, phy_address + 4 * i, (uint32_t *)temp);
+            hexagon_memw_phys_read_cdsp(target, phy_address + 4 * i, (uint64_t *)temp);
             temp = temp + 4;
         }
     }
@@ -2280,8 +2338,7 @@ static int hexagon_read_syscfg_register_cdsp(struct target *target)
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval, i = 0;
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
     /*Stuff inst  {r7 = syscfg}  {isdbmbxout = r7} */
 
     hexagon_r7_used_stuff_cdsp = 1;
@@ -2529,7 +2586,7 @@ static int hexagon_read_memory_cdsp(struct target *target, target_addr_t address
                                     uint32_t size, uint32_t count, uint8_t *buffer)
 {
     int retval = ERROR_OK;
-    LOG_DEBUG("  address  = 0x%x and size = %u,count=%u  ", (uint32_t)address, size, count);
+    LOG_DEBUG("  address  = 0x%x and size = %u,count=%u  ", (uint64_t)address, size, count);
     return retval;
 }
 
@@ -2537,7 +2594,7 @@ static int hexagon_write_memory_cdsp(struct target *target, target_addr_t addres
                                      uint32_t size, uint32_t count, const uint8_t *buffer)
 {
     int retval = ERROR_OK;
-    LOG_DEBUG("  address  = 0x%x and size = %u,count=%u  ", (uint32_t)address, size, count);
+    LOG_DEBUG("  address  = 0x%x and size = %u,count=%u  ", (uint64_t)address, size, count);
     return retval;
 }
 
@@ -2635,7 +2692,7 @@ static int hexagon_halt_cdsp(struct target *target)
 {
     static uint8_t vtlb_initialized = 0;
     int retval = ERROR_OK;
-    uint32_t debug_thread, prev_target_state, counter = 0, sys_cfg;
+    uint64_t debug_thread, prev_target_state, counter = 0, sys_cfg;
     bool halted;
     halted = debug_thread = 0;
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
@@ -2763,7 +2820,8 @@ int hexagon_read_tlb_entry_cdsp(struct target *target)
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     //	struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdbsts, read_val[1][2];
+    uint32_t isdbsts;
+    uint64_t read_val[1][2];
     int retval, i = 0, k = 0;
     uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status;
     uint32_t stuff_inst[1][4] = {{0x7800c022, 0x6c42c000, 0x6700c029, 0x6701c029}};
@@ -2779,7 +2837,7 @@ int hexagon_read_tlb_entry_cdsp(struct target *target)
     hexagon_start_time_cal_ms_cdsp();
 #endif
 
-    for (k = 0; k < HEXAGON_TLB_ENTRIES_NUM_CDSP; k++)
+    for (k = 0; k < gHexConfig_cdsp.numTlbEntries; k++)
     {
         /*	retval = enable_dbg_sys_pwr(swddp);
                 if (retval != ERROR_OK) {
@@ -2797,6 +2855,7 @@ int hexagon_read_tlb_entry_cdsp(struct target *target)
         {
             LOG_DEBUG("HEXAGON_ISDB_ISDBCMD_CDSP return value is not OK");
         }
+        
         /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */
         isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS_CDSP;
         if (isdb_cmd_status)
@@ -2942,13 +3001,13 @@ int hexagon_read_tlb_entry_cdsp(struct target *target)
     // LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", read_val[1]);
 
     LOG_DEBUG("Printing TLB Entries");
-    for (k = 0; k < HEXAGON_TLB_ENTRIES_NUM_CDSP; k++)
+    for (k = 0; k < gHexConfig_cdsp.numTlbEntries; k++)
     {
         LOG_DEBUG("VA raw = 0x%x --> PA raw  = 0x%x ", gpHexagonTlbEntries_cdsp[k].virt_tlb_raw_data, gpHexagonTlbEntries_cdsp[k].phys_tlb_raw_data);
         /*	LOG_DEBUG("VA = 0x%x --> PA = 0x%x and page size = %d", gpHexagonTlbEntries_cdsp[k].virt_page,gpHexagonTlbEntries_cdsp[k].phy_page,
                         gpHexagonTlbEntries_cdsp[k].page_size); */
-        LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x", gpHexagonTlbEntries_cdsp[k].virt_add_low,
-                  gpHexagonTlbEntries_cdsp[k].virt_add_high, (uint32_t)gpHexagonTlbEntries_cdsp[k].phy_add_low, (uint32_t)gpHexagonTlbEntries_cdsp[k].phy_add_high);
+        LOG_DEBUG("VA = 0x%lx -- 0x%lx and PA = 0x%llx -- 0x%llx", gpHexagonTlbEntries_cdsp[k].virt_add_low,
+                  gpHexagonTlbEntries_cdsp[k].virt_add_high, gpHexagonTlbEntries_cdsp[k].phy_add_low, gpHexagonTlbEntries_cdsp[k].phy_add_high);
     }
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
@@ -2959,7 +3018,7 @@ int hexagon_read_tlb_entry_cdsp(struct target *target)
     return ERROR_OK;
 }
 
-static unsigned int QURT_getPhysAddr_v2_cdsp(uint32_t pg_tlblo, uint32_t pg_tlbhi)
+static unsigned int QURT_getPhysAddr_v2_cdsp(uint64_t pg_tlblo, uint64_t pg_tlbhi)
 {
     union pg_tlblo_t_cdsp tlblo;
     union pg_tlbhi_t_cdsp tlbhi;
@@ -3026,20 +3085,22 @@ unsigned int get_phys_page_cdsp(unsigned int lo, unsigned int hi, unsigned int m
 }
 
 /* this function update the tlb entry in global structure  hexagon_tlb_entries */
-static void hexagon_update_tlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_t tlb_virtual, uint32_t index)
+static void hexagon_update_tlb_entry_in_structure_cdsp(uint64_t tlb_phy, uint64_t tlb_virtual, uint64_t index)
 {
-    uint32_t mask, size = 0, virt_add, phy_add;
+    //san:
+    uint64_t mask, size = 0, virt_add, phy_add;
     char *page_size;
     static int i;
 
     union pg_tlblo_t_cdsp tlblo;
     union pg_tlbhi_t_cdsp tlbhi;
 
-    if (index >= HEXAGON_TLB_ENTRIES_NUM_CDSP)
+    if (index >= gHexConfig_cdsp.numTlbEntries)
     {
-        LOG_DEBUG("Index is greate than HEXAGON_TLB_ENTRIES_NUM");
+        LOG_DEBUG("Index is greater than HEXAGON_TLB_ENTRIES_NUM");
         return;
     }
+
     tlblo.raw = tlb_phy;
     tlbhi.raw = tlb_virtual;
     gpHexagonTlbEntries_cdsp[index].phy_page = QURT_getPhysAddr_v2_cdsp(tlb_phy, tlb_virtual);
@@ -3075,6 +3136,14 @@ static void hexagon_update_tlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_
     gpHexagonTlbEntries_cdsp[index].A1 = P_A1_CDSP(tlb_virtual);
     gpHexagonTlbEntries_cdsp[index].A0 = P_A0_CDSP(tlb_virtual);
     page_size = PAGE_SIZE_CDSP(tlb_phy, mask);
+
+    LOG_DEBUG("SID = 0x%lx ", gpHexagonTlbEntries_cdsp[index].asid);
+    LOG_DEBUG("virt_add = 0x%lx ", virt_add);
+    LOG_DEBUG("phys_add = 0x%lx ", phy_add);
+
+
+    //     virt_add = gpHexagonTlbEntries_cdsp[index].virt_page << 12;
+    // phy_add = gpHexagonTlbEntries_cdsp[index].phy_page << 12;
 
     if (strcmp(page_size, "4KB") == 0)
     {
@@ -3114,7 +3183,14 @@ static void hexagon_update_tlb_entry_in_structure_cdsp(uint32_t tlb_phy, uint32_
     gpHexagonTlbEntries_cdsp[index].virt_add_low = gpHexagonTlbEntries_cdsp[index].virt_page << 12;
     gpHexagonTlbEntries_cdsp[index].virt_add_high = gpHexagonTlbEntries_cdsp[index].virt_add_low + size;
     gpHexagonTlbEntries_cdsp[index].phy_add_low = gpHexagonTlbEntries_cdsp[index].phy_page << 12;
-    gpHexagonTlbEntries_cdsp[index].phy_add_high = gpHexagonTlbEntries_cdsp[index].phy_add_low + size;
+	gpHexagonTlbEntries_cdsp[index].phy_add_high = (gpHexagonTlbEntries_cdsp[index].phy_add_low) + size;
+    
+    LOG_DEBUG("Phy page address left shift = 0x%lx", gpHexagonTlbEntries_cdsp[index].phy_page);
+
+    LOG_DEBUG("Phy page address left shift = 0x%lx", gpHexagonTlbEntries_cdsp[index].phy_add_low);
+
+
+    LOG_DEBUG("index = %d, VA = 0x%lx -- 0x%lx and PA = 0x%llx -- 0x%llx",index, gpHexagonTlbEntries_cdsp[index].virt_add_low,gpHexagonTlbEntries_cdsp[index].virt_add_high,gpHexagonTlbEntries_cdsp[index].phy_add_low,gpHexagonTlbEntries_cdsp[index].phy_add_high);
 }
 static int hexagon_dump_hwthrd_reg_cdsp(struct target *target, uint32_t hwthrd)
 {
@@ -3122,7 +3198,8 @@ static int hexagon_dump_hwthrd_reg_cdsp(struct target *target, uint32_t hwthrd)
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
 
     struct reg_cache *cache;
-    uint32_t i;
+    uint64_t i;
+    uint64_t current_pc_thread_select;
 
     if (hwthrd == gHexConfig_cdsp.maxHwThreads)
     {
@@ -3132,8 +3209,16 @@ static int hexagon_dump_hwthrd_reg_cdsp(struct target *target, uint32_t hwthrd)
         {
             for (i = 0; i < HEXAGON_PER_THREAD_REGS_CDSP; i++)
             {
+                current_pc_thread_select = *((uint64_t *)cache->reg_list[41].value);
+
+                if ((current_pc_thread_select == breakpoint_address_thread_select))
+                {   
+                    thread_id_thread_select = *((uint64_t *)cache->reg_list[72].value);
+                    
+                }
+                
                 LOG_DEBUG("%s : %s = 0x%x", cache->name,
-                          cache->reg_list[i].name, *((uint32_t *)cache->reg_list[i].value));
+                          cache->reg_list[i].name, *((uint64_t *)cache->reg_list[i].value));
             }
             cache = cache->next;
         }
@@ -3142,7 +3227,7 @@ static int hexagon_dump_hwthrd_reg_cdsp(struct target *target, uint32_t hwthrd)
         for (i = 0; i < HEXAGON_GLOBAL_REGS_CDSP; i++)
         {
             LOG_DEBUG("%s : %s = 0x%x", cache->name,
-                      cache->reg_list[i].name, *((uint32_t *)cache->reg_list[i].value));
+                      cache->reg_list[i].name, *((uint64_t *)cache->reg_list[i].value));
         }
     }
     else
@@ -3159,7 +3244,7 @@ static int hexagon_dump_hwthrd_reg_cdsp(struct target *target, uint32_t hwthrd)
         for (i = 0; i < HEXAGON_PER_THREAD_REGS_CDSP; i++)
         {
             LOG_DEBUG("%s : %s = 0x%x", cache->name,
-                      cache->reg_list[i].name, *((uint32_t *)cache->reg_list[i].value));
+                      cache->reg_list[i].name, *((uint64_t *)cache->reg_list[i].value));
         }
     }
     LOG_DEBUG("exiting hexagon_dump_hwthrd_reg_cdsp");
@@ -3936,7 +4021,7 @@ static int hexagon_restore_stuff_used_reg_cdsp(struct target *target)
         {
             LOG_DEBUG("Writing modifed R7");
 
-            hexagon_write_core_reg_cdsp(target, HEXAGON_R7_CDSP, i, *((uint32_t *)cache->reg_list[HEXAGON_R7_CDSP].value));
+            hexagon_write_core_reg_cdsp(target, HEXAGON_R7_CDSP, i, *((uint64_t *)cache->reg_list[HEXAGON_R7_CDSP].value));
             cache->reg_list[HEXAGON_R7_CDSP].dirty = false;
         }
         cache = cache->next;
@@ -4129,8 +4214,9 @@ int hexagon_write_hvx_registers_cdsp(struct target *target, uint32_t value)
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     int retval, i = 0, j = 0;
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status, opcode = 0x19a0e020;
+    // uint64_t isdbsts;
+    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
+    uint64_t opcode = 0x19a0e020;
     /*   0x6ea8c000 --> {  r0 = isdbmbxin } , 0x19a0e020 --> {  v0.w = vinsert(r0) } , 0x19a0e021 -->{  v1.w = vinsert(r0) }
       0x19a0e022 --> {v2.w = vinsert(r0) }  0x19a0e023-> {     v3.w = vinsert(r0) }, 0x19a0e03e-->{  v30.w = vinsert(r0) }
     0x19a0e03f --> {   v31.w = vinsert(r0) }*/
@@ -4240,9 +4326,10 @@ int hexagon_read_hvx_registers_cdsp(struct target *target)
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval, i, j, l = 0, x;
     uint32_t isdb_mmode_cmd, isdb_cmd_status, isdbsts;
-    uint32_t vextract_opcode_v0 = 0x9200c021;
+    uint64_t vextract_opcode_v0 = 0x9200c021;
 
-    /*  0x6ea8c000 --> {  r0 = isdbmbxin }  0x9200c021-->{r1 = vextract(v0,r0) }  0x6701c029 --> {  isdbmbxout = r1 }
+    /*  
+    0x6ea8c000 --> {  r0 = isdbmbxin }  0x9200c021-->{r1 = vextract(v0,r0) }  0x6701c029 --> {  isdbmbxout = r1 }
     0x9200c121 -->{ r1 = vextract(v1,r0)   0x9200c221 --> {  r1 = vextract(v2,r0) }} 0x9200de21  -->{ r1 = vextract(v30,r0) }
     0x9200df21 --> { r1 = vextract(v31,r0) }
     */
@@ -4409,13 +4496,14 @@ int hexagon_read_current_registers_cdsp(struct target *target, uint32_t hwthrd)
     LOG_DEBUG("Dumping Registers %s", target_name(target));
     hexagon_dump_hwthrd_reg_cdsp(target, gHexConfig_cdsp.maxHwThreads);
 
-    //	hexagon_read_hvx_registers_cdsp(target);
-    //	hexagon_write_hvx_registers_cdsp(target, 9);
-    //	hexagon_read_hvx_registers_cdsp(target);
+    // hexagon_read_hvx_registers_cdsp(target);
+    // hexagon_write_hvx_registers_cdsp(target, 9);
+    // hexagon_read_hvx_registers_cdsp(target);
+
     hexagon_read_tlb_entry_cdsp(target);
     return ERROR_OK;
 }
-static uint32_t hexagon_print_pc_cdsp(struct target *target)
+static uint64_t hexagon_print_pc_cdsp(struct target *target)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
@@ -4427,23 +4515,32 @@ static uint32_t hexagon_print_pc_cdsp(struct target *target)
     for (i = 0; i < gHexConfig_cdsp.maxHwThreads; i++)
     {
         LOG_DEBUG("Value of PC  %s : %s = 0x%x", cache->name, cache->reg_list[HEXAGON_PC_CDSP].name,
-                  *((uint32_t *)cache->reg_list[HEXAGON_PC_CDSP].value));
+                  *((uint64_t *)cache->reg_list[HEXAGON_PC_CDSP].value));
         cache = cache->next;
     }
     cache = hexa_info->core_cache;
     /* return PC value for HW thread 0 but printing it for all HW thread*/
-    return *((uint32_t *)cache->reg_list[HEXAGON_PC_CDSP].value);
+    return *((uint64_t *)cache->reg_list[HEXAGON_PC_CDSP].value);
 }
 
 static int hexagon_step_cdsp(struct target *target, int current, target_addr_t address,
                              int handle_breakpoints)
 {
     LOG_DEBUG("Entering..");
+
+    start = clock();
+    double func_time;    
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval = ERROR_OK;
-    uint32_t isdbcmd, isdbsts, isdb_cmd_status;
+    uint64_t isdbcmd, isdbsts, isdb_cmd_status;
+    
+    uint64_t output;
+
+#ifdef HEXAGON_DEBUG_LOGS
+    LOG_INFO("Inside Step function");
+#endif
 
     retval = isdbcmd = isdbsts = 0;
 
@@ -4452,11 +4549,28 @@ static int hexagon_step_cdsp(struct target *target, int current, target_addr_t a
         LOG_DEBUG("Step is requested when target is not halted");
         return ERROR_TARGET_NOT_HALTED;
     }
-    hexagon_stuff_reg_restore_r0_r1_r2_r7_cdsp(target);
-#ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
-    hexagon_start_time_cal_ms_cdsp();
+
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
 #endif
+    hexagon_stuff_reg_restore_r0_r1_r2_r7_cdsp(target);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_stuff_reg_restore_r0_r1_r2_r7_cdsp:  %lf", func_time);
+#endif
+
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif    
     hexagon_print_pc_cdsp(target);
+
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_print_pc_cdsp:  %lf", func_time);
+#endif
+
 
     if (gHexConfig_cdsp.maxHwThreads == 4)
     {
@@ -4480,6 +4594,7 @@ static int hexagon_step_cdsp(struct target *target, int current, target_addr_t a
         return retval;
     }
     /* Wait for some time  to enable ISDB clk */
+
     hexagon_wait_loop_cdsp();
 
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
@@ -4493,51 +4608,254 @@ static int hexagon_step_cdsp(struct target *target, int current, target_addr_t a
     isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS_CDSP;
     if (isdb_cmd_status)
     {
-        LOG_DEBUG("ISDB command failed returning from hexagon_step function ");
+        // LOG_DEBUG("ISDB command failed returning from hexagon_step function ");
         return ERROR_FAIL;
     }
-
-#ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
-    hexagon_end_time_cal_ms_cdsp();
-    LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total_cdsp);
-#endif
 
     target->debug_reason = DBG_REASON_SINGLESTEP;
 
     // hexagon_read_current_registers(target, HEXAGON_HW_THREAD0);
-
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif    
     /* read general purpose registers (R0-R1) */
     hexagon_read_gpr_registers_cdsp(target, gHexConfig_cdsp.maxHwThreads);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_read_gpr_registers_cdsp:  %lf", func_time);
+#endif
 
+
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif     
     /* read per thread control registers */
     hexagon_read_ctrl_registers_cdsp(target, gHexConfig_cdsp.maxHwThreads);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_read_ctrl_registers_cdsp:  %lf", func_time);
+#endif
 
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif         
     /* read per thread monitor mode control registers */
     hexagon_read_mmode_registers_cdsp(target, gHexConfig_cdsp.maxHwThreads);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_read_mmode_registers_cdsp:  %lf", func_time);
+#endif
 
+
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif       
     /* read global control registers */
     hexagon_read_global_ctrl_registers_cdsp(target);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_read_global_ctrl_registers_cdsp:  %lf", func_time);
+#endif
+
 
     /* read HVX   registers */
     //	hexagon_read_hvx_registers_cdsp(target);
 
     /* Restore the register used stuff instruction */
-    hexagon_restore_stuff_used_reg_cdsp(target);
 
-    hexagon_print_pc_cdsp(target);
-#ifdef _VTLB_ENABLED_CDSP
-    hexagon_populate_vtlb_refresh_entries_cdsp(target);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif        
+    hexagon_restore_stuff_used_reg_cdsp(target);
+#ifdef HEXAGON_DEBUG_LOGS
+    func_end = clock();
+    func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
+    LOG_INFO("hexagon_restore_stuff_used_reg_cdsp:  %lf", func_time);
 #endif
+    // start = clock();
+    double before_vtlb;
+    end = clock();
+    before_vtlb = ((double)(end - start))/CLOCKS_PER_SEC;
+    LOG_INFO("before_vtlb:  %lf", before_vtlb);
+
+    /* BITMAP array implementation */
+
+
+    if (QURTK_vtlb_revision != 0x0)
+    {
+        // uint32_t refresh_indicator ;
+        refresh_indicator = QURTK_vtlb_revision;
+        // reading the contents of qurtk_vtlb_main_addr-12 and storing it in output
+        // 2. To do  : instead of this logic we can use QURTK_vtlb_revision counter has incremented or not
+        hexagon_memw_read_cdsp (target, refresh_indicator, &output);
+        refresh_indicator = output;
+        hexagon_memw_read_cdsp (target, refresh_indicator, &output);
+        #ifdef HEXAGON_DEBUG_LOGS
+            LOG_INFO("QURTK_vtlb_revision at 0x%x is 0x%x and the previous revision number is 0x%x", refresh_indicator, output, revision_num );
+        #endif     
+
+
+    }
+
+
+
+    if (bitmap_init == false) // before bitmap array has been read once and cleared, we need to populate all entries once
+    {
+#ifdef HEXAGON_DEBUG_LOGS
+        LOG_INFO("Populating all entries");
+#endif    
+        hexagon_populate_vtlb_refresh_entries_cdsp(target);
+    }
+    else if (output != revision_num) 
+    // checking if revision number has incremented
+    {
+        revision_num = output;
+
+        retval = hexagon_update_modified_vtlb_entry(target);
+    }
+    else
+    {
+        LOG_INFO("no vtlb update needed");
+    }
+    // /* BITMAP array implementation ends here*/
+
+
+
+    end = clock();
+    execution = ((double)(end - start))/CLOCKS_PER_SEC;
+    LOG_INFO("Overall execution:  %lf", execution);
 
     sbp_step_executed_cdsp = 1;
 
     return ERROR_OK;
 }
 
+int hexagon_update_modified_vtlb_entry(struct target *target)
+{
+    int retval;
+
+    uint64_t output;
+    unsigned int vtlb_entry_count = hexagon_vtlb_data_cdsp.vtlb_no_of_entries;
+
+    //storing the read vtlb entries as an array
+    uint64_t vtlb_entries_read[vtlb_entry_count];
+    unsigned int vtlb_notify_size;
+    // checking if entry count is even, if not we add one to make it even
+    vtlb_notify_size = (vtlb_entry_count % 32)? ((vtlb_entry_count/32) +1) :  (vtlb_entry_count/32);
+
+   //storing the read bitmap entries as an array
+    unsigned int bitmap_array_contents[vtlb_notify_size];
+    //the binary representation will need this size of an array
+    unsigned int size_vtlb_binary = (vtlb_entry_count*4);
+
+    char *bits_overall; // string
+    uint64_t bit_result [size_vtlb_binary];
+   //the first element/pointer to the array will be read and stored in this
+    target_addr_t bitmap_addr_temp ;
+    //the first element/pointer to the vtlb array will be read and stored in this
+    target_addr_t vtlb_entries_temp;
+
+    // uint64_t final_str[size_vtlb_binary];
+    unsigned int* final_str = (unsigned int *) calloc(size_vtlb_binary, sizeof(unsigned int));
+    //length of the final binary string
+    unsigned int final_str_ind = 0;
+
+
+    //the first element/pointer to the array will be read and stored in bitmap_addr_temp
+    hexagon_memw_read_cdsp(target, bitmap_addr, &bitmap_addr_temp);
+    
+    //  reading the bitmap array, incrementing the array pointer by 4 as each entry is 4 bytes 
+    for (unsigned int i = 0; i < vtlb_notify_size; i++)
+    {   
+        hexagon_memw_read_cdsp(target, bitmap_addr_temp, &output);
+        bitmap_array_contents[i] = output;
+        bitmap_addr_temp = bitmap_addr_temp + 4;
+    } 
+#ifdef HEXAGON_DEBUG_LOGS
+    LOG_INFO("size of bitmap : %d",sizeof(bitmap_array_contents) / sizeof(bitmap_array_contents[0]));
+#endif   
+
+
+    //  converting decimal to binary storing it as a string so that sequential values of the array entries will have their values retained 
+    //  eg bitmap[0] = f;  bitmap[1]=1 then the string will be 1111 1000 (little endian)
+    for(unsigned int i = 0; i < (vtlb_notify_size); i++) 
+    {
+        unsigned int binaryNum[32] = {0};
+        decToBinary(bitmap_array_contents[i], binaryNum);
+        for(int j = 0; j < 32; j++) 
+        {
+// #ifdef HEXAGON_DEBUG_LOGS
+//             LOG_INFO("bitmap content : bitmap_array_contents[i]:%x, binaryNum[j]:%x, i:%d, j:%d, final_str_ind: %d",bitmap_array_contents[i], binaryNum[j],i,j,final_str_ind);
+// #endif   
+            final_str[final_str_ind] = binaryNum[j];
+            final_str_ind++;
+        }
+        // LOG_INFO("\n");
+    }
+
+    //reading the vtlb entries
+    // LOG_INFO("QURTK_vtlb_entries array at = 0x%x ", qurtk_vtlb_entries);
+
+    // vtlb_entries_temp reads the address of first array of vtlb element
+    hexagon_memw_read_cdsp(target, qurtk_vtlb_entries, &vtlb_entries_temp);
+    // LOG_INFO("QURTK_vtlb_entries temp at = 0x%x ", vtlb_entries_temp);
+
+    
+    //  updating entries for the set bits of bitmap array which were stored in binary format into the final_str 
+    for(unsigned int i = 0; i < size_vtlb_binary; i++)
+    {
+        if (final_str[i]!=0)
+        {   
+            if (i < vtlb_entry_count)
+            {
+                hexagon_memw_read_cdsp(target, vtlb_entries_temp, &output);
+                vtlb_entries_read[i] = output;
+                // LOG_INFO("vtlb_entries_read[i] : 0x%x\t", vtlb_entries_read[i]);
+                vtlb_entries_temp = vtlb_entries_temp + 4; 
+
+                hexagon_memw_read_cdsp(target, vtlb_entries_temp, &output);
+                // hexagon_long_wait_loop_cdsp();
+                vtlb_entries_read[i+1] = output;
+                // LOG_INFO("vtlb_entries_read[i+1] : 0x%x\t", vtlb_entries_read[i+1]);
+                vtlb_entries_temp = vtlb_entries_temp + 4;
+            }
+            if (i < (sizeof(vtlb_entries_read) / sizeof(vtlb_entries_read[0])))
+            {
+
+                hexagon_update_vtlb_entry_in_structure_cdsp(vtlb_entries_read[i],vtlb_entries_read[i+1],i);
+            }
+        }
+        else
+        {
+                vtlb_entries_temp = vtlb_entries_temp + 8; 
+        }
+        i++;
+        
+    }
+    free(final_str);
+    //resetting the bitmap address to default and clearing it so that we can check again
+    bitmap_addr = qurtk_vtlb_bitmap;
+    // LOG_INFO("QURTK_vtlb_bitmap array at = 0x%x ", bitmap_addr);    
+    hexagon_memw_read_cdsp(target, bitmap_addr, &bitmap_addr_temp);
+    // address = hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr + 8;
+    for (unsigned int i = 0; i < hexagon_vtlb_data_cdsp.vtlb_no_of_entries/32; i++)
+    {   
+        retval = hexagon_memw_write_cdsp(target, bitmap_addr_temp, 0x0 , 4);
+        bitmap_addr_temp = bitmap_addr_temp + 4;
+    } 
+
+    return ERROR_OK;
+
+}
+
 static int hexagon_dump_isdb_reg_cdsp(struct hexa_info_cdsp *hexa_info)
 {
     // struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t reg_value;
+    uint64_t reg_value;
     int retval = ERROR_OK, i;
 
     /* dump the all registers */
@@ -4566,11 +4884,15 @@ static int hexagon_resume_cdsp(struct target *target, int current, target_addr_t
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval = ERROR_OK;
-    uint32_t isdbcmd, isdbsts, isdb_cmd_status;
+    uint64_t isdbcmd, isdbsts, isdb_cmd_status;
     static int retry_cnt = 0;
 
     hexagon_dump_isdb_reg_cdsp(&hexagon->hexa_info);
-    hexagon_read_BRKPT_through_stuff_cdsp(target);
+
+    for (int j = 0; j < gHexConfig_cdsp.maxHwThreads; j++)
+    {
+        hexagon_read_BRKPT_through_stuff_cdsp(target,j);
+    }
 
     LOG_DEBUG("Entering, Params passed: current = %d  :  address = 0x%llx  :handle_breakpoints = %d  :	debug_execution = %d",
               current, address, handle_breakpoints, debug_execution);
@@ -4608,7 +4930,7 @@ static int hexagon_resume_cdsp(struct target *target, int current, target_addr_t
             while ((cache != NULL))
             {
                 LOG_DEBUG("*((uint32_t*)cache->reg_list[HEXAGON_PC].value) = 0x%x", *((uint32_t *)cache->reg_list[HEXAGON_PC_CDSP].value));
-                if (*((uint32_t *)cache->reg_list[HEXAGON_PC_CDSP].value) == ((current_breakpoint->address) + 4))
+                if (*((uint32_t *)cache->reg_list[HEXAGON_PC_CDSP].value) == ((current_breakpoint->address)))
                 {
                     LOG_DEBUG("breakpoint address match with PC found in the bp-list, Replacing the original instruction in place of breakpoint");
                     PC_matched_with_sbp_addr = 1;
@@ -4790,20 +5112,27 @@ resumed:
     return ERROR_OK;
 }
 
-static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
+static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target, uint32_t hwthrd)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
+    uint32_t isdb_mmode_cmd = 0x0;
+
 
     int retval, i = 0;
-    uint32_t stuff_inst[][4] = {{0x6ea4c007, 0x6707c029},
+    uint64_t stuff_inst[][4] = {{0x6ea4c007, 0x6707c029},
                                 {0x6ea6c007, 0x6707c029},
                                 {0x6ea5c007, 0x6707c029},
                                 {0x6ea7c007, 0x6707c029}}; // r7=PC0,PC1,CFG0,CFG1; isdbmbxout = r7;
-    uint32_t isdbsts, read_val[4] = {};
-    // uint32_t isdb_mmode_cmd = 0x184,size=0,nreg,loop,x;
-    uint32_t isdb_umode_cmd = 0x104, isdb_gmode_cmd = 0x144, isdb_cmd_status;
+    uint64_t isdbsts, read_val[4] = {};
+    // uint64_t isdb_mmode_cmd = 0x184,size=0,nreg,loop,x;
+
+    isdb_mmode_cmd = hexagon_pack_isdbcmd_cdsp(ISDBCMD_CMD_STUFF_CDSP, ISDBCMD_MONITOR_LVL_CDSP,
+                                                ISDBCMD_TNUM_MASK_THREAD_CDSP(hwthrd));
+
+    
+    uint64_t isdb_gmode_cmd = 0x144, isdb_cmd_status;
 
     LOG_DEBUG("%s ------ %d\n", __FUNCTION__, __LINE__);
 
@@ -4828,7 +5157,7 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
             LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK for stuff_inst[j][0],j=%d", j);
         }
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_umode_cmd);
+                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
         if (retval != ERROR_OK)
         {
             LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK for stuff_inst[j][0],j=%d", j);
@@ -4863,10 +5192,10 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
                 LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK for stuff_inst[j][0],j=%d", j);
             }
             retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_umode_cmd);
+                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
             if (retval != ERROR_OK)
             {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_umode_cmd return value is not OK for stuff_inst[j][0],j=%d", j);
+                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK for stuff_inst[j][0],j=%d", j);
             }
             retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBST_CDSP, &isdbsts);
@@ -4893,10 +5222,10 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
                     LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
                 }
                 retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_gmode_cmd);
+                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
                 if (retval != ERROR_OK)
                 {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_gmode_cmd return value is not OK");
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
                 }
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBST_CDSP, &isdbsts);
@@ -4927,7 +5256,7 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
             LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
         }
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_umode_cmd);
+                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
         if (retval != ERROR_OK)
         {
             LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
@@ -4959,10 +5288,10 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
                 LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
             }
             retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_umode_cmd);
+                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
             if (retval != ERROR_OK)
             {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_umode_cmd return value is not OK");
+                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
             }
 
             /* wait till the stuff instruction is executed */
@@ -4993,10 +5322,10 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
                     LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
                 }
                 retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_gmode_cmd);
+                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
                 if (retval != ERROR_OK)
                 {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_gmode_cmd return value is not OK");
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
                 }
 
                 /* wait till the stuff instruction is executed */
@@ -5052,19 +5381,19 @@ static int hexagon_read_BRKPT_through_stuff_cdsp(struct target *target)
 }
 
 static int hexagon_check_state_one_cdsp(struct target *target,
-                                        uint32_t mask, bool *halted, uint32_t *debug_thread)
+                                        uint64_t mask, bool *halted, uint64_t *debug_thread)
 {
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdbsts;
+    uint64_t isdbsts;
     int retval;
     isdbsts = 0;
 
     // LOG_INFO("hexagon_check_state_one_cdsp");
     if (halted == NULL || debug_thread == NULL)
     {
-        LOG_DEBUG(" Fail: halted 0x%x, debug_thread 0x%x", (uint32_t)*halted, *debug_thread);
+        LOG_DEBUG(" Fail: halted 0x%x, debug_thread 0x%x", (uint64_t)*halted, *debug_thread);
         return ERROR_FAIL;
     }
 
@@ -5098,12 +5427,12 @@ static int hexagon_debug_entry_cdsp(struct target *target)
     struct hexagon_common_cdsp *hexagon = target_to_hexagon_cdsp(target);
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     int retval = ERROR_OK;
-    uint32_t brkptinfo;
+    uint64_t brkptinfo;
     brkptinfo = 0;
 
-    uint32_t *thrd_src;
+    uint64_t *thrd_src;
 
-    thrd_src = (uint32_t *)malloc(gHexConfig_cdsp.maxHwThreads * sizeof(uint32_t));
+    thrd_src = (uint64_t *)malloc(gHexConfig_cdsp.maxHwThreads * sizeof(uint64_t));
 
     LOG_DEBUG("hexagon_debug_entry_cdsp	%s", target_name(target));
 
@@ -5215,7 +5544,7 @@ static int hexagon_debug_entry_cdsp(struct target *target)
             cache = hexa_info->core_cache;
             while (i < gHexConfig_cdsp.maxHwThreads)
             {
-                LOG_DEBUG("*((uint32_t*)cache->reg_list[HEXAGON_PC].value) = 0x%x", gpSbpHaltedThreadsPC_cdsp[i]);
+                LOG_DEBUG("*((uint64_t*)cache->reg_list[HEXAGON_PC].value) = 0x%x", gpSbpHaltedThreadsPC_cdsp[i]);
                 if (gpSbpHaltedThreadsPC_cdsp[i] == ((current_breakpoint->address) + 4))
                 {
                     LOG_DEBUG("breakpoint address match with PC found in the bp-list, Replacing the original instruction in place of breakpoint");
@@ -5273,7 +5602,7 @@ static int hexagon_debug_entry_cdsp(struct target *target)
     free(thrd_src);
     return ERROR_OK;
 }
-void hexagon_debug_reason_cdsp(struct target *target, uint32_t brkptinfo)
+void hexagon_debug_reason_cdsp(struct target *target, uint64_t brkptinfo)
 {
     /* Examine debug reason */
     switch (HEXA_DEBUG_ENTRY_CDSP(brkptinfo))
@@ -5303,7 +5632,7 @@ static int hexagon_poll_cdsp(struct target *target)
 {
     enum target_state prev_target_state;
     int retval = ERROR_OK;
-    uint32_t debug_thread;
+    uint64_t debug_thread;
     bool halted = false;
     halted = debug_thread = 0;
 
@@ -5385,7 +5714,7 @@ static int hexagon_init_debug_access_cdsp(struct target *target)
     struct adiv5_dap *swddp = hexa_info->dap;
 
     int retval = ERROR_OK;
-    uint32_t isdbcmd, isdbsts, isdbcsts, bpinfo;
+    uint64_t isdbcmd, isdbsts, isdbcsts, bpinfo;
 
     retval = isdbcmd = isdbsts = isdbcsts = bpinfo = 0;
 
@@ -5474,7 +5803,8 @@ COMMAND_HANDLER(hexagon_set_QURTK_vtlb_main_command)
     if (CMD_ARGC == 1)
     {
         COMMAND_PARSE_ADDRESS(CMD_ARGV[0], addr);
-        hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA = addr;
+        // hexagon_vtlb_data_cdsp.QURTK_vtlb_main_VA = addr;
+        qurtk_vtlb_main_addr = addr;
         command_print(CMD, " QURTK_vtlb_main = 0x%x", addr);
         LOG_INFO("QURTK_VTLB_main = 0x%x", addr);
     }
@@ -5553,6 +5883,7 @@ COMMAND_HANDLER(hexagon_SetNumTLBEntries)
 }
 COMMAND_HANDLER(hexagon_initConfig)
 {
+
     initConfig(&gHexConfig_cdsp);
     LOG_INFO("initiating with : ");
     LOG_INFO("HEXAGON_MAX_HW_THREADS_MODEM_CDSP = %d", gHexConfig_cdsp.maxHwThreads);
@@ -5561,6 +5892,315 @@ COMMAND_HANDLER(hexagon_initConfig)
 
     return ERROR_OK;
 }
+
+COMMAND_HANDLER(hexagon_mem_read)
+{
+    uint32_t output;
+    int retval;
+
+    clock_t start_read, end_read;
+    // clock_t start_buffer, end_buffer;
+    long double total_time;
+
+    struct target *target = get_current_target(CMD_CTX);
+    struct hexagon_common_cdsp *hexagon = target->arch_info;
+    struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
+    target_addr_t virt_addr, phy_addr;
+
+    uint32_t isdbsts;
+    if (CMD_ARGC > 1)
+        return ERROR_COMMAND_SYNTAX_ERROR;
+
+    if (CMD_ARGC == 1)
+    {
+        COMMAND_PARSE_ADDRESS(CMD_ARGV[0], virt_addr);
+        command_print(CMD, " virt_addr = 0x%x", virt_addr);
+        LOG_INFO("virt_addr = 0x%x ", virt_addr);
+    }
+    start_read = clock();
+
+    // retval = hexagon_virt2phys_cdsp(target, virt_addr, &phy_addr);
+
+    hexagon_memw_read_cdsp(target, virt_addr, &output);
+    LOG_INFO("output is 0x%x\t", output );
+    end_read = clock();
+
+    total_time = ((double)(end_read - start_read))/CLOCKS_PER_SEC;
+    LOG_INFO("AFTER memw_read %lf", total_time);
+
+    start_read = clock();
+
+
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST_CDSP, &isdbsts);
+    if (retval != ERROR_OK)
+            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
+
+    end_read = clock();
+
+    total_time = ((long double)(end_read - start_read))/CLOCKS_PER_SEC;
+    LOG_INFO("AFTER single DAP read of isdbstatus %lf", total_time);
+
+    total_time = ((long double)(end_read - start_read));
+    LOG_INFO("AFTER single DAP read of isdbstatus without converting to seconds %lf", total_time );
+
+    start_read = clock();
+
+
+    retval = mem_ap_write_atomic_u32(debug_axi_ap_cdsp,
+                                     gHexConfig_cdsp.qpss6WDOGCtl, HEXAGON_QDSP6SS_WDOG_DISABLE_CDSP);
+    end_read = clock();
+
+    total_time = ((double)(end_read - start_read))/CLOCKS_PER_SEC;
+    LOG_INFO("AFTER single DAP write of wdog_disable %lf", total_time);
+
+    total_time = ((long double)(end_read - start_read));
+    LOG_INFO("AFTER single DAP read of isdbstatus without converting to seconds %lf", total_time );
+    return ERROR_OK;
+
+
+}
+
+COMMAND_HANDLER(hexagon_vtlbRefresh)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    start = clock();
+    // hexagon_read_tlb_entry_cdsp(target);
+    hexagon_populate_vtlb_refresh_entries_cdsp(target);
+
+
+    end = clock();
+    execution = ((double)(end - start))/CLOCKS_PER_SEC;
+    LOG_INFO("time taken for refresh_tlb_entries  %lf", execution);
+    return ERROR_OK;
+}   
+
+
+void decToBinary(unsigned int n, unsigned int binaryNum[])
+{
+    // counter for binary array
+    int i = 0;
+    while (n > 0 && i < 32) {
+
+        // storing remainder in binary array
+        binaryNum[i] = n % 2;
+        n = n / 2;
+        i++;
+    }
+}
+
+COMMAND_HANDLER(hexagon_set_vtlb_params)
+{
+
+
+    //to read the memw results
+    uint64_t output;
+    int retval;
+    unsigned int vtlb_entry_count = hexagon_vtlb_data_cdsp.vtlb_no_of_entries ;
+    
+    //storing the read vtlb entries as an array
+    uint64_t vtlb_entries_read[vtlb_entry_count];
+    unsigned int vtlb_notify_size;
+    // checking if entry count is even, if not we add one to make it even
+    vtlb_notify_size = (vtlb_entry_count%32)? ((vtlb_entry_count/32)+1): vtlb_entry_count/32;
+
+    //storing the read bitmap entries as an array
+    unsigned int bitmap_array_contents[vtlb_notify_size];
+    //the binary representation will need this size of an array
+    unsigned int size_vtlb_binary = (vtlb_entry_count*4);
+
+    char *bits_overall; // string
+    uint64_t bit_result[size_vtlb_binary];
+    //the first element/pointer to the bitmap array will be read and stored in this
+    target_addr_t bitmap_addr_temp ;
+    //the first element/pointer to the vtlb array will be read and stored in this
+    target_addr_t vtlb_entries_temp;
+
+    // uint64_t final_str[size_vtlb_binary];
+    unsigned int* final_str = (unsigned int *)calloc(size_vtlb_binary, sizeof(unsigned int));
+    //length of the final binary string
+    unsigned int final_str_ind = 0;
+    //following initializations to use access hexagon parameters in this command
+    struct target *target = get_current_target(CMD_CTX);
+    struct hexagon_common_cdsp *hexagon = target->arch_info;
+    struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
+
+/* init code*/
+    target_addr_t vtlb_entries;
+    
+    // taking in user input for QURTK_vtlb_bitmap and QURTK_vtlb_entries from the symbols on ukernel elf via lldb commands
+    if (CMD_ARGC < 2)
+    {
+        return ERROR_COMMAND_SYNTAX_ERROR;
+    }
+
+    else if (CMD_ARGC == 2)
+    {
+        COMMAND_PARSE_ADDRESS(CMD_ARGV[0], bitmap_addr);
+        command_print(CMD, " bitmap addr = 0x%x", bitmap_addr);
+        qurtk_vtlb_bitmap = bitmap_addr;
+        // LOG_INFO("bitmap addr = 0x%x", bitmap_addr);
+
+        COMMAND_PARSE_ADDRESS(CMD_ARGV[1], vtlb_entries);
+        qurtk_vtlb_entries = vtlb_entries;
+        // vtlb_entries 
+        command_print(CMD, " QURTK_vtlb_entries = 0x%x", vtlb_entries);
+        // LOG_INFO("QURTK_vtlb_entries = 0x%x", vtlb_entries);
+    }
+/* init code ends here*/
+    // the first element/pointer to the array will be read and stored in bitmap_addr_temp
+    hexagon_memw_read_cdsp(target, bitmap_addr, &bitmap_addr_temp);
+    
+    //  reading the bitmap array, incrementing the array pointer by 4 as each entry is 4 bytes 
+    for (unsigned int i = 0; i < vtlb_notify_size; i++)
+    {   
+        hexagon_memw_read_cdsp(target, bitmap_addr_temp, &output);
+        bitmap_array_contents[i] = output;
+        // LOG_INFO("bitmap content at 0x%x is 0x%x",bitmap_addr_temp, output);
+        bitmap_addr_temp = bitmap_addr_temp + 4;
+
+    } 
+
+
+    // converting decimal to binary storing it as a string so that sequential values of the array entries will have their values retained 
+    // eg bitmap[0] = f;  bitmap[1]=1 then the string will be 1111 1000 (little endian)
+    for(unsigned int i = 0; i < (vtlb_notify_size); i++) 
+    {
+        unsigned int binaryNum[32] = {0};
+        decToBinary(bitmap_array_contents[i], binaryNum);
+        for(int j = 0; j < 32; j++) 
+        {
+            final_str[final_str_ind] = binaryNum[j];
+            final_str_ind++;
+        }
+    }
+
+    
+    //reading the vtlb entries
+    // LOG_INFO("QURTK_vtlb_entries array at = 0x%x ", qurtk_vtlb_entries);
+
+    // vtlb_entries_temp reads the address of first array of vtlb element
+    hexagon_memw_read_cdsp(target, qurtk_vtlb_entries, &vtlb_entries_temp);
+    // LOG_INFO("QURTK_vtlb_entries temp at = 0x%x ", vtlb_entries_temp);
+
+    
+    //  updating entries for the set bits of bitmap array which were stored in binary format into the final_str 
+    unsigned int j = 0;
+    for(unsigned int i = 0; i < final_str_ind; i++)
+    {
+        if (final_str[i] !=0)
+        {    
+            if (i < vtlb_entry_count)
+            {
+                hexagon_memw_read_cdsp(target, vtlb_entries_temp, &output);
+                vtlb_entries_read[i] = output;
+                // LOG_INFO("0x%x\t", vtlb_entries_read[i]);
+                vtlb_entries_temp = vtlb_entries_temp + 4; 
+
+                hexagon_memw_read_cdsp(target, vtlb_entries_temp, &output);
+                vtlb_entries_read[i+1] = output;
+                LOG_INFO("0x%x\t", vtlb_entries_read[i+1]);
+                vtlb_entries_temp = vtlb_entries_temp + 4;
+            }
+            if (i < (sizeof(vtlb_entries_read) / sizeof(vtlb_entries_read[0])))
+            {
+
+                hexagon_update_vtlb_entry_in_structure_cdsp(vtlb_entries_read[i],vtlb_entries_read[i+1],i);
+            }
+        }
+        else
+        {
+            vtlb_entries_temp = vtlb_entries_temp + 8;
+        }
+        i++;
+    }
+    free(final_str);
+    bitmap_init = true;
+
+    return ERROR_OK;
+}
+
+COMMAND_HANDLER(hexagon_set_revision_addr)
+{
+    target_addr_t input;
+    uint64_t output;
+    struct target *target = get_current_target(CMD_CTX);
+    struct hexagon_common_cdsp *hexagon = target->arch_info;
+    struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;    
+
+    if (CMD_ARGC > 1)
+        return ERROR_COMMAND_SYNTAX_ERROR;
+
+    if (CMD_ARGC == 1)
+    {
+        COMMAND_PARSE_ADDRESS(CMD_ARGV[0], input);
+        QURTK_vtlb_revision = input;
+        command_print(CMD, " QURTK_vtlb_revision = 0x%x", QURTK_vtlb_revision);
+        // LOG_INFO("QURTK_vtlb_revision = 0x%x", QURTK_vtlb_revision);
+    }
+
+    LOG_INFO("QURTK_vtlb_revision  at = 0x%x ", QURTK_vtlb_revision);
+    hexagon_memw_read_cdsp (target, QURTK_vtlb_revision, &output);
+    refresh_indicator = output;
+    hexagon_memw_read_cdsp (target, refresh_indicator, &output);
+    revision_num = output;
+    LOG_INFO("revision num is = 0x%x ", revision_num);
+
+    return ERROR_OK;
+}
+
+
+COMMAND_HANDLER(hexagon_clear_bitmap_array)
+{
+    uint64_t output;
+    int retval;
+
+    struct target *target = get_current_target(CMD_CTX);
+    struct hexagon_common_cdsp *hexagon = target->arch_info;
+    struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
+    bitmap_addr = qurtk_vtlb_bitmap;
+    target_addr_t bitmap_addr_temp ;
+
+
+    LOG_INFO("QURTK_vtlb_bitmap array at = 0x%x ", bitmap_addr);
+
+    // for (int i = 0; i < hexagon_vtlb_data_cdsp.vtlb_no_of_entries/32; i++)
+    // {
+    //     // retval = hexagon_memw_write_cdsp(target, virt_address + 4 * i, value, 4);
+    //     retval = hexagon_memw_write_cdsp(target, bitmap_addr, 0x0 , 4);
+    //     // retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, bitmap_addr, 0x0);
+    //     hexagon_memw_read_cdsp(target, bitmap_addr, &output);
+
+    //     LOG_INFO("0x%x\t", output );
+    //     bitmap_addr = bitmap_addr + 4;
+    // }    
+
+    
+    hexagon_memw_read_cdsp(target, bitmap_addr, &bitmap_addr_temp);
+    // address = hexagon_vtlb_data_cdsp.qurtk_vtlb_main.next_table_addr + 8;
+    for (unsigned int i = 0; i < hexagon_vtlb_data_cdsp.vtlb_no_of_entries/32; i++)
+    {   
+        retval = hexagon_memw_write_cdsp(target, bitmap_addr_temp, 0x0 , 4);
+
+        bitmap_addr_temp = bitmap_addr_temp + 4;
+    } 
+    bitmap_addr = qurtk_vtlb_bitmap;
+
+    hexagon_memw_read_cdsp(target, bitmap_addr, &bitmap_addr_temp);
+
+    for (unsigned int i = 0; i < hexagon_vtlb_data_cdsp.vtlb_no_of_entries/32; i++)
+    {   
+        hexagon_memw_read_cdsp(target, bitmap_addr_temp, &output);
+        LOG_INFO("bitmap content at 0x%x is 0x%x",bitmap_addr_temp, output);
+
+        bitmap_addr_temp = bitmap_addr_temp + 4;
+    } 
+
+            // LOG_INFO("bitmap content at 0x%x is 0x%x",bitmap_addr_temp, output);
+
+    return ERROR_OK;
+}
+
 static const struct command_registration hexagon_exec_command_handlers_cdsp[] = {
     {
         .name = "cache_info",
@@ -5605,6 +6245,13 @@ static const struct command_registration hexagon_exec_command_handlers_cdsp[] = 
         .usage = "[Number]",
     },
     {
+        .name = "setRevision",
+        .handler = hexagon_set_revision_addr,
+        .mode = COMMAND_ANY,
+        .help = "Set the revision address",
+        .usage = "[Number]",
+    },
+    {
         .name = "SetWDOGCTL",
         .handler = hexagon_SetQPSS6WDOGCTL,
         .mode = COMMAND_ANY,
@@ -5617,6 +6264,42 @@ static const struct command_registration hexagon_exec_command_handlers_cdsp[] = 
         .mode = COMMAND_ANY,
         .help = "Set Number of TLB Entries",
         .usage = "[Number]",
+    },
+    {
+        .name = "refreshVTLB",
+        .handler = hexagon_vtlbRefresh,
+        .mode = COMMAND_ANY,
+        .help = "Refresh VTLB entries",
+        .usage = "[Number]",
+    },
+
+    {
+        .name = "setVTLBParam",
+        .handler = hexagon_set_vtlb_params,
+        .mode = COMMAND_ANY,
+        .help = "set vtlb entries",
+        .usage = "[]",
+    },
+    {   
+        .name = "clear_vtlb_entries",
+        .handler = hexagon_clear_bitmap_array,
+        .mode = COMMAND_ANY,
+        .help = "clear bitmap array",
+        .usage = "[]",
+    },
+    // {   
+    //     .name = "find_modified_vtlb",
+    //     .handler = hexagon_find_modified_vtlb,
+    //     .mode = COMMAND_ANY,
+    //     .help = "find modified vtlb",
+    //     .usage = "[]",
+    // },
+    {
+        .name = "mem_read",
+        .handler = hexagon_mem_read,
+        .mode = COMMAND_ANY,
+        .help = "memw virtual read",
+        .usage = "[]",
     },
     {
         .name = "initConfig",
@@ -5649,9 +6332,9 @@ static int hexagon_handle_target_request_cdsp(void *priv)
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     int retval;
     static int cnt = 0;
-    uint32_t *thrd_src;
+    uint64_t *thrd_src;
 
-    thrd_src = (uint32_t *)malloc(gHexConfig_cdsp.maxHwThreads * sizeof(uint32_t));
+    thrd_src = (uint64_t *)malloc(gHexConfig_cdsp.maxHwThreads * sizeof(uint64_t));
 
     if ((++cnt % 1000) == 0)
         LOG_DEBUG("hexagon_handle_target_request_cdsp exam=%d dbg=%d state=%d ", target->examined, target->dbg_msg_enabled, target->state);
@@ -5662,7 +6345,7 @@ static int hexagon_handle_target_request_cdsp(void *priv)
         LOG_DEBUG("TARGET_HALTED\n");
         // check the halt reason
 
-        uint32_t brkptinfo = 0;
+        uint64_t brkptinfo = 0;
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                         hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO_CDSP, &brkptinfo);
         if (retval != ERROR_OK)
@@ -5890,7 +6573,7 @@ static void hexagon_wait_loop_cdsp(void)
 
 static void hexagon_long_wait_loop_cdsp(void)
 {
-    uint32_t i, loop = 0;
+    uint64_t i, loop = 0;
 
     for (i = 0; i < 10000; i++)
     {
@@ -5901,16 +6584,16 @@ static void hexagon_long_wait_loop_cdsp(void)
 }
 
 /* This function enable the ETM */
-static uint32_t hexagon_etm_on_cdsp(struct target *target)
+static uint64_t hexagon_etm_on_cdsp(struct target *target)
 {
     struct hexagon_common_cdsp *hexagon = target->arch_info;
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     struct adiv5_dap *swddp = hexa_info->dap;
     static int initialized;
-    uint32_t retval = ERROR_OK, tmp;
+    uint64_t retval = ERROR_OK, tmp;
 
-    uint32_t etm_clk_enable_addr = 0x86988000;
-    uint32_t etm_clk_reset_addr = 0x86988008;
+    uint64_t etm_clk_enable_addr = 0x86988000;
+    uint64_t etm_clk_reset_addr = 0x86988008;
 
     if (!initialized)
     {
@@ -5973,7 +6656,7 @@ static int hexagon_examine_first_cdsp(struct target *target)
     // struct hexagon_private_config_cdsp *pc;
     struct adiv5_dap *swddp = hexa_info->dap;
     int retval = ERROR_OK;
-    uint32_t isdben, isdbver, isdbcstat, isdbst, corever, tmp;
+    uint64_t isdben, isdbver, isdbcstat, isdbst, corever, tmp;
     isdben = isdbver = isdbcstat = isdbst = corever = tmp = 0;
 
     /* Search for the APB-AB - it is needed to access debug registers */
@@ -5999,9 +6682,9 @@ static int hexagon_examine_first_cdsp(struct target *target)
     {
 
         /* TDB */
-        uint32_t dbgbase;
+        uint64_t dbgbase;
         /* Get ROM Table base */
-        uint32_t apid;
+        uint64_t apid;
         int32_t coreidx = target->coreid;
 
         retval = dap_get_debugbase(hexa_info->debug_ap, &dbgbase, &apid);
@@ -6095,7 +6778,7 @@ static int hexagon_examine_first_cdsp(struct target *target)
             LOG_DEBUG("ISDBEN write failed 0x%x", isdben);
             return retval;
         }
-        LOG_DEBUG("After ISDBEN write  0x%x", (uint32_t)isdben);
+        LOG_DEBUG("After ISDBEN write  0x%x", (uint64_t)isdben);
     }
     else
     {
@@ -6112,7 +6795,7 @@ static int hexagon_examine_first_cdsp(struct target *target)
         LOG_DEBUG("ISDBEN read failed 0x%x", isdben);
         return retval;
     }
-    LOG_DEBUG("After ISDBEN read 0x%x ", (uint32_t)isdben);
+    LOG_DEBUG("After ISDBEN read 0x%x ", (uint64_t)isdben);
 
     retval = enable_dbg_sys_pwr(swddp);
 
@@ -6167,6 +6850,7 @@ static int hexagon_examine_first_cdsp(struct target *target)
     LOG_INFO("%s: examination pass\n", target_name(target));
 
     hexagon_hw_watchdog_disable_cdsp(target);
+    LOG_INFO("checking STEP latency issues");
     // hexagon_populate_vtlb_data(target);
     return ERROR_OK;
 }
@@ -6219,7 +6903,7 @@ static void hexagon_initialize_axi_ap_cdsp(struct target *target)
 static void hexagon_hw_watchdog_disable_cdsp(struct target *target)
 {
     int retval;
-    uint32_t temp;
+    uint64_t temp;
     uint8_t buffer;
 
     LOG_DEBUG("hexagon_hw_watchdog_disable_cdsp  enter ");
@@ -6523,7 +7207,7 @@ static int hexagon_write_core_reg_cdsp(struct target *target, int regnum, uint32
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     struct reg_cache *cache;
     int retval = ERROR_OK;
-    uint32_t i;
+    uint64_t i;
 
     if (regnum < HEXAGON_R0_CDSP || regnum >= HEXAGON_MMODE_GLOBAL_MAX_CDSP)
         return ERROR_COMMAND_SYNTAX_ERROR;
@@ -6580,8 +7264,7 @@ static int hexagon_write_global_ctrl_register_cdsp(struct target *target, int re
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval, i = 0;
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
 
 #ifdef _DEBUG_HEXAGON_CDSP_
     LOG_DEBUG("hexagon_write_global_ctrl_register_cdsp: hw thrd: %d, regnum %d, value %d", hwthrd, regnum, value);
@@ -6740,8 +7423,9 @@ static int hexagon_write_ctrl_register_cdsp(struct target *target, int regnum, u
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval, i = 0;
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+
+    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
+
 
 #ifdef _DEBUG_HEXAGON_CDSP_
     LOG_DEBUG("hexagon_write_ctrl_register_cdsp: hw thrd: %d, regnum %d, value 0x%x", hwthrd, regnum, value);
@@ -6899,12 +7583,12 @@ static int hexagon_write_gpr_register_cdsp(struct target *target, int regnum, ui
     // struct adiv5_dap *swddp = hexa_info->dap;
     int retval, i = 0;
     uint32_t isdbsts;
-    uint32_t isdb_umode_cmd, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd, isdb_cmd_status;
 
 #ifdef _DEBUG_HEXAGON_CDSP_
     LOG_DEBUG("hexagon_write_gpr_register_cdsp: hw thrd: %d, regnum %d, value 0x%x", hwthrd, regnum, value);
 #endif
-    isdb_umode_cmd = hexagon_pack_isdbcmd_cdsp(ISDBCMD_CMD_STUFF_CDSP, ISDBCMD_MONITOR_LVL_CDSP,
+    isdb_mmode_cmd = hexagon_pack_isdbcmd_cdsp(ISDBCMD_CMD_STUFF_CDSP, ISDBCMD_MONITOR_LVL_CDSP,
                                                ISDBCMD_TNUM_MASK_THREAD_CDSP(hwthrd));
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_CDSP
@@ -6950,7 +7634,7 @@ static int hexagon_write_gpr_register_cdsp(struct target *target, int regnum, ui
 #endif
 
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                     hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_umode_cmd);
+                                     hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD_CDSP, isdb_mmode_cmd);
     if (retval != ERROR_OK)
     {
         LOG_DEBUG("HEXAGON_ISDB_ISDBCMD_CDSP return value is not OK");
@@ -7014,7 +7698,7 @@ static int hexagon_read_core_reg_cdsp(struct target *target, struct reg *r, int 
     struct hexa_info_cdsp *hexa_info = &hexagon->hexa_info;
     struct reg_cache *cache;
     int retval = ERROR_OK;
-    uint32_t i;
+    uint64_t i;
 
     LOG_INFO("reading reg:%d, hw_thrd %d ", regnum, hwthrd);
 
@@ -7029,7 +7713,7 @@ static int hexagon_read_core_reg_cdsp(struct target *target, struct reg *r, int 
         cache = cache->next;
         i++;
     }
-    r->value = (uint32_t *)cache->reg_list[regnum].value;
+    r->value = (uint64_t *)cache->reg_list[regnum].value;
     r->valid = true;
     r->dirty = false;
     return retval;
@@ -7072,7 +7756,7 @@ static void hexagon_deinit_target_cdsp(struct target *target)
 
 static int hexagon_mmu_cdsp(struct target *target, int *enabled)
 {
-    uint32_t syscfg, retval;
+    uint64_t syscfg, retval;
 
     retval = hexagon_read_syscfg_register_cdsp(target);
     hexagon_stuff_reg_restore_r7_cdsp(target);
@@ -7100,7 +7784,8 @@ static int hexagon_mmu_cdsp(struct target *target, int *enabled)
     return ERROR_OK;
 }
 
-struct target_type hexagon_cdsp_target = {
+struct target_type hexagon_cdsp_target = 
+{
     .name = "hexagon_cdsp",
     .poll = hexagon_poll_cdsp,
     .arch_state = hexagon_arch_state_cdsp,
@@ -7140,4 +7825,5 @@ struct target_type hexagon_cdsp_target = {
     .get_gdb_fileio_info = NULL,
     .gdb_fileio_end = NULL,
     .profiling = NULL,
-    .address_bits = NULL};
+    .address_bits = NULL
+};

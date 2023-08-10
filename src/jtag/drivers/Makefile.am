@@ -72,7 +72,7 @@ if EUD
 include %D%/eud/Makefile.am
 DRIVERFILES += %D%/eud.c
 %C%_libocdjtagdrivers_la_CPPFLAGS += -I $(EUDINCDIR)
-%C%_libocdjtagdrivers_la_LIBADD +=  %D%/eud/libquts.la -lstdc++
+%C%_libocdjtagdrivers_la_LIBADD +=  %D%/eud/libquts.la
 endif
 if FTDI
 DRIVERFILES += %D%/ftdi.c %D%/mpsse.c

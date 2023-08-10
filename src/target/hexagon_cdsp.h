@@ -12,40 +12,24 @@
 
 /*******************************Common MACRO for Feature control********************************************/
 
-#if 0
-#define _BITRA_TARGET_CDSP
-#define _CEDROS_TARGET_CDSP
-#define _KODIAK_TARGET_CDSP
-#define _VTLB_ENABLED_CDSP
-#define _MANNAR_TARGET_CDSP
-#define _DEBUG_HEXAGON_CDSP_
-#define _AGATTI_TARGET_CDSP
-#endif
-
-//#define _BITRA_TARGET_CDSP
-#define _KODIAK_TARGET_CDSP
 #define _HEXAGON_TARGET_TIME_PROFILING_CDSP
 
-// #define _VTLB_ENABLED_CDSP
+#define _VTLB_ENABLED_CDSP
 
 /* define this macro when we need to fetch VTLB using AXI */
-//#define HEXAGON_VTLB_AXI_CDSP
+#define HEXAGON_VTLB_AXI_CDSP
 
 /* define this macro when we need to fetch VTLB using MEM_PHYS */
 #define HEXAGON_VTLB_MEM_PHYS_CDSP
 
 /* define this macro when we need to fetch VTLB using MEMW interface */
-//#define HEXAGON_VTLB_MEMW_CDSP
+#define HEXAGON_VTLB_MEMW_CDSP
 
 
 
-#if defined(_BITRA_TARGET_CDSP)
-#define HEXAGON_VTLB_OLD_ARCH_CDSP
-#endif
 
-#if defined(_KODIAK_TARGET_CDSP)
+
 #define HEXAGON_VTLB_NEW_ARCH_CDSP
-#endif
 
 /***************************************************************************/
 
@@ -354,13 +338,7 @@ enum hexagon_registers_CDSP
 #define HEXAGON_VALID_PER_THREAD_REGS_CDSP (HEXAGON_MMODE_PERTHRD_MAX_CDSP - HEXAGON_PER_THREAD_RESV_REGS_CDSP)
 #define HEXAGON_VALID_GLOBAL_REGS_CDSP (HEXAGON_MMODE_GLOBAL_MAX_CDSP - HEXAGON_MMODE_PERTHRD_MAX_CDSP - HEXAGON_GLOBAL_RESV_REGS_CDSP)
 
-#ifdef _BITRA_TARGET_CDSP
-#define HEXAGON_TLB_ENTRIES_NUM_CDSP 128
-#endif
 
-#ifdef _KODIAK_TARGET_CDSP
-#define HEXAGON_TLB_ENTRIES_NUM_CDSP 128
-#endif
 
 //#define hexagon_pack_isdbcmd(cmd, prilvl, thrdmsk) ((cmd) | (prilvl << 6) | (prilvl << 6))
 #define hexagon_pack_isdbcmd_cdsp(cmd, prilvl, thrdmsk) ((cmd) | (prilvl) | (thrdmsk))
@@ -433,7 +411,7 @@ enum hexagon_opcode_cdsp
     HEXA_OPCODE_MAX_CDSP
 };
 
-static const uint32_t hexagon_opcodes_cdsp[HEXA_OPCODE_MAX_CDSP] = {
+static const uint64_t hexagon_opcodes_cdsp[HEXA_OPCODE_MAX_CDSP] = {
     [READ_REG_R0_CDSP] = 0x6700c029,
     [READ_REG_R1_CDSP] = 0x6701c029,
     [READ_REG_R2_CDSP] = 0x6702c029,
@@ -485,7 +463,7 @@ struct hexagon_brp_cdsp
     int used;
     int type;
     target_addr_t value;
-    uint32_t control;
+    uint64_t control;
     uint8_t BRPn;
 };
 
@@ -497,7 +475,7 @@ enum hexagon_isrmasking_mode_cdsp
 
 union fourbyte_cdsp
 {
-    uint32_t word;
+    uint64_t word;
     uint16_t hword[2];
     uint8_t byte[4];
 };
@@ -512,15 +490,15 @@ struct hexa_reg_cdsp
     int (*finish)(hexagon_reg_cdsp *);
 
     /** Runs one instruction. */
-    int (*instr_execute)(hexagon_reg_cdsp *, uint32_t opcode);
+    int (*instr_execute)(hexagon_reg_cdsp *, uint64_t opcode);
 
     /** Runs one instruction, writing data to R0 before execution. */
     int (*instr_write_data_r0)(hexagon_reg_cdsp *,
-                               uint32_t opcode, uint32_t data);
+                               uint64_t opcode, uint64_t data);
 
     /** Runs one instruction, reading data from r0 after execution. */
     int (*instr_read_data_r0)(hexagon_reg_cdsp *,
-                              uint32_t opcode, uint32_t *data);
+                              uint64_t opcode, uint64_t *data);
 
     struct reg *(*hexagon_reg_current_cdsp)(struct hexa_info_cdsp *hexa_info,
                                             unsigned int regnum, struct reg_cache *cache);
@@ -529,8 +507,8 @@ struct hexa_reg_cdsp
 struct hexa_bp_cdsp
 {
     unsigned number;
-    uint32_t address;
-    uint32_t control;
+    uint64_t address;
+    uint64_t control;
     /* true if hardware state needs flushing */
     bool dirty;
 };
@@ -546,10 +524,10 @@ struct hexa_brkpt_cdsp
      * breakpoints; indices 16..31 are for watchpoints.
      */
     int (*hwbp_enable)(struct hexa_brkpt_cdsp *, unsigned index_value,
-                       uint32_t addr, uint32_t control);
+                       uint64_t addr, uint64_t control);
 
     int (*swbp_enable)(struct hexa_brkpt_cdsp *, unsigned index_value,
-                       uint32_t addr, uint32_t control);
+                       uint64_t addr, uint64_t control);
 
     /**
      * Disables one breakpoint or watchpoint by clearing its
@@ -573,21 +551,21 @@ struct hexa_brkpt_cdsp
 struct hexagon_mmu_common_cdsp
 {
 
-    uint32_t mmu_enabled;
-    uint32_t instrution_cache_enabled;
-    uint32_t data_cache_enabled;
+    uint64_t mmu_enabled;
+    uint64_t instrution_cache_enabled;
+    uint64_t data_cache_enabled;
 };
 
 struct hexa_info_cdsp
 {
 
     /* Hold the last read ISDB registers values */
-    uint32_t isdb_ver;
-    uint32_t corever;
-    uint32_t isdb_enable;
-    uint32_t isdb_status;
-    uint32_t isdb_cstatus;
-    uint32_t brkptinfo;
+    uint64_t isdb_ver;
+    uint64_t corever;
+    uint64_t isdb_enable;
+    uint64_t isdb_status;
+    uint64_t isdb_cstatus;
+    uint64_t brkptinfo;
 
     /** Backpointer to the target. */
     struct target *target;
@@ -600,7 +578,7 @@ struct hexa_info_cdsp
      * used to make requests to the target.
      */
     struct adiv5_dap *dap;
-    uint32_t debug_base;
+    uint64_t debug_base;
     struct adiv5_ap *debug_ap;
     struct reg_cache *core_cache;
 
@@ -613,10 +591,10 @@ struct hexa_info_cdsp
     int (*full_context)(struct target *target);
 
     /** Retrieve a single Hw thread  register. */
-    int (*read_core_reg)(struct target *target, struct reg *r, int regnum, uint32_t hwthrd);
-    int (*write_core_reg)(struct target *target, int regnum, uint32_t hwthrd, uint32_t value);
+    int (*read_core_reg)(struct target *target, struct reg *r, int regnum, uint64_t hwthrd);
+    int (*write_core_reg)(struct target *target, int regnum, uint64_t hwthrd, uint64_t value);
     const int *map;
-    const uint32_t *opcodes;
+    const uint64_t *opcodes;
     struct hexa_brkpt_cdsp brkpt;
     struct hexagon_mmu_common_cdsp hexagon_mmu;
 
@@ -630,8 +608,8 @@ struct hexagon_common_cdsp
     struct hexa_info_cdsp hexa_info;
     int common_magic;
     /* Context information */
-    uint32_t system_control_reg;
-    uint32_t system_control_reg_curr;
+    uint64_t system_control_reg;
+    uint64_t system_control_reg_curr;
     /* Breakpoint register pairs */
     int brp_num_context;
     int brp_num;
@@ -643,7 +621,7 @@ struct hexagon_common_cdsp
 struct hex_reg_cdsp
 {
     int num;
-    uint32_t hwthrd;
+    uint64_t hwthrd;
     struct target *target;
     struct hexa_info_cdsp *hexa_info;
     uint8_t value[16];
@@ -677,14 +655,14 @@ enum hexagon_page_size_CDSP
 
 typedef struct
 {
-    uint64_t phy_add_low;
-    uint64_t phy_add_high;
-    uint32_t virt_add_low;
-    uint32_t virt_add_high;
-    uint32_t virt_tlb_raw_data;
-    uint32_t phys_tlb_raw_data;
-    uint32_t virt_page : 20;
-    uint32_t phy_page : 24;
+    long long int phy_add_low;
+    long long int phy_add_high;
+    uint64_t virt_add_low;
+    uint64_t virt_add_high;
+    uint64_t virt_tlb_raw_data;
+    uint64_t phys_tlb_raw_data;
+    uint64_t virt_page : 20;
+    long long int phy_page;
     enum hexagon_page_size_CDSP page_size;
     uint8_t asid : 7;
     uint8_t CCCC : 4;
@@ -703,26 +681,26 @@ typedef struct
 #ifdef HEXAGON_VTLB_NEW_ARCH_CDSP
 typedef struct
 {
-    uint32_t vtlb_version : 4;               // version info
-    uint32_t vtlb_table_type : 3;            // Descriptor type
-    uint32_t next_table_addr_is_virtual : 1; // next element is virtual or physical
+    uint64_t vtlb_version : 4;               // version info
+    uint64_t vtlb_table_type : 3;            // Descriptor type
+    uint64_t next_table_addr_is_virtual : 1; // next element is virtual or physical
     uint64_t next_table_addr : 36;           // table address where the descriptor type elements start from
-    uint32_t table_entries : 20;             // Number of entries of the descriptor type
+    uint64_t table_entries : 20;             // Number of entries of the descriptor type
 } qurtk_vtlb_table_descriptor_cdsp __attribute__((packed));
 #endif
 
 /* data structure contains the data related to QURTK_vtlb_main for fetching vtlb entries */
 typedef struct
 {
-    uint32_t vtlb_previous_counter;
-    uint32_t vtlb_current_counter;
-    uint32_t vtlb_no_of_entries;
-    uint32_t vtlb_no_of_entries1;
-    uint32_t valid_vtlb_no_of_entries;
-    uint32_t QURTK_vtlb_main_VA;
-    uint32_t QURTK_vtlb_main_PA;
-    uint32_t QURTK_VTLB_DATA_VA;
-    uint32_t QURTK_VTLB_DATA_PA;
+    uint64_t vtlb_previous_counter;
+    uint64_t vtlb_current_counter;
+    uint64_t vtlb_no_of_entries;
+    uint64_t vtlb_no_of_entries1;
+    uint64_t valid_vtlb_no_of_entries;
+    uint64_t QURTK_vtlb_main_VA;
+    uint64_t QURTK_vtlb_main_PA;
+    uint64_t QURTK_VTLB_DATA_VA;
+    uint64_t QURTK_VTLB_DATA_PA;
 #ifdef HEXAGON_VTLB_NEW_ARCH_CDSP
     qurtk_vtlb_table_descriptor_cdsp qurtk_vtlb_main;
     qurtk_vtlb_table_descriptor_cdsp qurtk_vtlb_main_next;

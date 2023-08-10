@@ -47,6 +47,9 @@
 #include "target/hexagon.h"
 #include "target/hexagon_cdsp.h"
 
+uint64_t thread_id_thread_select;
+uint64_t breakpoint_address_thread_select;
+
 #define GDB 0
 #define LLDB 1
 
@@ -153,6 +156,9 @@ static int gdb_use_target_description = 1;
 
 /* current processing free-run type, used by file-I/O */
 static char gdb_running_type;
+
+/*Extern variable for the hexagon*/
+// bool is_hexagon_untrusted = false;
 
 char *hexagon_regiterinfo[] = {
 	"name:r00;alt-name:R0;bitsize:32;variable-size:0;offset:0;encoding:uint;format:hex;set:Thread Registers;gcc:0;dwarf:0;generic:;",
@@ -1098,7 +1104,10 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		current_thread[0] = '\0';
 
 		if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
-		{
+		{   
+			current_thread_id_hexagon = thread_id_thread_select + 1;
+			LOG_DEBUG("pk_thread_id_current= %d", current_thread_id_hexagon);
+
 			gdb_hexagon_fetch_fp_pc_sp(connection);
 			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx32 ";",
 					 current_thread_id_hexagon);
@@ -2217,6 +2226,7 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 	}
 
 	address = strtoull(separator + 1, &separator, 16);
+	breakpoint_address_thread_select=address;
 
 	if (*separator != ',') {
 		LOG_ERROR("incomplete breakpoint/watchpoint packet received, dropping connection");
@@ -3338,7 +3348,9 @@ static int gdb_query_packet(struct connection *connection,
 			&buffer,
 			&pos,
 			&size,
-			"PacketSize=%x;qXfer:memory-map:read%c;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
+			// "PacketSize=%x;qXfer:memory-map:read%c;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
+			"PacketSize=%x;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
+
 			GDB_BUFFER_SIZE,
 			((gdb_use_memory_map == 1) && (flash_get_bank_count() > 0)) ? '+' : '-',
 			(gdb_target_desc_supported == 1) ? '+' : '-');

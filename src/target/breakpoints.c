@@ -302,6 +302,8 @@ static int breakpoint_remove_internal(struct target *target, target_addr_t addre
 		if ((breakpoint->address == address) ||
 		    (breakpoint->address == 0 && breakpoint->asid == address))
 			break;
+		else if ((breakpoint->address + 4) == address)
+			break;
 		breakpoint = breakpoint->next;
 	}
 

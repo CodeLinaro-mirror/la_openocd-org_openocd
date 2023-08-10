@@ -35,14 +35,14 @@ typedef struct hexagon_config
 
 hexagon_config gHexConfig =
 {
-	.maxHwThreads  = 6,
-	.etmClkenAddr  = 0x86808000,
-	.etmResetAddr  = 0x86808008,
-	.qpss6WDOGCtl  = 0x4104004,
-	.numTlbEntries = 192,
+	.maxHwThreads  = 8,
+	.etmClkenAddr  = 0x80808000,
+	.etmResetAddr  = 0x80808008,
+	.qpss6WDOGCtl  = 0x92384004,
+	.numTlbEntries = 256,
 };
 
-
+static int spid;
 static uint8_t sbp_step_executed = 0; //Just a bool variable
 
 //Global data to store/keep track of the initial PC value once threads are halted through software breakpoint, value are cleared once resume happens.
@@ -2120,13 +2120,6 @@ static int hexagon_remove_breakpoint(struct target *target, struct breakpoint *b
 	struct hexagon_common *hexagon = target_to_hexagon(target);
 	LOG_DEBUG("Entering %s\n", __FUNCTION__);
 
-#if 0
-/* It is perfectly possible to remove breakpoints while the target is running */
-	if (target->state != TARGET_HALTED) {
-		LOG_WARNING("target not halted");
-		return ERROR_TARGET_NOT_HALTED;
-	}
-#endif
 
 	if (breakpoint->is_set)
 	{
@@ -2370,10 +2363,7 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
 	LOG_DEBUG("after read register value =  0x%x ", global_reg[regnum-HEXAGON_EVB]);
 #endif
 
-#ifdef _HEXAGON_TARGET_TIME_PROFILING_
-	hexagon_end_time_cal_ms();
-	LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total);
-#endif
+
 	return ERROR_OK;
 }
 
@@ -4870,10 +4860,12 @@ static void hexagon_populate_vtlb_refresh_entries(struct target *target)
 /* This function populate the VTLB global data like no of entries in VTLB, counter and allocate VTLB memory for entries */
 static void hexagon_populate_vtlb_data(struct target *target)
 {
+
+	int retval = ERROR_OK;
+
 	LOG_DEBUG("hexagon_populate_vtlb_data  Enter");
 
-	/*if(hexagon_vtlb_data.QURTK_VTLB_DATA_VA != 0)
-		return;*/
+
 
 #ifdef HEXAGON_VTLB_AXI
 	if (debug_axi_ap == NULL)
@@ -4942,7 +4934,8 @@ static void hexagon_populate_vtlb_data(struct target *target)
 static void hexagon_populate_vtlb_entries(struct target *target)
 {
 
-	uint32_t output[2] = {0}, i, address;
+	int retval = ERROR_OK;
+	uint32_t output[2] = {0}, i;
 
 
 
@@ -5023,8 +5016,8 @@ static void hexagon_print_vtlb_entries(void)
 		temp = hexagon_vtlb_entries + i;
 		/*LOG_DEBUG("VA = 0x%x --> PA = 0x%x ", temp->virt_tlb_raw_data,temp->phys_tlb_raw_data);
 		LOG_DEBUG("VA Page = 0x%08x PA Page =  0x%08x and Page size = %d", temp->virt_page,temp->phy_page,temp->page_size);*/
-		LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x", temp->virt_add_low, temp->virt_add_high,
-				  (uint32_t)temp->phy_add_low, (uint32_t)temp->phy_add_high);
+		LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%llx -- 0x%llx", temp->virt_add_low, temp->virt_add_high,
+				  temp->phy_add_low, temp->phy_add_high);
 	}
 }
 
@@ -5046,8 +5039,8 @@ static void hexagon_update_vtlb_entry_in_structure(uint32_t tlb_phy, uint32_t tl
 	}
 	virt_page = VIRT_PAGE(tlb_virtual);
 	global_bit = P_G(tlb_virtual);
-	/*if(!global_bit)
-		return; */
+
+
 	if (virt_page == 0x0)
 		return;
 	tlblo.raw = tlb_phy;
@@ -5129,8 +5122,8 @@ static void hexagon_update_vtlb_entry_in_structure(uint32_t tlb_phy, uint32_t tl
 
 	temp->phy_add_low = temp->phy_page << 12;
 	temp->phy_add_high = temp->phy_add_low + size;
-	//LOG_DEBUG("index = %d, VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x",index, temp->virt_add_low,temp->virt_add_high,temp->phy_add_low,temp->phy_add_high);
-	//LOG_DEBUG("hexagon_update_vtlb_entry_in_structure Exit");
+	// LOG_DEBUG("index = %d, VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x",index, temp->virt_add_low,temp->virt_add_high,temp->phy_add_low,temp->phy_add_high);
+	// LOG_DEBUG("hexagon_update_vtlb_entry_in_structure Exit");
 }
 
 /* this function is related to page table and get the mask from physical page */
@@ -5443,17 +5436,16 @@ int hexagon_read_tlb_entry(struct target *target)
 									hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
 	LOG_DEBUG("hexagon_read_tlb_entry  ISDBST status after reading MBXOUT = 0x%x", isdbsts);
 	//LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", read_val[1]);
-	//	#if 0
+
 	LOG_DEBUG("Printing TLB Entries");
 	for (k = 0; k < gHexConfig.numTlbEntries; k++)
 	{
 		/*	LOG_DEBUG("VA raw = 0x%x --> PA raw  = 0x%x ", gpHexagonTlbEntries[k].virt_tlb_raw_data,gpHexagonTlbEntries[k].phys_tlb_raw_data);
 			    LOG_DEBUG("VA = 0x%x --> PA = 0x%x and page size = %d", gpHexagonTlbEntries[k].virt_page,gpHexagonTlbEntries[k].phy_page,
 					gpHexagonTlbEntries[k].page_size);*/
-		LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%08x -- 0x%08x", gpHexagonTlbEntries[k].virt_add_low,
-				  gpHexagonTlbEntries[k].virt_add_high, (uint32_t)gpHexagonTlbEntries[k].phy_add_low, (uint32_t)gpHexagonTlbEntries[k].phy_add_high);
+		LOG_DEBUG("VA = 0x%08x -- 0x%08x and PA = 0x%llx -- 0x%llx", gpHexagonTlbEntries[k].virt_add_low,
+				  gpHexagonTlbEntries[k].virt_add_high, gpHexagonTlbEntries[k].phy_add_low, gpHexagonTlbEntries[k].phy_add_high);
 	}
-	//#endif
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_
 	hexagon_end_time_cal_ms();
@@ -5504,7 +5496,7 @@ static void hexagon_hw_watchdog_disable(struct target *target)
 	uint32_t temp;
 	uint8_t buffer;
 
-	LOG_DEBUG("hexagon_hw_watchdog_disable  enter ");
+	LOG_INFO("hexagon_hw_watchdog_disable  enter ");
 
 	if (debug_axi_ap == NULL)
 		hexagon_initialize_axi_ap(target);
@@ -5521,8 +5513,8 @@ static void hexagon_hw_watchdog_disable(struct target *target)
 
 	LOG_DEBUG("HEXAGON_MSS_QDSP6SS_WDOG_CTL read value  = 0x%x ", temp);
 
-	retval = mem_ap_write_atomic_u32(debug_axi_ap,
-									 gHexConfig.qpss6WDOGCtl, HEXAGON_MSS_QDSP6SS_WDOG_DISABLE);
+	retval = mem_ap_write_atomic_u32(debug_axi_ap, gHexConfig.qpss6WDOGCtl,
+									HEXAGON_MSS_QDSP6SS_WDOG_DISABLE);
 
 	if (retval != ERROR_OK)
 		LOG_DEBUG("WDOG disabled failed");
@@ -5533,25 +5525,6 @@ static void hexagon_hw_watchdog_disable(struct target *target)
 		LOG_DEBUG("read api failed");
 
 	LOG_DEBUG("HEXAGON_MSS_QDSP6SS_WDOG_CTL read value after write  = 0x%x ", temp);
-
-#ifdef _BITRA_TARGET_
-	/* g_sleepAllowLowPowerModes  write this with value 0 to disable sleep */
-	buffer = 0;
-	mem_ap_write_buf(debug_axi_ap, &buffer, 1, 1, 0x92EE3414);
-
-	/* dog_hal_disable_for_bringup write this value with 1  */
-	buffer = 1;
-	mem_ap_write_buf(debug_axi_ap, &buffer, 1, 1, 0x9AF8F801);
-
-	/* dog_disable_pd_grace_timer write this value with 1  */
-	mem_ap_write_buf(debug_axi_ap, &buffer, 1, 1, 0x9368715A);
-
-	/* dog_virtual_disable write this value with 1  */
-	mem_ap_write_buf(debug_axi_ap, &buffer, 1, 1, 0x93687159);
-
-	/* dog_hb_disable write this value with 1  */
-	mem_ap_write_buf(debug_axi_ap, &buffer, 1, 1, 0x93687158);
-#endif
 
 	LOG_INFO("hexagon_hw_watchdog_disable  exit ");
 }
@@ -5726,7 +5699,7 @@ static int hexagon_resume(struct target *target, int current, target_addr_t addr
 			while ((cache != NULL))
 			{
 				LOG_DEBUG("*((uint32_t*)cache->reg_list[HEXAGON_PC].value) = 0x%x", *((uint32_t *)cache->reg_list[HEXAGON_PC].value));
-				if (*((uint32_t *)cache->reg_list[HEXAGON_PC].value) == ((current_breakpoint->address) + 4))
+                if (*((uint32_t *)cache->reg_list[HEXAGON_PC].value) == ((current_breakpoint->address)))
 				{
 					LOG_DEBUG("breakpoint address match with PC found in the bp-list, Replacing the original instruction in place of breakpoint");
 					PC_matched_with_sbp_addr = 1;
@@ -5741,14 +5714,7 @@ static int hexagon_resume(struct target *target, int current, target_addr_t addr
 
 			LOG_DEBUG("Reached here");
 
-			/*	
-			if(current_breakpoint->address == PC){
-				//breakpoint found in the list
-				LOG_DEBUG("breakpoint found in the list, continuing resume");
-				pc_found_in_bp = 1;
-				break;
-			}
-		*/
+
 			current_breakpoint = current_breakpoint->next;
 			LOG_DEBUG("Reached here");
 
@@ -5796,13 +5762,13 @@ static int hexagon_resume(struct target *target, int current, target_addr_t addr
 		}
 		retval = hexagon_write_ctrl_register(target, HEXAGON_PC, i, current_breakpoint->address);
 		//Replace breakpoint instrn with original instruction
-		//retval = ERROR_OK;
-		//union fourbyte val;
+		retval = ERROR_OK;
+		union fourbyte val;
 
-		//val.byte[0] = current_breakpoint->orig_instr[0];
-		//val.byte[1] = current_breakpoint->orig_instr[1];
-		//val.byte[2] = current_breakpoint->orig_instr[2];
-		//val.byte[3] = current_breakpoint->orig_instr[3];
+		val.byte[0] = current_breakpoint->orig_instr[0];
+		val.byte[1] = current_breakpoint->orig_instr[1];
+		val.byte[2] = current_breakpoint->orig_instr[2];
+		val.byte[3] = current_breakpoint->orig_instr[3];
 
 		//retval = hexagon_memw_write_instruction_memory(target, current_breakpoint->address, val.word, 1);
 		//if (retval != ERROR_OK)
@@ -5934,18 +5900,10 @@ resumed:
 	}
 
 	LOG_DEBUG("Exiting %s\n", __FUNCTION__);
-#ifdef _HEXAGON_TARGET_TIME_PROFILING_
-	hexagon_end_time_cal_ms();
-	LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total);
-#endif
+
 
 	//resetting the global data structures to keep track of Business logic involved in SW BP
-	/*gpSbpHaltedThreadsPC[0] = 0;
-	gpSbpHaltedThreadsPC[1] = 0;
-	gpSbpHaltedThreadsPC[2] = 0;
-	gpSbpHaltedThreadsPC[3] = 0;
-	gpSbpHaltedThreadsPC[4] = 0;
-	gpSbpHaltedThreadsPC[5] = 0; */
+
 	for (j = 0; j < gHexConfig.maxHwThreads; j++)
 	{
 		gpSbpHaltedThreadsPC[j] = 0;
@@ -5973,6 +5931,7 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
 		return ERROR_TARGET_NOT_HALTED;
 	}
 	hexagon_stuff_reg_restore_r0_r1_r2_r7(target);
+
 #ifdef _HEXAGON_TARGET_TIME_PROFILING_
 	hexagon_start_time_cal_ms();
 #endif
@@ -5980,6 +5939,7 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
 
 	/* Send ISDB command(STEP) to set all thread  */
 	isdbcmd |= ISDBCMD_CMD_ISTEP;
+
 	if (gHexConfig.maxHwThreads == 6)
 		isdbcmd |= ISDBCMD_TNUM_MASK_6;
 	else if (gHexConfig.maxHwThreads == 4)
@@ -6391,14 +6351,6 @@ static int hexagon_debug_entry(struct target *target)
 
 	LOG_DEBUG("TARGET_HALTED, HEXAGON_ISDB_BRKPTINFO = 0x%x \n", brkptinfo);
 
-	/*uint32_t thrd_src[6] = 	{
-									((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0)),
-									((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE)>>(3)),
-									((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE)>>(6)),
-									((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE)>>(9)),
-									((brkptinfo & BRKPTINFO_THREAD4_BRKPT_SOURCE)>>(12)),
-									((brkptinfo & BRKPTINFO_THREAD5_BRKPT_SOURCE)>>(15))
-								}; */
 	if (gHexConfig.maxHwThreads == 4)
 	{
 		thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE) >> (0));
@@ -6806,14 +6758,6 @@ static int hexagon_handle_target_request(void *priv)
 
 		LOG_DEBUG("TARGET_HALTED, HEXAGON_ISDB_BRKPTINFO = 0x%x \n", brkptinfo);
 
-		/*	uint32_t thrd_src[6] = 	{
-										((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0)),
-										((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE)>>(3)),
-										((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE)>>(6)),
-										((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE)>>(9)),
-										((brkptinfo & BRKPTINFO_THREAD4_BRKPT_SOURCE)>>(12)),
-										((brkptinfo & BRKPTINFO_THREAD5_BRKPT_SOURCE)>>(15))
-									}; */
 		if (gHexConfig.maxHwThreads == 4)
 		{
 			thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE) >> (0));
@@ -6890,52 +6834,55 @@ static uint32_t hexagon_etm_on(struct target *target)
 	struct hexagon_common *hexagon = target->arch_info;
 	struct hexa_info *hexa_info = &hexagon->hexa_info;
 	struct adiv5_dap *swddp = hexa_info->dap;
+    static int initialized;
 	uint32_t retval = ERROR_OK, tmp;
 
-
-	retval = enable_dbg_sys_pwr(swddp);
-	LOG_INFO("Unlocking ISDB-APB interface");
-	LOG_INFO("Enabling ETM ");
-	tmp = 0x3;
-	retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmClkenAddr, tmp);
-	if (retval != ERROR_OK)
-	{
-		LOG_DEBUG("unable to enable ETM clk 0x%x", tmp);
-		return retval;
-	}
-	hexagon_wait_loop();
-	tmp = 0x1;
-	retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
-	if (retval != ERROR_OK)
-	{
-		LOG_DEBUG("unable to reset ETM 0x%x", tmp);
-		return retval;
-	}
-	hexagon_wait_loop();
-	tmp = 0x0;
-	retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
-	if (retval != ERROR_OK)
-	{
-		LOG_DEBUG("APB unlock fail");
-		return retval;
-	}
-	hexagon_wait_loop();
-	LOG_INFO("After Enabling ETM ");
-	retval = mem_ap_read_atomic_u32(hexa_info->debug_ap, gHexConfig.etmClkenAddr, &tmp);
-	if (retval != ERROR_OK)
-	{
-		LOG_DEBUG("unable to read ETM clk 0x%x", tmp);
-		return retval;
-	}
-	LOG_DEBUG("ETM clk 0x%x", tmp);
-	retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
-	if (retval != ERROR_OK)
-	{
-		LOG_DEBUG("unable to read ETM reset 0x%x", tmp);
-		return retval;
-	}
-	LOG_DEBUG("ETM reset 0x%x", tmp);
-
+    if (!initialized)
+    {
+        retval = enable_dbg_sys_pwr(swddp);
+        LOG_INFO("Unlocking ISDB-APB interface");
+        LOG_INFO("Enabling ETM ");
+        tmp = 0x3;
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmClkenAddr, tmp);
+        if (retval != ERROR_OK)
+        {
+            LOG_DEBUG("unable to enable ETM clk 0x%x", tmp);
+            return retval;
+        }
+        hexagon_wait_loop();
+        tmp = 0x1;
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
+        if (retval != ERROR_OK)
+        {
+            LOG_DEBUG("unable to reset ETM 0x%x", tmp);
+            return retval;
+        }
+        hexagon_wait_loop();
+        tmp = 0x0;
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
+        if (retval != ERROR_OK)
+        {
+            LOG_DEBUG("APB unlock fail");
+            return retval;
+        }
+        hexagon_wait_loop();
+        LOG_INFO("After Enabling ETM ");
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap, gHexConfig.etmClkenAddr, &tmp);
+        if (retval != ERROR_OK)
+        {
+            LOG_DEBUG("unable to read ETM clk 0x%x", tmp);
+            return retval;
+        }
+        LOG_DEBUG("ETM clk 0x%x", tmp);
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, gHexConfig.etmResetAddr, tmp);
+        if (retval != ERROR_OK)
+        {
+            LOG_DEBUG("unable to read ETM reset 0x%x", tmp);
+            return retval;
+        }
+        LOG_DEBUG("ETM reset 0x%x", tmp);
+        initialized = 1;
+    }
 	return retval;
 }
 
@@ -7107,26 +7054,7 @@ static int hexagon_examine_first(struct target *target)
 		return retval;
 	}
 	LOG_DEBUG("After ISDB status  0x%x ", isdbst);
-#if 0
-	retval = mem_ap_read_buf(hexa_info->debug_ap,(uint8_t *)&tmp, 4, 1, gHexConfig.qpss6WDOGCtl);
-		if(retval != ERROR_OK)
-			LOG_DEBUG("read api failed"); 
-		
-		LOG_DEBUG("HEXAGON_MSS_QDSP6SS_WDOG_CTL read value	= 0x%x ",tmp);
-		
-		retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-					gHexConfig.qpss6WDOGCtl, HEXAGON_MSS_QDSP6SS_WDOG_DISABLE);
-		
-		if(retval != ERROR_OK)
-			LOG_DEBUG("WDOG disabled failed"); 
-			
-		hexagon_wait_loop();
-		retval = mem_ap_read_buf(hexa_info->debug_ap,(uint8_t *)&tmp, 4, 1, gHexConfig.qpss6WDOGCtl);
-		if(retval != ERROR_OK)
-			LOG_DEBUG("read api failed"); 
-		
-		LOG_DEBUG("HEXAGON_MSS_QDSP6SS_WDOG_CTL read value after write	= 0x%x ",tmp);
-#endif
+
 
 	hexagon->brp_num = 2;
 	hexagon->brp_num_available = hexagon->brp_num;
@@ -7162,9 +7090,8 @@ static int hexagon_examine_first(struct target *target)
 	target_set_examined(target);
 	LOG_INFO("%s: examination pass\n", target_name(target));
 
-    // hexagon_hw_watchdog_disable(target);
+    hexagon_hw_watchdog_disable(target);
 
-	//hexagon_populate_vtlb_data(target);
 	return ERROR_OK;
 }
 
@@ -7178,11 +7105,6 @@ static int hexagon_examine(struct target *target)
 	/* don't re-probe hardware after each reset */
 	if (!target_was_examined(target))
 		retval = hexagon_examine_first(target);
-
-	//Disabling this code as upon openocd start GDB sends hexagon-halt & part of it, hexagon_init_debug_access will be called.
-	/* Configure core debug access */
-	//if (retval == ERROR_OK)
-	//	retval = hexagon_init_debug_access(target);
 
 	return retval;
 }
@@ -7209,7 +7131,7 @@ static int hexagon_init_arch_info(struct target *target,
 	hexa_info->arch_info = hexagon;
 	target->arch_info = hexagon;
 	hexa_info->target = target;
-    // memset(gpPerHwThrdReg, 0, sizeof(gpPerHwThrdReg));
+
 	memset(global_reg, 0, sizeof(global_reg));
 
 	target_register_timer_callback(hexagon_handle_target_request, 5,
@@ -8407,8 +8329,6 @@ static int hexagon_untrusted_read_to_mailboxout(struct target *target, uint32_t 
 
 	retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
 									hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, value);
-	// LOG_INFO("VALUE : 0x%x", value);
-
 	if (retval != ERROR_OK)
 	{
 		LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", *value);
@@ -8416,8 +8336,6 @@ static int hexagon_untrusted_read_to_mailboxout(struct target *target, uint32_t 
 	}
 	retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
 									hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-	LOG_DEBUG("ISDBSTS after read from mailboxout : 0x%x", isdbsts);
 	if (retval != ERROR_OK)
 	{
 		LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
@@ -8562,10 +8480,9 @@ int hexagon_untrusted_listen_for_rsp(struct target *target, char *s, uint16_t *r
 	int retval, i = 0;
 	uint32_t read_val;
 	uint32_t calculated_checksum = 0;
+    uint32_t mbxOutVal;
 	untrusted_essential *header;
-	uint32_t mbxOutVal=0;
-
-	struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_common *hexagon = target_to_hexagon(target);
 	struct hexa_info *hexa_info = &hexagon->hexa_info;
 
 	/* Read the essential header */
@@ -8809,7 +8726,7 @@ static int load_process_list(char *process_list_response)
 	char *scolon_index;
 	char p[16];
 	int pname_index = 0;
-	int spid;
+	// int spid;
 	selected_process = -1;
 	int r=0x0;
 	char line[256];
@@ -8840,22 +8757,20 @@ static int load_process_list(char *process_list_response)
 	{
 		printf("\t%u\t\t%s\n", process_list[i].pid, process_list[i].process_name);
 	}
-	printf("Enter the process ID to debug: \n");
-	if (fgets(line, sizeof(line), stdin))
+
+	if (spid)
 	{
-		if (1 == sscanf(line, "%d", &spid))
+		for (int i = 0; i < total_process; i++)
 		{
-			for (int i = 0; i < total_process; i++)
+			if (process_list[i].pid == spid)
 			{
-				if (process_list[i].pid == spid)
-				{
-					selected_process = spid;
-					printf("Selected process to debug is : %s\n", process_list[i].process_name);
-					break;
-				}
+				selected_process = spid;
+				printf("Since untrusted mode debug has been enabled selected process to debug is : %s\n", process_list[i].process_name);
+				break;
 			}
 		}
 	}
+	
 
 	if (selected_process == -1)
 	{
@@ -8910,6 +8825,7 @@ int hexagon_untrusted_forward_rsp(struct target *target, char *response, uint16_
 static int hexagon_untrusted_mode()
 {
 	is_hexagon_untrusted = true;
+	spid = 2;
 	LOG_DEBUG("Mode changed to hexagon untrusted!\n");
 	return ERROR_OK;
 }
@@ -8955,4 +8871,5 @@ struct target_type hexagon_target = {
 	.get_gdb_fileio_info = NULL,
 	.gdb_fileio_end = NULL,
 	.profiling = NULL,
-	.address_bits = NULL};
+	.address_bits = NULL
+};
