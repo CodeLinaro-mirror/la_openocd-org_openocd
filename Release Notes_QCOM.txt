@@ -3,5 +3,5 @@ VERSIONS
 ===================================
 
 Openocd              : 0.12.0
-Jimtcl               : https://github.com/msteveb/jimtcl/tree/1933e5457b9512d39ebbe11ed32578aada149f49
+Jimtcl               : https://github.com/msteveb/jimtcl/tree/a77ef1a6218fad4c928ddbdc03c1aedc41007e70
 Libjaylink           : https://gitlab.zapb.de/libjaylink/libjaylink/-/tree/0d23921a05d5d427332a142d154c213d0c306eb1
