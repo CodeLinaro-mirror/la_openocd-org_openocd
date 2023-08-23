@@ -12,7 +12,13 @@ Tools/Pre-requsites
     pacman -S  mingw-w64-ucrt-x86_64-thrift
 	
 - If you face any issues while installing above packages, please check your firewall settings.	
-	
+
+Qualcomm specific tools:
+- Login to qpm.qualcomm.com	& install the below packages:
+- QUTS: 1.64.1.39 (version & above)
+- Qualcomm Host USB Product Suite - QUD QC only : 1.00.63 (supported version)
+- EUD QC only : 2.1.1 (version & above)
+
 ==========================
 Obtaining OpenOCD From GIT
 ==========================
