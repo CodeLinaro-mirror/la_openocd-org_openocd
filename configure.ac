@@ -733,6 +733,15 @@ AS_IF([test "x$enable_jlink" != "xno"], [
   ])
 ])
 
+AS_IF([test "x$enable_eud" != "xno"], [
+  AS_IF([test -f "$srcdir/src/jtag/drivers/eud/configure.ac"], [
+    AX_CONFIG_SUBDIR_OPTION([src/jtag/drivers/eud], [--enable-subproject-build])
+  ], [
+    AC_MSG_ERROR([Internal eud not found, run either 'git submodule init' and 'git submodule update' or disable internal eud with --disable-internal-eud.])
+  ])
+])
+
+
 # Presto needs the bitq module
 AS_IF([test "x$enable_presto" != "xno"], [
   build_bitq=yes

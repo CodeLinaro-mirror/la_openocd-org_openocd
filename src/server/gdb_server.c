@@ -20,10 +20,7 @@
  *   Hsiangkai Wang <hkwang@andestech.com>                                 *
  *                                                                         *
  *   Copyright (C) 2013 Franck Jullien                                     *
- *   elec4fun@gmail.com                                                    * 
- *                                                                         *
- *   Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
- *   All rights reserved.                                                  *
+ *   elec4fun@gmail.com                                                    *
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -45,10 +42,14 @@
 #include "target/smp.h"
 #include "target/arm.h"
 #include "target/hexagon.h"
-#include "target/hexagon_cdsp.h"
+#include "target/hexagon.h"
 
+#ifdef BREAKPOINT_THREAD_SELECT
 uint64_t thread_id_thread_select;
 uint64_t breakpoint_address_thread_select;
+#endif
+
+int is_spurious_breakpoint = 1;
 
 #define GDB 0
 #define LLDB 1
@@ -128,6 +129,7 @@ static void gdb_log_callback(void *priv, const char *file, unsigned line,
 static void gdb_sig_halted(struct connection *connection);
 
 static int gdb_qregister_packet(struct connection *connection, char const *packet, int packet_size);
+extern void current_debug_thread(uint32_t selected_thread);
 
 /* number of gdb connections, mainly to suppress gdb related debugging spam
  * in helper/log.c when no gdb connections are actually active */
@@ -160,7 +162,7 @@ static char gdb_running_type;
 /*Extern variable for the hexagon*/
 // bool is_hexagon_untrusted = false;
 
-char *hexagon_regiterinfo[] = {
+char *hexagon_registerinfo[] = {
 	"name:r00;alt-name:R0;bitsize:32;variable-size:0;offset:0;encoding:uint;format:hex;set:Thread Registers;gcc:0;dwarf:0;generic:;",
 	"name:r01;alt-name:R1;bitsize:32;variable-size:0;offset:4;encoding:uint;format:hex;set:Thread Registers;gcc:1;dwarf:1;generic:;",
 	"name:r02;alt-name:R2;bitsize:32;variable-size:0;offset:8;encoding:uint;format:hex;set:Thread Registers;gcc:2;dwarf:2;generic:;",
@@ -381,12 +383,6 @@ unsigned int current_target_hexagon = 0;
 /*  hexagon_no_of_threads  variable contains info regarding no of HW threads in system*/
 unsigned int hexagon_no_of_threads = 0;
 
-/*  current_target_hexagon variable contains info if current debug target is hexagon cdsp*/
-unsigned int current_target_hexagon_cdsp = 0;
-
-/*  current_target_hexagon variable contains info if current debug target is hexagon adsp*/
-unsigned int current_target_hexagon_adsp = 0;
-
 /* current_thread_id_hexagon variable contains the info for current selected HW thread*/
 unsigned int current_thread_id_hexagon = 1;
 
@@ -394,18 +390,21 @@ unsigned int current_thread_id_hexagon = 1;
 // unsigned int hexagon_pc , hexagon_sp, hexagon_fp;
 char hexagon_pc[15], hexagon_sp[15], hexagon_fp[15];
 
-extern void hexagon_update_sp_pc_fp_gdb_server_adsp(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
-extern void hexagon_update_sp_pc_fp_gdb_server_cdsp(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
 extern void hexagon_update_sp_pc_fp_gdb_server(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
-extern uint32_t hexagon_no_of_hw_threads(void);
-extern uint32_t hexagon_no_of_hw_threads_cdsp(void);
-extern uint32_t hexagon_no_of_hw_threads_adsp(void);
+
+extern uint32_t hexagon_no_of_hw_threads(struct target *target);
+char* form_thread_list_packet(unsigned int hexagon_no_of_hw_threads, char * pkt);
+char*  form_thread_id_packet (unsigned int thread_number, char* pkt);
+int pkt_size_calculate(unsigned int hexagon_no_of_hw_threads);
+int thread_id_pkt_size(unsigned int hexagon_no_of_hw_threads);
 
 static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection);
 
 static int gdb_last_signal(struct target *target)
 {
-	switch (target->debug_reason) {
+	switch (target->debug_reason) 
+	{
+
 		case DBG_REASON_DBGRQ:
 			return 0x2;		/* SIGINT */
 		case DBG_REASON_BREAKPOINT:
@@ -911,7 +910,7 @@ static inline int fetch_packet(struct connection *connection,
 	checksum[2] = 0;
 
 	/*Hexagon untrusted mode changes*/
-	if (is_hexagon_untrusted == true)
+	if (is_hexagon_untrusted == true && current_target_hexagon)
 	{
 		retval = hexagon_untrusted_update_packet(buffer, count);
 		if (retval != ERROR_OK)
@@ -1103,18 +1102,35 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 
 		current_thread[0] = '\0';
 
-		if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+		if (current_target_hexagon)
 		{   
+		#ifdef BREAKPOINT_THREAD_SELECT
 			current_thread_id_hexagon = thread_id_thread_select + 1;
-			LOG_DEBUG("pk_thread_id_current= %d", current_thread_id_hexagon);
+
+		#endif
 
 			gdb_hexagon_fetch_fp_pc_sp(connection);
 			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx32 ";",
 					 current_thread_id_hexagon);
 			/*snprintf(hexagon_thread_info, sizeof(hexagon_thread_info), "28:%x;1e:%x;1d:%x;",
 					hexagon_pc,hexagon_fp,hexagon_sp);*/
+			/* 
+			format : `TAAn...:r...;n...:r...;n...:r...;'
+				AA = two hex digit signal number; 
+				n... = register number (hex), 
+				r... = target byte ordered register contents, size defined by DEPRECATED_REGISTER_RAW_SIZE;
+				n... = `thread', 
+				r... = thread process ID, 
+				this is a hex integer; 
+				n... = (`watch' | `rwatch' | `awatch', 
+				r... = data address, this is a hex integer;
+			 	n... = other string not starting with valid hex digit. 
+				GDB should ignore this n..., r... pair and go on to the next. This way we can extend the protocol.
+			*/
+			
 			snprintf(hexagon_thread_info, sizeof(hexagon_thread_info), "28:%s;1e:%s;1d:%s;",
 					 hexagon_pc, hexagon_fp, hexagon_sp);
+			
 			sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s%s",
 									 signal_var, stop_reason, current_thread, hexagon_thread_info);
 			LOG_DEBUG("sig_reply %s", (char *)sig_reply);
@@ -1220,7 +1236,9 @@ static void gdb_fileio_reply(struct target *target, struct connection *connectio
 		/* Use target_resume() to let target run its own exit syscall handler. */
 		gdb_connection->frontend_state = TARGET_RUNNING;
 		target_resume(target, 1, 0x0, 0, 0);
-	} else {
+	} 
+	else 
+	{
 		gdb_connection->frontend_state = TARGET_HALTED;
 		rtos_update_threads(target);
 	}
@@ -1285,23 +1303,13 @@ static int gdb_new_connection(struct connection *connection)
 	connection->priv = gdb_connection;
 	connection->cmd_ctx->current_target = target;
 
-	if (strncmp(target->type->name, "hexagon_cdsp", 12) == 0)
-	{
-		current_target_hexagon_cdsp = 1;
-		hexagon_no_of_threads = hexagon_no_of_hw_threads_cdsp();
-		LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
-	}
-	else if (strncmp(target->type->name, "hexagon_adsp", 12) == 0)
-	{
-		current_target_hexagon_adsp = 1;
-		hexagon_no_of_threads = hexagon_no_of_hw_threads_adsp();
-	}
-	else if (strncmp(target->type->name, "hexagon", 7) == 0)
+    if (strncmp(target->type->name, "hexagon", 7) == 0)
 	{
 		current_target_hexagon = 1;
-		hexagon_no_of_threads = hexagon_no_of_hw_threads();
+        hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
+        LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
+
 	}
-	LOG_DEBUG("current_target_hexagon_cdsp=%d", current_target_hexagon_cdsp);
 	LOG_DEBUG("current_target_hexagon=%d", current_target_hexagon);
 	/* initialize gdb connection information */
 	gdb_connection->buf_p = gdb_connection->buffer;
@@ -1421,9 +1429,8 @@ static int gdb_connection_closed(struct connection *connection)
 	 */
 	log_remove_callback(gdb_log_callback, connection);
 	current_target_hexagon = 0;
-	current_target_hexagon_cdsp = 0;
-	current_target_hexagon_adsp = 0;
 	hexagon_no_of_threads = 0;
+
 	gdb_actual_connections--;
 	LOG_DEBUG("GDB Close, Target: %s, state: %s, gdb_actual_connections=%d",
 		target_name(target),
@@ -1690,7 +1697,7 @@ static int gdb_qregister_packet(struct connection *connection,
 #endif
 	if (strncmp(target->type->name, "hexagon", 7) == 0)
 	{
-		reg_packet = hexagon_regiterinfo[reg_num];
+		reg_packet = hexagon_registerinfo[reg_num];
 	}
 	if (arm->core_state == ARM_STATE_AARCH64)
 	{
@@ -1724,21 +1731,24 @@ static int gdb_get_register_packet(struct connection *connection,
 
 	retval = target_get_gdb_reg_list_noread(target, &reg_list, &reg_list_size,
 			REG_CLASS_ALL);
+	
 	if (retval != ERROR_OK)
 		return gdb_error(connection, retval);
 
 	if ((reg_list_size <= reg_num) || !reg_list[reg_num] ||
-		!reg_list[reg_num]->exist || reg_list[reg_num]->hidden) {
+		!reg_list[reg_num]->exist || reg_list[reg_num]->hidden) 
+	{
 		LOG_ERROR("gdb requested a non-existing register (reg_num=%d)", reg_num);
 		return ERROR_SERVER_REMOTE_CLOSED;
 	}
-	if (current_thread_id_hexagon > 1 && (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp))
+
+	if (current_thread_id_hexagon > 1 && (current_target_hexagon))
 	{
 		temp_reg_num = reg_num;
-		// LOG_DEBUG("reg_list_size = %d reg_num =  %d and  current_thread_id_hexagon = %d ", reg_list_size,reg_num,current_thread_id_hexagon);
+		LOG_DEBUG("reg_list_size = %d reg_num =  %d and  current_thread_id_hexagon = %d ", reg_list_size,reg_num,current_thread_id_hexagon);
 		reg_num = HEXAGON_LLDB_PER_THREAD_REGISTER_COUNT * (current_thread_id_hexagon - 1) + reg_num;
 		// value = (unsigned int *)reg_list[reg_num]->value;
-		//	LOG_DEBUG("reg_num after calculation = %d and value = %d", reg_num,*value);
+		LOG_DEBUG("reg_num after calculation = %d ", reg_num);
 		if (temp_reg_num == 40)
 		{
 			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num]);
@@ -1758,7 +1768,7 @@ static int gdb_get_register_packet(struct connection *connection,
 			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 10]);
 		}
 	}
-	if (current_thread_id_hexagon == 1 && (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp))
+	if (current_thread_id_hexagon == 1 && (current_target_hexagon ))
 	{
 		if (reg_num == 40)
 		{
@@ -1807,27 +1817,20 @@ static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection)
 	struct target *target = get_target_from_connection(connection);
 	unsigned int sp, fp, pc;
 	struct reg reg_list = {0};
-	if (current_target_hexagon)
+    if (current_target_hexagon)
 	{
-		hexagon_update_sp_pc_fp_gdb_server(current_thread_id_hexagon - 1, &pc, &fp, &sp);
-	}
-	else if (current_target_hexagon_cdsp)
-	{
-		hexagon_update_sp_pc_fp_gdb_server_cdsp(current_thread_id_hexagon - 1, &pc, &fp, &sp);
-	}
-	else if (current_target_hexagon_adsp)
-	{
-		hexagon_update_sp_pc_fp_gdb_server_adsp(current_thread_id_hexagon - 1, &pc, &fp, &sp);
+		hexagon_update_sp_pc_fp_gdb_server( current_thread_id_hexagon - 1, &pc, &fp, &sp);
+
 	}
 
 	reg_list.size = 32;
-	reg_list.value = &fp;
+	reg_list.value = (uint8_t *) &fp;
 	gdb_str_to_target(target, hexagon_fp, &reg_list);
 
-	reg_list.value = &sp;
+	reg_list.value = (uint8_t *) &sp;
 	gdb_str_to_target(target, hexagon_sp, &reg_list);
 
-	reg_list.value = &pc;
+	reg_list.value = (uint8_t *) &pc;
 	gdb_str_to_target(target, hexagon_pc, &reg_list);
 }
 
@@ -1885,7 +1888,7 @@ static int gdb_set_register_packet(struct connection *connection,
 
 	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+	if (current_target_hexagon)
 	{
 
 		// struct reg *reg;
@@ -2178,7 +2181,9 @@ static int gdb_step_continue_packet(struct connection *connection,
 		LOG_DEBUG("continue");
 		/* resume at current address, don't handle breakpoints, not debugging */
 		retval = target_resume(target, current, address, 0, 0);
-	} else if (packet[0] == 's') {
+	} 
+	else if (packet[0] == 's') 
+	{
 		LOG_DEBUG("step");
 		/* step at current or address, don't handle breakpoints */
 		retval = target_step(target, current, address, 0);
@@ -2226,7 +2231,9 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 	}
 
 	address = strtoull(separator + 1, &separator, 16);
-	breakpoint_address_thread_select=address;
+#ifdef BREAKPOINT_THREAD_SELECT	
+	breakpoint_address_thread_select = address;
+#endif
 
 	if (*separator != ',') {
 		LOG_ERROR("incomplete breakpoint/watchpoint packet received, dropping connection");
@@ -2239,7 +2246,16 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 		case 0:
 		case 1:
 			if (packet[0] == 'Z') {
+				
+				if(is_spurious_breakpoint == 1 && (current_target_hexagon==1) )
+				{
+					LOG_INFO("Ignoring spurious breakpoint request sent by lldb");
+					gdb_put_packet(connection, "OK", 2);
+					is_spurious_breakpoint = 0;
+				    return ERROR_OK;
+				}
 				retval = breakpoint_add(target, address, size, bp_type);
+
 				if (retval == ERROR_NOT_IMPLEMENTED) {
 					/* Send empty reply to report that breakpoints of this type are not supported */
 					gdb_put_packet(connection, "", 0);
@@ -3329,6 +3345,8 @@ static int gdb_query_packet(struct connection *connection,
 		int pos = 0;
 		int size = 0;
 		int gdb_target_desc_supported = 0;
+		char * qxfer_packet = 0;
+
 
 		/* we need to test that the target supports target descriptions */
 		retval = gdb_target_description_supported(target, &gdb_target_desc_supported);
@@ -3344,18 +3362,28 @@ static int gdb_query_packet(struct connection *connection,
 			gdb_target_desc_supported = 0;
 		}
 
+		if ((current_target_hexagon ))
+		{
+			qxfer_packet = "PacketSize=%x;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+";
+		}
+		else
+		//  we use default qxfer packet value for other subsystems
+		{
+
+			qxfer_packet = "PacketSize=%x;qXfer:memory-map:read%c;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+";
+		}
 		xml_printf(&retval,
 			&buffer,
 			&pos,
 			&size,
-			// "PacketSize=%x;qXfer:memory-map:read%c;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
-			"PacketSize=%x;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+",
+			qxfer_packet,
 
 			GDB_BUFFER_SIZE,
 			((gdb_use_memory_map == 1) && (flash_get_bank_count() > 0)) ? '+' : '-',
 			(gdb_target_desc_supported == 1) ? '+' : '-');
 
 		if (retval != ERROR_OK) {
+			LOG_ERROR("qXfer packet error ");
 			gdb_send_error(connection, 01);
 			return ERROR_OK;
 		}
@@ -3512,23 +3540,25 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 				packet_size -= endp - parse;
 				parse = endp;
 			}
-		} else {
-			thread_id = 0; }
+		} else 
+		{
+			thread_id = 0; 
+		}
 			
-			if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+		if (current_target_hexagon)
+		{
+			/*if(current_thread_id_hexagon != current_thread_id_hexagon)
 			{
-				/*if(current_thread_id_hexagon != current_thread_id_hexagon)
-				{
-					fake_step = true;
-					LOG_INFO("fake_step = true for hexagon target'");
-				}*/
-				if (thread_id >= 1 && thread_id <= 6)
-				{
-					current_thread_id_hexagon = thread_id;
-				}
-				LOG_DEBUG("current_thread_id_hexagon = %lld'", thread_id);
+				fake_step = true;
+				LOG_INFO("fake_step = true for hexagon target'");
+			}*/
+			if (thread_id >= 1 && thread_id <= 8)
+			{
+				current_thread_id_hexagon = thread_id;
 			}
-			
+			LOG_DEBUG("current_thread_id_hexagon = %lld'", thread_id);
+		}
+		
 
 		if (target->rtos) {
 			/* FIXME: why is this necessary? rtos state should be up-to-date here already! */
@@ -3614,8 +3644,13 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 				gdb_connection->frontend_state = TARGET_RUNNING;
 			return true;
 		}
+        if (current_target_hexagon)
+		{
+			current_debug_thread(thread_id);
+		}
 
 		retval = target_step(ct, current_pc, 0, 0);
+
 		if (retval == ERROR_TARGET_NOT_HALTED)
 			LOG_INFO("target %s was not halted when step was requested", target_name(ct));
 
@@ -4030,7 +4065,9 @@ static int gdb_input_inner(struct connection *connection)
 			char rsp_response[1024];
 			/*hexagon untrusted changes*/
 			uint16_t len_of_response;
-			retval = hexagon_untrusted_forward_rsp(get_target_from_connection(connection), rsp_response, &len_of_response);
+			if (current_target_hexagon)
+				retval = hexagon_untrusted_forward_rsp(get_target_from_connection(connection), rsp_response, &len_of_response);
+
 			if (retval != ERROR_OK)
 				return retval;
 
@@ -4058,7 +4095,7 @@ static int gdb_input_inner(struct connection *connection)
 			switch (packet[0])
 			{
 			case 'T': /* Is thread alive? */
-				if (current_target_hexagon || current_target_hexagon_cdsp || current_target_hexagon_adsp)
+				if (current_target_hexagon)
 				{
 					gdb_put_packet(connection, "OK", 2); /* thread alive */
 				}
@@ -4069,11 +4106,11 @@ static int gdb_input_inner(struct connection *connection)
 				break;
 			case 'H': /* Set current thread ( 'c' for step and continue,
 					   * 'g' for all other operations ) */
-				if ((strncmp(packet, "Hg", 2) == 0) && (current_target_hexagon || current_target_hexagon_cdsp ||
-														current_target_hexagon_adsp))
+
+				if ((strncmp(packet, "Hg", 2) == 0) && (current_target_hexagon))
 				{
-					LOG_DEBUG("current_target_hexagon =%d and current_target_hexagon_cdsp = %d", current_target_hexagon,
-							  current_target_hexagon_cdsp);
+					LOG_DEBUG("current_target_hexagon =%d and current_target_hexagon = %d", current_target_hexagon,
+							  current_target_hexagon);
 					sscanf(packet, "Hg%16" SCNx32, &current_thread_id_hexagon);
 					LOG_DEBUG("current_thread_id_hexagon = 0x%x ", current_thread_id_hexagon);
 					gdb_put_packet(connection, "OK", 2);
@@ -4091,60 +4128,31 @@ static int gdb_input_inner(struct connection *connection)
 				}
 				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon)
 				{
-					LOG_DEBUG("current_target_hexagon =%d ", current_target_hexagon);
-					if (hexagon_no_of_threads == 6)
-					{
-						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
-						break;
-					}
-					else if (hexagon_no_of_threads == 4)
-					{
-						gdb_put_packet(connection, "m1,2,3,4", 8);
-						break;
-					}
-					else if (hexagon_no_of_threads == 2)
-					{
-						gdb_put_packet(connection, "m1,2", 4);
-						break;
-					}
-				}
-				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon_cdsp)
-				{
+					hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
+					gdb_hexagon_fetch_fp_pc_sp(connection); // to get  the updated PC information for corresponding threads 
 					LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
-					LOG_DEBUG("current_target_hexagon_cdsp =%d ", current_target_hexagon_cdsp);
-					if (hexagon_no_of_threads == 6)
+					LOG_DEBUG("current_target_hexagon =%d ", current_target_hexagon);
+
+					if (hexagon_no_of_threads > 1)
 					{
-						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
+						char *pkt = NULL;
+						int pkt_size = pkt_size_calculate(hexagon_no_of_threads);
+					    pkt = (char *)malloc(pkt_size * sizeof(char));
+
+						if (pkt == NULL) 
+						{
+							LOG_ERROR("Memory allocation failed\n");
+							break;
+						}
+
+						pkt = form_thread_list_packet(hexagon_no_of_threads, pkt);
+						// LOG_DEBUG("packet = %s\n", pkt);
+						// LOG_INFO("packet size = %d\n", pkt_size);
+						gdb_put_packet(connection, pkt, pkt_size-1);
+						free(pkt);
 						break;
 					}
-					else if (hexagon_no_of_threads == 4)
-					{
-						gdb_put_packet(connection, "m1,2,3,4", 8);
-						break;
-					}
-					else if (hexagon_no_of_threads == 2)
-					{
-						gdb_put_packet(connection, "m1,2", 4);
-						break;
-					}
-				}
-				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon_adsp)
-				{
-					if (hexagon_no_of_threads == 6)
-					{
-						gdb_put_packet(connection, "m1,2,3,4,5,6", 12);
-						break;
-					}
-					else if (hexagon_no_of_threads == 4)
-					{
-						gdb_put_packet(connection, "m1,2,3,4", 8);
-						break;
-					}
-					else if (hexagon_no_of_threads == 2)
-					{
-						gdb_put_packet(connection, "m1,2", 4);
-						break;
-					}
+
 				}
 				/*if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_arm)
 				{
@@ -4156,38 +4164,25 @@ static int gdb_input_inner(struct connection *connection)
 						gdb_put_packet(connection, "QC1", 3);
 						break;
 				}*/
-				if (strncmp(packet, "qC", 2) == 0 && (current_target_hexagon || current_target_hexagon_adsp ||
-													  current_target_hexagon_cdsp))
+				if (strncmp(packet, "qC", 2) == 0 && (current_target_hexagon))
 				{
-					if (current_thread_id_hexagon == 1)
+					hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
+					LOG_INFO("hexagon_no_of_threads=%d", hexagon_no_of_threads);
+
+					int pkt_size = 3 + snprintf(NULL, 0, "%d", hexagon_no_of_hw_threads(target)); // "QC" + number + null terminator
+					if (hexagon_no_of_threads > 0)
+					if(current_thread_id_hexagon>0)
 					{
-						gdb_put_packet(connection, "QC1", 3);
-						break;
-					}
-					else if (current_thread_id_hexagon == 2)
-					{
-						gdb_put_packet(connection, "QC2", 3);
-						break;
-					}
-					else if (current_thread_id_hexagon == 3)
-					{
-						gdb_put_packet(connection, "QC3", 3);
-						break;
-					}
-					else if (current_thread_id_hexagon == 4)
-					{
-						gdb_put_packet(connection, "QC4", 3);
-						break;
-					}
-					else if (current_thread_id_hexagon == 5)
-					{
-						gdb_put_packet(connection, "QC5", 3);
-						break;
-					}
-					else if (current_thread_id_hexagon == 6)
-					{
-						gdb_put_packet(connection, "QC6", 3);
-						break;
+						if (current_thread_id_hexagon >= 1)
+						{
+							char *pkt = NULL;
+
+							pkt = form_thread_id_packet(current_thread_id_hexagon, pkt);
+							pkt_size = thread_id_pkt_size(current_thread_id_hexagon) + 3;
+							gdb_put_packet(connection, pkt, pkt_size-1);
+							free(pkt);
+							break;
+						}
 					}
 				}
 #endif
@@ -4340,14 +4335,12 @@ static int gdb_input_inner(struct connection *connection)
 					break;
 
 				case 'j':
-					if ((strncmp(packet, "jThreadsInfo", 12) == 0) && (current_target_hexagon || current_target_hexagon_adsp ||
-																	   current_target_hexagon_cdsp))
+					if ((strncmp(packet, "jThreadsInfo", 12) == 0) )
 					{
 						gdb_put_packet(connection, "", 0);
 						break;
 					}
-					if ((strncmp(packet, "jThreadExtendedInfo", 19) == 0) && (current_target_hexagon || current_target_hexagon_adsp ||
-																			  current_target_hexagon_cdsp))
+					if ((strncmp(packet, "jThreadExtendedInfo", 19) == 0) )
 					{
 						gdb_put_packet(connection, "", 0);
 						break;
@@ -4785,6 +4778,95 @@ static const struct command_registration gdb_command_handlers[] = {
 	COMMAND_REGISTRATION_DONE
 };
 
+
+int pkt_size_calculate(unsigned int hexagon_no_of_hw_threads)
+{
+    unsigned int pkt_size = 1;
+    unsigned int div = 10;
+    unsigned int digits = 1;
+
+    for (unsigned int i = 1;  i <= hexagon_no_of_hw_threads;  i++ )
+    {
+        if ((i/div) > 0)
+        {
+            div = div * 10;
+            digits = digits + 1;
+        }
+        pkt_size = pkt_size + (digits + 1);
+    }
+
+    return pkt_size;
+}
+int process_pkt_size(int hexagon_no_of_hw_threads)
+{
+	LOG_INFO("in process_pkt_size");
+	int length = 0;
+	LOG_INFO("input threads : %u",hexagon_no_of_hw_threads);
+    do {
+        length++;
+		LOG_INFO("length : %d",length);
+		LOG_INFO("in while loop  : %d",hexagon_no_of_hw_threads);
+
+        hexagon_no_of_hw_threads /= 10;
+    } while (hexagon_no_of_hw_threads != 0);
+	LOG_INFO("in process_pkt_size done");
+    return length;
+}
+int thread_id_pkt_size(unsigned int hexagon_no_of_hw_threads)
+{
+	unsigned int length = 0;
+    do {
+        length++;
+        hexagon_no_of_hw_threads /= 10;
+    } while (hexagon_no_of_hw_threads != 0);
+    return length;
+}
+char*  form_thread_id_packet (unsigned int thread_number, char* pkt)
+{
+    // printf("thread_number = %d\n", thread_number);
+
+    int pkt_size = thread_id_pkt_size(thread_number) + 3; // "QC" + number + null terminator
+
+    pkt = (char *)malloc(pkt_size * sizeof(char));
+
+
+    if (!pkt) 
+    {
+        LOG_ERROR("Memory allocation failed\n");
+        return NULL;
+    }
+
+    snprintf(pkt, pkt_size, "QC%d", thread_number); // pkt = QC81798217
+
+	return pkt;
+}
+
+char* form_thread_list_packet(unsigned int hexagon_no_of_hw_threads, char* pkt) {
+    // int pkt_size = 0; 
+
+	// pkt_size = pkt_size_calculate(hexagon_no_of_hw_threads) + 1; // +1 for null terminator
+
+    // pkt = (char *)malloc(pkt_size * sizeof(char));
+	// if (pkt == NULL) 
+	// {
+	// 	LOG_ERROR("Memory allocation failed\n");
+	// 	return NULL;
+	// }
+
+    // Initialize the packet with "m1"
+    // Using strcpy instead of strncpy since we are copying a fixed string and the destination buffer is large enough.
+    strcpy(pkt, "m1");
+
+    // Append the remaining numbers
+    for (unsigned int i = 2; i <= hexagon_no_of_hw_threads; i++) 
+    {
+        char num_str[6];
+        snprintf(num_str, sizeof(num_str), ",%d", i);
+        strncat(pkt, num_str, strnlen(num_str, sizeof(num_str)));
+    }
+
+    return pkt;
+}
 int gdb_register_commands(struct command_context *cmd_ctx)
 {
 	gdb_port = strdup("3333");

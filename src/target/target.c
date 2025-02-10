@@ -87,8 +87,6 @@ extern struct target_type cortexm_target;
 extern struct target_type cortexa_target;
 extern struct target_type aarch64_target;
 extern struct target_type hexagon_target;
-extern struct target_type hexagon_cdsp_target;
-extern struct target_type hexagon_adsp_target;
 extern struct target_type cortexr4_target;
 extern struct target_type arm11_target;
 extern struct target_type ls1_sap_target;
@@ -157,8 +155,6 @@ static struct target_type *target_types[] = {
 	&aarch64_target,
 	&mips_mips64_target,
 	&hexagon_target,
-	&hexagon_cdsp_target,
-	&hexagon_adsp_target,
 	NULL,
 };
 
