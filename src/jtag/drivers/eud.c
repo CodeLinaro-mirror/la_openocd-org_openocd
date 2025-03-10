@@ -602,6 +602,13 @@ static int eud_set_speed(int speed)
 
 static int eud_init(void)
 {
+    // Read EUD version in use
+    uint32_t major_rev = 0;
+    uint32_t minor_rev = 0;
+    uint32_t spin_rev = 0;
+    eud_get_version(&major_rev, &minor_rev, &spin_rev);
+    LOG_INFO("Using EUD %u.%u.%u", major_rev, minor_rev, spin_rev);
+
     return ERROR_OK;
 }
 
@@ -613,9 +620,7 @@ static int eud_quit(void)
 
 static int eud_swd_init(void)
 {
-    // LOG_DEBUG("eud swd init start");
     EUD_ERR_t err = EUD_SUCCESS;
-
 
     uint32_t arr[100] = {0};
     uint32_t len = 0;
@@ -629,7 +634,7 @@ static int eud_swd_init(void)
 
     if (err != EUD_SUCCESS)
         return ERROR_FAIL;
-    LOG_DEBUG("eud swd init end");
+
     return err;
 }
 
