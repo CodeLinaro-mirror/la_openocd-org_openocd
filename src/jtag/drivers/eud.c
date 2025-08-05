@@ -47,6 +47,13 @@
 #define EUD_SWD_FREQ_120_MHz 0x0
 #define EUD_SWD_FREQ_80_MHz 0x1
 
+#define EUD_RESET_ASSERTED 1
+#define DAP_VERSION_ADIV5 5
+#define DAP_VERSION_ADIV6 6
+
+#define CTRLSTAT_CHECK_ENABLED 1
+#define CTRLSTAT_READ_ENABLED 1
+
 #if 0
 #define EUD_CMD_COUNT_LOGGING 1
 
@@ -70,10 +77,12 @@ static uint32_t cmd_count = 0;
 uint32_t dummy_read;
 uint32_t periodic_seq_timeout = 3500;
 bool is_pwrupNeeded = false;
+uint32_t dap_version = 5;
 
-#define CTRLSTAT_CHECK_ENABLED 1
-#define CTRLSTAT_READ_ENABLED 1
 
+// qcom added function to get ADI Version in EUD Adapter file
+// Need to find a proper way to get ADI Version before upstreaming this change
+extern uint32_t get_adi_version(void);
 
 static void trigger_pwr_on_sequence(void);
 static void eud_ensure_dbg_sys_pwr_is_on(void);
@@ -121,11 +130,17 @@ static void kill_process(void)
 int eud_switch_seq(enum swd_special_seq seq)
 {
     EUD_ERR_t err = EUD_SUCCESS;
+
     // LOG_DEBUG("eud_switch_seq\n");
+    dap_version = get_adi_version();
     switch (seq)
     {
     case JTAG_TO_SWD:
-        err = jtag_to_swd(gpSWDDevice);
+        if(dap_version == DAP_VERSION_ADIV5)
+            err = jtag_to_swd_adiv5(gpSWDDevice);
+        else if(dap_version == DAP_VERSION_ADIV6)
+            err = jtag_to_swd_adiv6(gpSWDDevice);
+
         if (err != EUD_SUCCESS)
             return ERROR_FAIL;
         break;
@@ -475,14 +490,81 @@ int eud_DeAssertReset(void)
     return err;
 }
 
+/**
+ * Asserts reset for ADIv6 devices.
+ *
+ * This function asserts the reset signal for ADIv6 devices, which is used to
+ * reset the target device.
+ * 
+ * @return ERROR_OK on success, or an error code on failure.
+ */
+int eud_assert_reset_adiv6(void)
+{
+    is_pwrupNeeded = true;
+    EUD_ERR_t err = ERROR_OK;
+    uint32_t srst_status = 0;
+    uint32_t DPIDR = 0;      // DPIDR = 0;
+
+    eudGetJtagIDwrapper(&DPIDR);
+
+    if (err = swd_flush(gpSWDDevice))
+        return err;
+    //eud_ctl_check_srst_status(gDeviceId, &srst_status);    //uncomment to read status of the SRST signal for the specified device
+
+    err = eud_ctl_assert_srst(gDeviceId, 1);
+    //eud_ctl_check_srst_status(gDeviceId, &srst_status);    //uncomment to read status of the SRST signal for the specified device
+
+    if (err != ERROR_OK)
+    {
+        LOG_ERROR("%s error: line %d\n", __FUNCTION__, __LINE__);
+        return err;
+    }
+
+    eudGetJtagIDwrapper(&DPIDR);
+
+    LOG_INFO(" From inside assert api, before jtag to swd DPIDR: %x\n", DPIDR);
+
+    return err;
+}
+
+/**
+ * De-asserts reset for ADIv6 devices.
+ *
+ * This function de-asserts the reset signal for ADIv6 devices, allowing the
+ * target device to resume normal operation.
+ *
+ * @return ERROR_OK on success, or an error code on failure.
+ */
+int eud_deassert_reset_adiv6(void)
+{
+    EUD_ERR_t err = ERROR_OK;
+
+    if (err = swd_flush(gpSWDDevice))
+        return err;
+    err = eud_ctl_assert_srst(gDeviceId, 0);
+
+    if (err != ERROR_OK)
+    {
+        LOG_ERROR("%s error: line %d\n", __FUNCTION__, __LINE__);
+        return err;
+    }
+
+    return err;
+}
+
 int eud_reset(int trst, int srst)
 {
     LOG_DEBUG("eud_reset call \n");
     int retval = EUD_SUCCESS;
 
-    if (srst == 1)
+    if (srst == EUD_RESET_ASSERTED)
     {
-        retval = eud_AssertReset();
+        if(dap_version == DAP_VERSION_ADIV5) {
+            retval = eud_AssertReset();
+        }
+        else if(dap_version == DAP_VERSION_ADIV6) {
+            retval = eud_assert_reset_adiv6();
+        }
 
         if (retval)
         {
@@ -495,7 +577,12 @@ int eud_reset(int trst, int srst)
     else
     {
 
-        retval = eud_DeAssertReset();
+        if(dap_version == DAP_VERSION_ADIV5) {
+            retval = eud_DeAssertReset();
+        }
+        else if(dap_version == DAP_VERSION_ADIV6) {
+            retval = eud_deassert_reset_adiv6();
+        }
 
         if (retval)
         {

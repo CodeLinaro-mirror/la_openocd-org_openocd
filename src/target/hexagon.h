@@ -25,32 +25,6 @@
 
 /*******************************Common MACRO for Feature control********************************************/
 
-typedef struct Q6_global
-{
-	double execution_time;
-	double buffer_execution;
-	uint32_t refresh_indicator;
-    uint32_t revision_num;
-
-	uint32_t debug_thread_id;
-	int selected_process;
-	uint16_t total_process;
-	uint64_t hexagon_debug_process_id;
-
-	uint32_t qurtk_vtlb_main_addr;
-	target_addr_t qurtk_vtlb_entries; 
-	target_addr_t QURTK_vtlb_revision;
-    uint64_t bitmap_addr;
-} Q6_global;
-
-typedef struct current_hexagon_target  
-{
-    bool hexagon_adsp;
-    bool hexagon_cdsp;
-    bool hexagon_mpss;
-    bool hexagon;
-} current_hexagon_target;
-
 #define ClkEnRegs 8
 
 /* define this macro when we need to fetch VTLB using MEMW interface */
@@ -532,8 +506,8 @@ union fourbyte {
   uint8_t  byte[4];
 };
 
-//  forward declaration for usage in hexa_info
-struct hexa_info;
+//  forward declaration for usage in hexagon_arch_info
+struct hexagon_arch_info;
 
 struct hexa_reg {
 
@@ -556,7 +530,7 @@ struct hexa_reg {
             uint32_t opcode, uint32_t *data);
 
 
-    struct reg *(*hexagon_reg_current)(struct hexa_info *hexa_info,
+    struct reg *(*hexagon_reg_current)(struct hexagon_arch_info *hexa_info,
             unsigned int regnum, struct reg_cache *cache);
 };
 
@@ -612,7 +586,57 @@ struct hexagon_mmu_common {
     uint32_t data_cache_enabled;
 };
 
-struct hexa_info {
+/* this enum for page  size */
+enum hexagon_page_size
+{
+    HEXAGON_TLB_PAGE_SIZE_4KB,
+    HEXAGON_TLB_PAGE_SIZE_16KB,
+    HEXAGON_TLB_PAGE_SIZE_64KB,
+    HEXAGON_TLB_PAGE_SIZE_256KB,
+    HEXAGON_TLB_PAGE_SIZE_1MB,
+    HEXAGON_TLB_PAGE_SIZE_4MB,
+    HEXAGON_TLB_PAGE_SIZE_16MB,
+};
+
+typedef struct
+{
+    uint64_t phy_add_low;
+    uint64_t phy_add_high;
+    uint32_t virt_add_low;
+    uint32_t virt_add_high;
+    uint32_t virt_tlb_raw_data;
+    uint32_t phys_tlb_raw_data;
+    uint32_t virt_page : 20;
+    uint32_t phy_page  : 24;
+    enum hexagon_page_size page_size;
+    uint8_t asid : 7;
+    uint8_t CCCC : 4;
+    uint8_t validbit  : 1;
+    uint8_t globalbit : 1;
+    uint8_t EP : 1;
+    uint8_t A0 : 1;
+    uint8_t A1 : 1;
+    uint8_t S  : 1;
+    uint8_t R  : 1;
+    uint8_t W  : 1;
+    uint8_t X  : 1;
+    uint8_t U  : 1;
+} tlb_entries;
+
+typedef struct hexagon_config
+{
+    uint32_t maxHwThreads;
+    char (*pThreadNameArray)[20];
+    uint32_t qpss6WDOGCtl;
+    uint32_t numTlbEntries;
+    tlb_entries *pTlbEntries;
+    uint32_t clkEnAddr[8];
+    uint32_t etmClkenAddr;
+    uint32_t etmResetAddr;
+} hexagon_config;
+
+struct hexagon_arch_info {
+    hexagon_config config;
 
     /* Hold the last read ISDB registers values */
     uint32_t isdb_ver;
@@ -656,29 +680,80 @@ struct hexa_info {
 
     /* last run-control command issued to this target (resume, halt, step) */
     enum run_control_op last_run_control_op;
+    uint32_t (*pPerHwThrdReg)[HEXAGON_PER_THREAD_REGS] ;
+    uint32_t hvx_register[32][16];
+    uint32_t **pSbpHaltedThreadsPC;
+    bool mmu_init;
+    bool multi_thr_enabled;
+    uint64_t thread_id_thread_select;
+    uint64_t breakpoint_address_thread_select;
+    int is_spurious_breakpoint;
 };
 
+typedef struct{
+    char process_name[128];
+    uint16_t pid;
+} process_pd;
+
+typedef struct qurt_context_t
+{
+    uint32_t refresh_indicator;
+    uint32_t revision_num;
+
+    uint32_t debug_thread_id;
+    int      selected_process;
+    uint16_t total_process;
+    uint64_t hexagon_debug_process_id;
+
+    uint32_t qurtk_vtlb_main_addr;
+    target_addr_t qurtk_vtlb_entries; 
+    target_addr_t QURTK_vtlb_revision;
+    uint64_t qurtk_vtlb_bitmap;  // Initialize to 0 - AGNELO
+    uint64_t bitmap_addr;
+    uint8_t  vtlb_initialized;
+    bool bitmap_init;
+    process_pd process_list[4];
+} qurt_context_t;
+
+typedef struct {
+    bool has_packet;
+    bool has_checksum;
+    bool has_rsp;
+    char current_packet[1024];
+    char current_checksum[2];
+    uint16_t packet_len;
+    bool header_sent;
+    uint32_t current_process_id;
+    uint32_t process_id_list[10];
+    uint32_t current_session_id;
+    struct target *target;
+} untrusted_mode;
 
 struct hexagon_common {
-
-    struct hexa_info hexa_info;
+    struct hexagon_arch_info hexa_info;
     int common_magic;
+
     /* Context information */
     uint32_t system_control_reg;
     uint32_t system_control_reg_curr;
+
     /* Breakpoint register pairs */
     int brp_num_context;
     int brp_num;
     int brp_num_available;
     struct hexagon_brp *brp_list;
+
     enum hexagon_isrmasking_mode isrmasking_mode;
+    bool is_hexagon_untrusted;
+    untrusted_mode untrusted_current_state;
+    struct qurt_context_t qurt_context;
 };
 
 struct hex_reg {
     int num;
     uint32_t hwthrd;
     struct target *target;
-    struct hexa_info *hexa_info;
+    struct hexagon_arch_info *hexa_info;
     uint8_t value[16];
 };
 /*
@@ -695,44 +770,9 @@ target_to_hexagon(struct target *target)
     return container_of(target->arch_info, struct hexagon_common, hexa_info);
 }
 
-/* this enum for page  size */
-enum hexagon_page_size
-{
-    HEXAGON_TLB_PAGE_SIZE_4KB,
-    HEXAGON_TLB_PAGE_SIZE_16KB,
-    HEXAGON_TLB_PAGE_SIZE_64KB,
-    HEXAGON_TLB_PAGE_SIZE_256KB,
-    HEXAGON_TLB_PAGE_SIZE_1MB,
-    HEXAGON_TLB_PAGE_SIZE_4MB,
-    HEXAGON_TLB_PAGE_SIZE_16MB,
-};
 
 /* data structure contains the data of TLB entry parsing*/
 
-typedef struct
-{
-    uint64_t phy_add_low;
-    uint64_t phy_add_high;
-    uint32_t virt_add_low;
-    uint32_t virt_add_high;
-    uint32_t virt_tlb_raw_data;
-    uint32_t phys_tlb_raw_data;
-    uint32_t virt_page : 20;
-    uint32_t phy_page  : 24;
-    enum hexagon_page_size page_size;
-    uint8_t asid : 7;
-    uint8_t CCCC : 4;
-    uint8_t validbit  : 1;
-    uint8_t globalbit : 1;
-    uint8_t EP : 1;
-    uint8_t A0 : 1;
-    uint8_t A1 : 1;
-    uint8_t S  : 1;
-    uint8_t R  : 1;
-    uint8_t W  : 1;
-    uint8_t X  : 1;
-    uint8_t U  : 1;
-} tlb_entries;
 
 #ifdef HEXAGON_VTLB_NEW_ARCH
 typedef struct    
@@ -794,19 +834,6 @@ union pg_tlblo_t{
  */
 #define ISDBMAILBOX_SIZE 4
 #define UNTRUSTED_PROTOCOL_VERSION 1
-typedef struct {
-    bool has_packet;
-    bool has_checksum;
-    bool has_rsp;
-    char current_packet[1024];
-    char current_checksum[2];
-    uint16_t packet_len;
-    bool header_sent;
-    uint32_t current_process_id;
-    uint32_t process_id_list[10];
-    uint32_t current_session_id;
-    struct target *target;
-} untrusted_mode;
 
 typedef struct {
     uint8_t protocol;
@@ -826,15 +853,21 @@ typedef struct{
     uint32_t *payload;
 } untrusted_payload;
 
-typedef struct{
-    char process_name[128];
-    uint16_t pid;
-} process_pd;
+// extern bool is_hexagon_untrusted; // AGNELO - XXXXX
+
 /*
 hexagon-Untrusted mode function prototypes
 */
-int hexagon_untrusted_update_packet(char *packet, int len);
-int hexagon_untrusted_update_packet_checksum(char *checksum);
-int hexagon_untrusted_forward_rsp(struct target *target, char *response, uint16_t *response_len);
+extern int hexagon_untrusted_update_packet(struct target *target, char *packet, int len);
+extern int hexagon_untrusted_update_packet_checksum(struct target *target, char *checksum);
+extern int hexagon_untrusted_forward_rsp(struct target *target, char *response, uint16_t *response_len);
+extern uint32_t hexagon_no_of_hw_threads(struct target *target);
+extern void hexagon_update_sp_pc_fp_gdb_server(struct target *target, unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
+extern bool is_hexagon_mode_untrusted(struct target *target);
+extern bool hexagon_is_spurious_breakpoint(struct target *target);
+extern void hexagon_clear_spurious_breakpoint_flag(struct target *target);
+extern void hexagon_breakpoint_address_thread_select(struct target *target, uint64_t address);
+extern int hexagon_thread_id_thread_select(struct target *target);
+
 
 #endif  /* OPENOCD_TARGET_HEXAGON_H */

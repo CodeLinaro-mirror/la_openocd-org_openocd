@@ -49,7 +49,6 @@ uint64_t thread_id_thread_select;
 uint64_t breakpoint_address_thread_select;
 #endif
 
-int is_spurious_breakpoint = 1;
 
 #define GDB 0
 #define LLDB 1
@@ -129,7 +128,7 @@ static void gdb_log_callback(void *priv, const char *file, unsigned line,
 static void gdb_sig_halted(struct connection *connection);
 
 static int gdb_qregister_packet(struct connection *connection, char const *packet, int packet_size);
-extern void current_debug_thread(uint32_t selected_thread);
+extern void current_debug_thread(struct target *target, uint32_t selected_thread);
 
 /* number of gdb connections, mainly to suppress gdb related debugging spam
  * in helper/log.c when no gdb connections are actually active */
@@ -158,9 +157,6 @@ static int gdb_use_target_description = 1;
 
 /* current processing free-run type, used by file-I/O */
 static char gdb_running_type;
-
-/*Extern variable for the hexagon*/
-// bool is_hexagon_untrusted = false;
 
 char *hexagon_registerinfo[] = {
 	"name:r00;alt-name:R0;bitsize:32;variable-size:0;offset:0;encoding:uint;format:hex;set:Thread Registers;gcc:0;dwarf:0;generic:;",
@@ -390,9 +386,6 @@ unsigned int current_thread_id_hexagon = 1;
 // unsigned int hexagon_pc , hexagon_sp, hexagon_fp;
 char hexagon_pc[15], hexagon_sp[15], hexagon_fp[15];
 
-extern void hexagon_update_sp_pc_fp_gdb_server(unsigned int hwthrd, unsigned int *pc, unsigned int *fp, unsigned int *sp);
-
-extern uint32_t hexagon_no_of_hw_threads(struct target *target);
 char* form_thread_list_packet(unsigned int hexagon_no_of_hw_threads, char * pkt);
 char*  form_thread_id_packet (unsigned int thread_number, char* pkt);
 int pkt_size_calculate(unsigned int hexagon_no_of_hw_threads);
@@ -909,13 +902,15 @@ static inline int fetch_packet(struct connection *connection,
 	checksum[1] = character;
 	checksum[2] = 0;
 
+	struct target *target = get_target_from_connection(connection);
+
 	/*Hexagon untrusted mode changes*/
-	if (is_hexagon_untrusted == true && current_target_hexagon)
+	if (current_target_hexagon  &&  is_hexagon_mode_untrusted(target) == true)
 	{
-		retval = hexagon_untrusted_update_packet(buffer, count);
+		retval = hexagon_untrusted_update_packet(target, buffer, count);
 		if (retval != ERROR_OK)
 			return retval;
-		retval = hexagon_untrusted_update_packet_checksum(checksum);
+		retval = hexagon_untrusted_update_packet_checksum(target, checksum);
 		if (retval != ERROR_OK)
 			return retval;
 	}
@@ -1105,8 +1100,7 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		if (current_target_hexagon)
 		{   
 		#ifdef BREAKPOINT_THREAD_SELECT
-			current_thread_id_hexagon = thread_id_thread_select + 1;
-
+			current_thread_id_hexagon = hexagon_thread_id_thread_select(target);
 		#endif
 
 			gdb_hexagon_fetch_fp_pc_sp(connection);
@@ -1686,10 +1680,7 @@ static int gdb_qregister_packet(struct connection *connection,
 	struct arm *arm = target_to_arm(target);
 	char *reg_packet = NULL;
 	int reg_num;
-	// struct reg **reg_list;
-	// int reg_list_size;
-	// int retval;
-
+	
 	reg_num = strtoul(packet + 13, NULL, 16);
 
 #ifdef _DEBUG_GDB_IO_
@@ -1699,11 +1690,11 @@ static int gdb_qregister_packet(struct connection *connection,
 	{
 		reg_packet = hexagon_registerinfo[reg_num];
 	}
-	if (arm->core_state == ARM_STATE_AARCH64)
+	else if (arm->core_state == ARM_STATE_AARCH64)
 	{
 		reg_packet = qregiterinfo_aarch64[reg_num];
 	}
-	if (arm->core_state == ARM_STATE_ARM)
+	else if (arm->core_state == ARM_STATE_ARM)
 	{
 		reg_packet = qregiterinfo_aarch32[reg_num];
 	}
@@ -1819,8 +1810,7 @@ static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection)
 	struct reg reg_list = {0};
     if (current_target_hexagon)
 	{
-		hexagon_update_sp_pc_fp_gdb_server( current_thread_id_hexagon - 1, &pc, &fp, &sp);
-
+		hexagon_update_sp_pc_fp_gdb_server(target, current_thread_id_hexagon - 1, &pc, &fp, &sp);
 	}
 
 	reg_list.size = 32;
@@ -2232,7 +2222,9 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 
 	address = strtoull(separator + 1, &separator, 16);
 #ifdef BREAKPOINT_THREAD_SELECT	
-	breakpoint_address_thread_select = address;
+	if (current_target_hexagon == 1){
+		hexagon_breakpoint_address_thread_select(target, address);
+	}
 #endif
 
 	if (*separator != ',') {
@@ -2246,14 +2238,17 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 		case 0:
 		case 1:
 			if (packet[0] == 'Z') {
-				
-				if(is_spurious_breakpoint == 1 && (current_target_hexagon==1) )
+			#if 0
+			    /* This logic will be required if we are using root pd elf as primary target in lldb
+				as lldb tries to set a breakpoint with root pd elf */
+				if(current_target_hexagon==1  &&  hexagon_is_spurious_breakpoint(target) == 1)
 				{
 					LOG_INFO("Ignoring spurious breakpoint request sent by lldb");
 					gdb_put_packet(connection, "OK", 2);
-					is_spurious_breakpoint = 0;
+					hexagon_clear_spurious_breakpoint_flag(target);
 				    return ERROR_OK;
 				}
+			#endif
 				retval = breakpoint_add(target, address, size, bp_type);
 
 				if (retval == ERROR_NOT_IMPLEMENTED) {
@@ -3646,7 +3641,7 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 		}
         if (current_target_hexagon)
 		{
-			current_debug_thread(thread_id);
+			current_debug_thread(target, thread_id);
 		}
 
 		retval = target_step(ct, current_pc, 0, 0);
@@ -4055,7 +4050,7 @@ static int gdb_input_inner(struct connection *connection)
 		gdb_packet_buffer[packet_size] = '\0';
 
 
-		if (packet_size > 0 && is_hexagon_untrusted == true)
+		if (packet_size > 0 && is_hexagon_mode_untrusted (target) == true)
 		{
 			if (packet[0] == 'D')
 			{
@@ -4087,7 +4082,7 @@ static int gdb_input_inner(struct connection *connection)
 
 			return ERROR_OK;
 		}
-		if (packet_size > 0 && is_hexagon_untrusted == false) {
+		if (packet_size > 0 && is_hexagon_mode_untrusted (target) == false) {
 
 			gdb_log_incoming_packet(connection, gdb_packet_buffer);
 
