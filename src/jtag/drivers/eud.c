@@ -735,6 +735,44 @@ COMMAND_HANDLER(eud_trigger_seq)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(eud_usb_spoof_attach)
+{
+    if(gDeviceId == 0)
+    {
+        LOG_ERROR("EUD Device not enumerated");
+        return ERROR_FAIL;
+    }
+    EUD_ERR_t err = eud_spoof_attach(gDeviceId);
+    if(err != EUD_SUCCESS)
+    {
+        LOG_ERROR("EUD Spoof attach failed");
+        return ERROR_FAIL;
+    }
+    else
+    {
+        LOG_INFO("EUD USB Spoof attach success");
+        return ERROR_OK;
+    }
+}
+COMMAND_HANDLER(eud_usb_spoof_detach)
+{
+    if(gDeviceId == 0)
+    {
+        LOG_ERROR("EUD Device not enumerated");
+        return ERROR_FAIL;
+    }
+    EUD_ERR_t err = eud_spoof_detach(gDeviceId);
+    if(err != EUD_SUCCESS)
+    {
+        LOG_ERROR("EUD Spoof Detach failed");
+        return ERROR_FAIL;
+    }
+    else
+    {
+        LOG_INFO("EUD USB Spoof Detach success");
+        return ERROR_OK;
+    }
+}
 static const struct command_registration eud_exec_command_handlers[] = 
 {
     {
@@ -742,10 +780,23 @@ static const struct command_registration eud_exec_command_handlers[] =
 		.handler = eud_trigger_seq,
 		.mode = COMMAND_EXEC,
 		.help = "set periodic trigger frequency",
-	.usage = "",
-    },
-
-    COMMAND_REGISTRATION_DONE
+		.usage = "",
+	},
+    {
+		.name       = "eud_usb_spoof_detach",
+		.mode       = COMMAND_EXEC,
+		.help       = "EUD spoof detach to enter in CXPC",
+        .handler    = eud_usb_spoof_detach,
+		.usage      = "",
+	},
+	{
+    	.name       = "eud_spoof_attach",
+    	.mode       = COMMAND_EXEC,
+    	.help       = "EUD spoof attach to enter in CXPC",
+    	.handler    = eud_usb_spoof_attach,
+   	 	.usage      = "",
+	},
+	COMMAND_REGISTRATION_DONE
 };
 
 static const struct command_registration eud_command_handlers[] = {
