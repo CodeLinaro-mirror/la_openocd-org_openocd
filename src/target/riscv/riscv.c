@@ -23,6 +23,9 @@
 #include "debug_defines.h"
 #include <helper/bits.h>
 
+// Required for ARM DAP related functions
+#include "target/arm_adi_v5.h" 
+
 #define get_field(reg, mask) (((reg) & (mask)) / ((mask) & ~((mask) << 1)))
 #define set_field(reg, mask, val) (((reg) & ~(mask)) | (((val) * ((mask) & ~((mask) << 1))) & (mask)))
 
@@ -199,6 +202,17 @@ struct trigger {
 	int unique_id;
 };
 
+typedef struct  riscv_private_config 
+{ 
+    struct adiv5_private_config adiv5_config;
+}rv_pvt_cfg_t;
+
+
+static const struct jim_nvp nvp_config_opts[] = 
+{
+	{ .name = NULL, .value = -1 }
+};
+
 /* Wall-clock timeout for a command/access. Settable via RISC-V Target commands.*/
 int riscv_command_timeout_sec = DEFAULT_COMMAND_TIMEOUT_SEC;
 
@@ -260,6 +274,7 @@ static enum riscv_halt_reason riscv_halt_reason(struct target *target, int harti
 static void riscv_info_init(struct target *target, struct riscv_info *r);
 static void riscv_invalidate_register_cache(struct target *target);
 static int riscv_step_rtos_hart(struct target *target);
+static int riscv_examine_first(struct target *target, struct riscv_info *info);
 
 static void riscv_sample_buf_maybe_add_timestamp(struct target *target, bool before)
 {
@@ -430,6 +445,15 @@ static struct target_type *get_target_type(struct target *target)
 static int riscv_create_target(struct target *target, Jim_Interp *interp)
 {
 	LOG_DEBUG("riscv_create_target()");
+	/* If there is an ARM DAP need to verify ARM DAP configuration. */
+	if (target->has_dap == true) {
+		rv_pvt_cfg_t *pc = target->private_config;
+		if (adiv5_verify_config(&pc->adiv5_config) != ERROR_OK) {
+			LOG_ERROR("Unable to verify ADIV5 Configuration");
+			return ERROR_FAIL;
+		}
+	}
+	
 	target->arch_info = calloc(1, sizeof(struct riscv_info));
 	if (!target->arch_info) {
 		LOG_ERROR("Failed to allocate RISC-V target structure.");
@@ -445,21 +469,24 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 	LOG_DEBUG("riscv_init_target()");
 	RISCV_INFO(info);
 	info->cmd_ctx = cmd_ctx;
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if(target->has_dap == false) {
+		select_dtmcontrol.num_bits = target->tap->ir_length;
+		select_dbus.num_bits = target->tap->ir_length;
+		select_idcode.num_bits = target->tap->ir_length;
 
-	select_dtmcontrol.num_bits = target->tap->ir_length;
-	select_dbus.num_bits = target->tap->ir_length;
-	select_idcode.num_bits = target->tap->ir_length;
-
-	if (bscan_tunnel_ir_width != 0) {
-		assert(target->tap->ir_length >= 6);
-		uint32_t ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
-		h_u32_to_le(ir_user4, ir_user4_raw);
-		select_user4.num_bits = target->tap->ir_length;
-		bscan_tunneled_ir_width[0] = bscan_tunnel_ir_width;
-		if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
-			bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
-		else /* BSCAN_TUNNEL_NESTED_TAP */
-			bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
+		if (bscan_tunnel_ir_width != 0) {
+			assert(target->tap->ir_length >= 6);
+			uint32_t ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
+			h_u32_to_le(ir_user4, ir_user4_raw);
+			select_user4.num_bits = target->tap->ir_length;
+			bscan_tunneled_ir_width[0] = bscan_tunnel_ir_width;
+			if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
+				bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
+			else /* BSCAN_TUNNEL_NESTED_TAP */
+				bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
+		}
 	}
 
 	riscv_semihosting_init(target);
@@ -1115,9 +1142,48 @@ static int old_or_new_riscv_step(struct target *target, int current,
 		return riscv_openocd_step(target, current, address, handle_breakpoints);
 }
 
+static int riscv_examine_first(struct target *target, struct riscv_info *info)
+{
+	int retval = ERROR_FAIL;
+	struct adiv5_dap *dap = info->dap;
+	rv_pvt_cfg_t *pvt_config = (rv_pvt_cfg_t *)target->private_config;
+
+	if(!pvt_config)
+		return retval;
+	
+	if(!info->debug_ap) {
+		if (pvt_config->adiv5_config.ap_num == DP_APSEL_INVALID) {
+			/* Search for the APB-AB - it is needed to access debug registers */
+			retval = dap_find_get_ap(dap, AP_TYPE_APB_AP, &info->debug_ap);
+
+			if (retval != ERROR_OK) {
+				LOG_ERROR("Could not find APB-AP for debug access");
+				return retval;
+			}
+		} else {
+			info->debug_ap = dap_get_ap(dap, pvt_config->adiv5_config.ap_num);
+			if (!info->debug_ap) {
+				LOG_ERROR("Cannot get AP");
+				return ERROR_FAIL;
+			}
+		}
+	}
+	
+	retval = mem_ap_init(info->debug_ap);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("Could not initialize the APB-AP");
+		return retval;
+	}
+	
+	info->debug_base = target->dbgbase;
+
+	return ERROR_OK;
+}
 
 static int riscv_examine(struct target *target)
 {
+	int retval = ERROR_FAIL;
+
 	LOG_DEBUG("riscv_examine()");
 	if (target_was_examined(target)) {
 		LOG_DEBUG("Target was already examined.");
@@ -1127,10 +1193,21 @@ static int riscv_examine(struct target *target)
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 
 	RISCV_INFO(info);
-	uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
-	LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
-	info->dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
-	LOG_DEBUG("  version=0x%x", info->dtm_version);
+	/* If ARM DAP present need to initialize dap configurations. */
+	if(target->has_dap == true) {
+		retval = riscv_examine_first(target, info);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("Examine first failed for target %s", 
+                  target_name(target));
+			return retval;
+		}
+	}
+	else {	
+		uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
+		LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
+		info->dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
+		LOG_DEBUG("  version=0x%x", info->dtm_version);
+	}
 
 	struct target_type *tt = get_target_type(target);
 	if (!tt)
@@ -2088,7 +2165,7 @@ static enum riscv_poll_hart riscv_poll_hart(struct target *target, int hartid)
 	if (riscv_set_current_hartid(target, hartid) != ERROR_OK)
 		return RPH_ERROR;
 
-	LOG_DEBUG("polling hart %d, target->state=%d", hartid, target->state);
+	// LOG_DEBUG("polling hart %d, target->state=%d", hartid, target->state);
 
 	/* If OpenOCD thinks we're running but this hart is halted then it's time
 	 * to raise an event. */
@@ -2183,7 +2260,7 @@ exit:
 /*** OpenOCD Interface ***/
 int riscv_openocd_poll(struct target *target)
 {
-	LOG_DEBUG("polling all harts");
+	// LOG_DEBUG("polling all harts");
 	int halted_hart = -1;
 
 	if (target->smp) {
@@ -2364,6 +2441,78 @@ COMMAND_HANDLER(riscv_set_reset_timeout_sec)
 	}
 
 	riscv_reset_timeout_sec = timeout;
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_suspend_debug)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	bool preserve_cache = false;
+
+	if (CMD_ARGC > 1) {
+		LOG_ERROR("Command takes at most 1 parameter");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (CMD_ARGC == 1) {
+		if (strcmp(CMD_ARGV[0], "preserve_cache") == 0) {
+			preserve_cache = true;
+		} else {
+			LOG_ERROR("Unknown argument '%s'. Expected 'preserve_cache'.", CMD_ARGV[0]);
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
+	}
+
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	if (target_is_debug_suspended(target)) {
+		LOG_WARNING("Target %s is already suspended", target_name(target));
+		return ERROR_OK;
+	}
+
+	if (preserve_cache) {
+		/* Caller knows the target remains reachable and unchanged (e.g.
+		 * pausing debug to do other work, intending to pick up exactly
+		 * where they left off) -- keep the last-known register values
+		 * so they're still there after 'riscv resume_debug'. */
+		LOG_INFO("%s: preserving register cache across suspend", target_name(target));
+	} else {
+		/* Default: assume the hart's Debug Module may become
+		 * unreachable (e.g. deep sleep / power collapse). The
+		 * last-known register values would be meaningless in that
+		 * case, so drop them rather than risk serving a stale cache
+		 * after resume. */
+		riscv_invalidate_register_cache(target);
+	}
+
+	target_set_debug_suspended(target, true);
+
+	LOG_INFO("%s: debug access suspended (target will not be polled or "
+			"accessed until 'riscv resume_debug')", target_name(target));
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_resume_debug)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (CMD_ARGC != 0) {
+		LOG_ERROR("Command takes no parameters");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	if (!target_is_debug_suspended(target)) {
+		LOG_WARNING("Target %s is not suspended", target_name(target));
+		return ERROR_OK;
+	}
+
+	target_set_debug_suspended(target, false);
+
+	LOG_INFO("%s: debug access resumed", target_name(target));
+
 	return ERROR_OK;
 }
 
@@ -2949,6 +3098,28 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.help = "Set the wall-clock timeout (in seconds) after reset is deasserted"
 	},
 	{
+		.name = "suspend_debug",
+		.handler = riscv_suspend_debug,
+		.mode = COMMAND_ANY,
+		.usage = "[preserve_cache]",
+		.help = "Suspend debug access to this target (e.g. before it enters deep "
+			"sleep / power collapse). Polling, register access, and all other "
+			"DMI/JTAG accesses to this target are skipped until 'riscv resume_debug' "
+			"is run. Other targets sharing the same DAP are not affected. By default "
+			"the register cache is invalidated, since the target may become "
+			"physically unreachable while suspended. Pass 'preserve_cache' instead "
+			"when the target remains reachable and unchanged (e.g. pausing debug to "
+			"do other work and resume exactly where you left off)."
+	},
+	{
+		.name = "resume_debug",
+		.handler = riscv_resume_debug,
+		.mode = COMMAND_ANY,
+		.usage = "",
+		.help = "Resume debug access to a target previously suspended with "
+			"'riscv suspend_debug'."
+	},
+	{
 		.name = "set_prefer_sba",
 		.handler = riscv_set_prefer_sba,
 		.mode = COMMAND_ANY,
@@ -3151,6 +3322,47 @@ static unsigned int riscv_data_bits(struct target *target)
 	return riscv_xlen(target);
 }
 
+static int riscv_jim_configure(struct target *target, struct jim_getopt_info *goi)
+{
+	rv_pvt_cfg_t *pc;
+	struct  jim_nvp *n;
+	int e;
+	LOG_DEBUG("riscv_jim_configure");
+	pc = (rv_pvt_cfg_t *) target->private_config;
+	if (pc == NULL) {
+		pc = calloc(1, sizeof(rv_pvt_cfg_t));
+		target->private_config = pc;
+	}
+
+	/*
+	 * Call adiv5_jim_configure() to parse the common DAP options
+	 * It will return JIM_CONTINUE if it didn't find any known
+	 * options, JIM_OK if it correctly parsed the topmost option
+	 * and JIM_ERR if an error occured during parameter evaluation.
+	 * For JIM_CONTINUE, we check our own params.
+	 */
+	e = adiv5_jim_configure(target, goi);
+	if (e != JIM_CONTINUE)
+		return e;
+	
+	/* parse config or cget options ... */
+	if (goi->argc > 0) {
+		Jim_SetEmptyResult(goi->interp);
+
+		/* check first if topmost item is for us */
+		e = jim_nvp_name2value_obj(goi->interp, nvp_config_opts,
+				goi->argv[0], &n);
+		if (e != JIM_OK)
+			return JIM_CONTINUE;
+
+		e = jim_getopt_obj(goi, NULL);
+		if (e != JIM_OK)
+			return e;
+	}
+
+	return JIM_OK;
+}
+
 struct target_type riscv_target = {
 	.name = "riscv",
 
@@ -3197,7 +3409,8 @@ struct target_type riscv_target = {
 	.commands = riscv_command_handlers,
 
 	.address_bits = riscv_xlen_nonconst,
-	.data_bits = riscv_data_bits
+	.data_bits = riscv_data_bits,
+	.target_jim_configure = riscv_jim_configure,
 };
 
 /*** RISC-V Interface ***/
@@ -3212,6 +3425,12 @@ static void riscv_info_init(struct target *target, struct riscv_info *r)
 	r->dtm_version = 1;
 	r->current_hartid = target->coreid;
 	r->version_specific = NULL;
+
+	/* If ARM DAP is present, get the ARM DAP configurations.*/
+	if (target->has_dap == true)
+		r->dap = ((rv_pvt_cfg_t *) (target->private_config))->adiv5_config.dap; 
+	else
+		r->dap = NULL;
 
 	memset(r->trigger_unique_id, 0xff, sizeof(r->trigger_unique_id));
 
@@ -3312,6 +3531,8 @@ int riscv_set_current_hartid(struct target *target, int hartid)
 static void riscv_invalidate_register_cache(struct target *target)
 {
 	LOG_DEBUG("[%d]", target->coreid);
+	if (target->reg_cache == NULL)
+		return;
 	register_cache_invalidate(target->reg_cache);
 	for (size_t i = 0; i < target->reg_cache->num_regs; ++i) {
 		struct reg *reg = &target->reg_cache->reg_list[i];
@@ -4496,7 +4717,6 @@ int riscv_init_registers(struct target *target)
 
 	return ERROR_OK;
 }
-
 
 void riscv_add_bscan_tunneled_scan(struct target *target, struct scan_field *field,
 					riscv_bscan_tunneled_scan_context_t *ctxt)

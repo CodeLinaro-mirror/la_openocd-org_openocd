@@ -660,6 +660,7 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 
 		if (ctrlstat & SSTICKYERR)
 			LOG_ERROR("JTAG-DP STICKY ERROR");
+
 		if (ctrlstat & SSTICKYORUN)
 			LOG_DEBUG("JTAG-DP STICKY OVERRUN");
 

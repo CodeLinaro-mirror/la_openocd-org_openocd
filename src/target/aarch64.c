@@ -2989,6 +2989,108 @@ COMMAND_HANDLER(aarch64_mask_interrupts_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(aarch64_suspend_debug_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct armv8_common *armv8 = target_to_armv8(target);
+	bool preserve_cache = false;
+
+	if (CMD_ARGC > 1) {
+		LOG_ERROR("Command takes at most 1 parameter");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (CMD_ARGC == 1) {
+		if (strcmp(CMD_ARGV[0], "preserve_cache") == 0) {
+			preserve_cache = true;
+		} else {
+			LOG_ERROR("Unknown argument '%s'. Expected 'preserve_cache'.", CMD_ARGV[0]);
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
+	}
+
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	if (target_is_debug_suspended(target)) {
+		LOG_WARNING("Target %s is already suspended", target_name(target));
+		return ERROR_OK;
+	}
+
+	if (preserve_cache) {
+		/* Caller knows the target remains reachable and unchanged (e.g.
+		 * pausing debug to do other work, intending to pick up exactly
+		 * where they left off) -- keep the last-known register values
+		 * so they're still there after 'aarch64 resume_debug'. */
+		LOG_INFO("%s: preserving register cache across suspend", target_name(target));
+	} else {
+		/* Default: assume the core may become physically unreachable
+		 * while suspended (e.g. deep sleep / power collapse). The
+		 * last-known register values would be meaningless in that
+		 * case, so drop them rather than risk serving a stale cache
+		 * after resume. */
+		register_cache_invalidate(armv8->arm.core_cache);
+		register_cache_invalidate(armv8->arm.core_cache->next);
+	}
+
+	target_set_debug_suspended(target, true);
+
+	LOG_INFO("%s: debug access suspended (target will not be polled or "
+			"accessed until 'aarch64 resume_debug')", target_name(target));
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(aarch64_resume_debug_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct armv8_common *armv8 = target_to_armv8(target);
+	int retval;
+
+	if (CMD_ARGC != 0) {
+		LOG_ERROR("Command takes no parameters");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	if (!target_is_debug_suspended(target)) {
+		LOG_WARNING("Target %s is not suspended", target_name(target));
+		return ERROR_OK;
+	}
+
+	/* Unlike RISC-V's Debug Module, which re-arms itself lazily on the
+	 * next DMI access, AArch64 debug access depends on a stateful
+	 * power-domain handshake at the DP (CDBGPWRUPACK/CSYSPWRUPACK) plus
+	 * per-core OS Lock / sticky-reset bits. If a physical reset happened
+	 * anywhere on this DAP while suspended, that handshake needs to be
+	 * redone -- otherwise every access is met with a stale/locked debug
+	 * interface (silently-wrong register reads, or JTAG-DP STICKY ERROR
+	 * on every subsequent transaction). Reconnect the DP first: if it
+	 * detects the debug power domain dropped, it does a full reconnect;
+	 * otherwise this is a cheap no-op re-init.
+	 */
+	retval = dap_dp_init_or_reconnect(armv8->debug_ap->dap);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("%s: DP re-init failed while resuming debug access", target_name(target));
+		return retval;
+	}
+
+	/* Re-clear OSLock and reset the CTI gating that aarch64_examine()
+	 * sets up after every reset -- this target was invisible to the
+	 * normal reset-assert-post / examine flow while suspended. */
+	retval = aarch64_init_debug_access(target);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("%s: failed to re-init debug access while resuming", target_name(target));
+		return retval;
+	}
+
+	target_set_debug_suspended(target, false);
+
+	LOG_INFO("%s: debug access resumed", target_name(target));
+
+	return ERROR_OK;
+}
+
 static int jim_mcrmrc(Jim_Interp *interp, int argc, Jim_Obj * const *argv)
 {
 	struct command *c = jim_to_command(interp);
@@ -3155,6 +3257,28 @@ static const struct command_registration aarch64_exec_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.help = "mask aarch64 interrupts during single-step",
 		.usage = "['on'|'off']",
+	},
+	{
+		.name = "suspend_debug",
+		.handler = aarch64_suspend_debug_command,
+		.mode = COMMAND_ANY,
+		.usage = "[preserve_cache]",
+		.help = "Suspend debug access to this target (e.g. before it enters deep "
+			"sleep / power collapse). Polling, register access, and all other "
+			"DAP accesses to this target are skipped until 'aarch64 resume_debug' "
+			"is run. Other targets sharing the same DAP are not affected. By default "
+			"the register cache is invalidated, since the target may become "
+			"physically unreachable while suspended. Pass 'preserve_cache' instead "
+			"when the target remains reachable and unchanged (e.g. pausing debug to "
+			"do other work and resume exactly where you left off)."
+	},
+	{
+		.name = "resume_debug",
+		.handler = aarch64_resume_debug_command,
+		.mode = COMMAND_ANY,
+		.usage = "",
+		.help = "Resume debug access to a target previously suspended with "
+			"'aarch64 suspend_debug'."
 	},
 	{
 		.name = "mcr",

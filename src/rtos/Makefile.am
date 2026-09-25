@@ -23,6 +23,8 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/hwthread.c \
 	%D%/zephyr.c \
 	%D%/riot.c \
+	%D%/qurt.c \
+	%D%/rtos_qurt_stackings.c \
 	%D%/rtos.h \
 	%D%/rtos_standard_stackings.h \
 	%D%/rtos_ecos_stackings.h \
@@ -32,4 +34,6 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/rtos_mqx_stackings.h \
 	%D%/rtos_riot_stackings.h \
 	%D%/rtos_ucos_iii_stackings.h \
+	%D%/qurt.h \
+	%D%/rtos_qurt_stackings.h \
 	%D%/nuttx_header.h

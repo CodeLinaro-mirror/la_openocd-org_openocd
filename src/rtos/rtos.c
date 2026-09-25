@@ -3,6 +3,9 @@
 /***************************************************************************
  *   Copyright (C) 2011 by Broadcom Corporation                            *
  *   Evan Hunter - ehunter@broadcom.com                                    *
+ *                                                                         *
+ *   Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.    *
+ *   All rights reserved.                                                  *
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -29,6 +32,7 @@ extern struct rtos_type nuttx_rtos;
 extern struct rtos_type hwthread_rtos;
 extern struct rtos_type riot_rtos;
 extern struct rtos_type zephyr_rtos;
+extern struct rtos_type qurt_rtos;
 
 static struct rtos_type *rtos_types[] = {
 	&threadx_rtos,
@@ -43,6 +47,7 @@ static struct rtos_type *rtos_types[] = {
 	&nuttx_rtos,
 	&riot_rtos,
 	&zephyr_rtos,
+	&qurt_rtos,
 	/* keep this as last, as it always matches with rtos auto */
 	&hwthread_rtos,
 	NULL
@@ -419,12 +424,38 @@ int rtos_thread_packet(struct connection *connection, char const *packet, int pa
 			} else {
 				/*thread id are 16 char +1 for ',' */
 				char *out_str = malloc(17 * target->rtos->thread_count + 1);
-				char *tmp_str = out_str;
-				for (i = 0; i < target->rtos->thread_count; i++) {
-					tmp_str += sprintf(tmp_str, "%c%016" PRIx64, i == 0 ? 'm' : ',',
-										target->rtos->thread_details[i].threadid);
+				/* malloc can fail (large thread_count / memory pressure).
+				 * The pre-existing code dereferenced out_str unconditionally;
+				 * guard it and fall back to the empty-list reply so we never
+				 * sprintf into NULL. */
+				if (!out_str) {
+					LOG_ERROR("rtos: out of memory building qfThreadInfo list");
+					gdb_put_packet(connection, "l", 1);
+					return ERROR_OK;
 				}
-				gdb_put_packet(connection, out_str, strlen(out_str));
+				char *tmp_str = out_str;
+				bool first = true;
+				for (i = 0; i < target->rtos->thread_count; i++) {
+					/* Inert/synthetic helper threads can ask to be hidden
+					 * from the CLI thread list while still appearing in the
+					 * qXfer:threads:read XML used by IDE front-ends for
+					 * grouping. Gate on the same opt-in signal the XML emitter
+					 * uses (tier set) so that pre-existing RTOS backends -- which
+					 * never touch hide_from_cli and may allocate thread_details
+					 * with plain malloc (uninitialised bytes) -- are NOT
+					 * accidentally filtered by a garbage hide_from_cli value. */
+					if (target->rtos->thread_details[i].tier &&
+					    target->rtos->thread_details[i].tier[0] &&
+					    target->rtos->thread_details[i].hide_from_cli)
+						continue;
+					tmp_str += sprintf(tmp_str, "%c%016" PRIx64, first ? 'm' : ',',
+										target->rtos->thread_details[i].threadid);
+					first = false;
+				}
+				if (first) /* everything was hidden */
+					gdb_put_packet(connection, "l", 1);
+				else
+					gdb_put_packet(connection, out_str, strlen(out_str));
 				free(out_str);
 			}
 		} else

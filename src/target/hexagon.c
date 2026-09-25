@@ -1,7 +1,7 @@
 /**************************************************************************
-*    Copyright (c) 2023 Qualcomm Innovation Center, Inc.                   *
-*   All rights reserved.                                                  * 
-*   SPDX-License-Identifier: GPL-2.0-or-later                             * 
+*   Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.     *
+*   All rights reserved.                                                   *
+*   Confidential and Proprietary - Qualcomm Technologies, Inc.             *
 *                                                                          *
 ***************************************************************************/
 #ifdef HAVE_CONFIG_H
@@ -13,15 +13,10 @@
 #include "register.h"
 #include "target_request.h"
 #include "target_type.h"
-#include "armv8_opcodes.h"
-#include "armv8_cache.h"
-#include "arm_semihosting.h"
-#include "jtag/interface.h"
 #include "smp.h"
-#include <helper/time_support.h>
-#include "arm_adi_v5.h"
-#include "jtag/swd.h"
 #include "hexagon.h"
+#include "rtos/rtos.h"   /* struct rtos_reg, for the QuRT OS-awareness HW-thread reg hook */
+#include "rtos/qurt.h"   /* QuRT walk-enable/stack-walk hooks + hexagon_rtos_* prototypes */
 #include <time.h>
 
 extern void decToBinary(unsigned int n, unsigned int binaryNum[]);
@@ -33,11 +28,9 @@ clock_t start;
 clock_t end;
 double execution_time=0;
 
-uint64_t loop_count = 1000;
+uint64_t loop_count = HEXAGON_DEFAULT_WAIT_LOOP;
 
 #define ClkEnRegs 8
-
-// extern int is_spurious_breakpoint;
 
 /****************************Global /static variable declartions**************************/
 
@@ -394,7 +387,33 @@ static uint32_t stuff_inst_ctrl_reg_write[][2] =  {
     {0x6ea8c007, 0x6227c01f},    /* r7 = isdbmbxin, utimerhi = r7   */
 };
 
-#if 0
+
+static uint32_t examine_writes_dbg_base[][2] = {
+    {HEXAGON_APB_SPACE_UNLOCK, 0xc5acce55},
+    {HEXAGON_ISDB_ISDBEN, 0x0000005d},
+    {HEXAGON_ISDB_ISDBCFG0, 0x00ffffff},
+    {HEXAGON_ISDB_ISDBCFG1, 0xffffffff},
+    {HEXAGON_ISDB_ISDBEN, 0x0000004d},
+};
+
+
+static uint32_t examine_writes_etm_base[][2] = {
+    {HEXAGON_ETM_CTRL0,             0x00000018},
+    {HEXAGON_ETM_TRIG0_SAC0_ADDR,   0x00000000},
+    {HEXAGON_ETM_TRIG0_CTRL2,       0x00000000},
+    {HEXAGON_ETM_PROF_SRC_CTRL3,    0x00000000},
+
+    {HEXAGON_ETM_ASYNC_PERIOD,      0x00000800},
+    {HEXAGON_ETM_ISYNC_PERIOD,      0x00000800},
+    {HEXAGON_ETM_GSYNC_PERIOD,      0x000fffff},
+    {HEXAGON_ETM_TEST_BUS_CTRL0,    0x00800000},
+    {HEXAGON_ETM_TEST_BUS_CTRL1,    0x00000000},
+    {HEXAGON_ETM_CTRL1,             0xf0f00008},
+    {HEXAGON_ETM_ATID,              0x00000201},
+    {HEXAGON_ETM_ATID_TILE1,        0x00000403}
+};
+
+# if 0
 /* Per thread control registers */
 static uint32_t stuff_inst_mmode_reg_write[][2] = { 
     {0x6ea8c007, 0x6707c000},    /* r7 = isdbmbxin, sgp0 = r7      */
@@ -410,8 +429,8 @@ static uint32_t stuff_inst_mmode_reg_write[][2] = {
     {0x0, 0x0},                  /* Invalid: S14 reserved          */
     {0x0, 0x0},                  /* Invalid: S15 reserved          */
 };
-
 #endif 
+
 /* Per thread control registers */
 static uint32_t stuff_inst_global_reg_write[][2] = { 
     {0x6ea8c007, 0x6707c010},    /* r7 = isdbmbxin, evb = r7       */
@@ -431,6 +450,27 @@ static uint32_t stuff_inst_global_reg_write[][2] = {
     {0x6ea8c007, 0x6707c01e},    /* r7 = isdbmbxin, pcyclelo = r7  */
     {0x6ea8c007, 0x6707c01f},    /* r7 = isdbmbxin, pcyclehi = r7  */
 };
+
+/* XML formatting string constant declarations */
+static const char *XML_ASID = "<item>\n<column name=\"SPACE ASID\">";
+static const char *XML_VPAGE = "</column><column name=\"VPAGE\">";
+static const char *XML_PPAGE = "</column><column name=\"PPAGE\">";
+static const char *XML_SIZE = "</column><column name=\"SIZE\">";
+static const char *XML_R = "</column><column name=\"R\">";
+static const char *XML_W = "</column><column name=\"W\">";
+static const char *XML_X = "</column><column name=\"X\">";
+static const char *XML_CACHE = "</column><column name=\"\tCache Attr\">";
+static const char *XML_END = "</column></item>\n";
+
+/* XML formatting string constant declarations */
+static const char *XML_INDEX = "<item>\n<column name=\"INDEX\">";
+static const char *XML_ASID_MID = "</column><column name=\"ASID\">";
+static const char *XML_U = "</column><column name=\"U\">";
+static const char *XML_S = "</column><column name=\"S\">";
+static const char *XML_V = "</column><column name=\"V\">";
+static const char *XML_G = "</column><column name=\"G\">";
+static const char *XML_EP = "</column><column name=\"EP\">";
+static const char *XML_PPN_MSB = "</column><column name=\"PPNmsb\">";
 
 
 static int hexagon_get_core_reg(struct reg *reg);
@@ -460,7 +500,6 @@ static int initConfig(struct hexagon_common *hexagon)
 {
     struct hexagon_arch_info *hexa_info;
     uint32_t i;
-    char a = '0';
 
     LOG_INFO("InitConfig is called here");
     hexa_info = &(hexagon->hexa_info);
@@ -472,28 +511,30 @@ static int initConfig(struct hexagon_common *hexagon)
     // since we need array of pointers, we need size of pointer not integer
     hexa_info->pSbpHaltedThreadsPC = (uint32_t **)malloc(pHexCfg->maxHwThreads * sizeof(uint32_t *));
     pHexCfg->pTlbEntries = (tlb_entries *)malloc(pHexCfg->numTlbEntries * sizeof(tlb_entries));
-    
+
     if (pHexCfg->pThreadNameArray == NULL || hexa_info->pPerHwThrdReg == NULL || hexa_info->pSbpHaltedThreadsPC == NULL || pHexCfg->pTlbEntries == NULL)
     {
         if (pHexCfg->pThreadNameArray != NULL)
             free(pHexCfg->pThreadNameArray);
-
+            
         if (hexa_info->pPerHwThrdReg != NULL)
             free(hexa_info->pPerHwThrdReg);
 
         if (hexa_info->pSbpHaltedThreadsPC != NULL)
             free(hexa_info->pSbpHaltedThreadsPC);
         if (pHexCfg->pTlbEntries!= NULL)
-                free(pHexCfg->pTlbEntries);
+            free(pHexCfg->pTlbEntries);
         return ERROR_FAIL;
     }
-    for (i = 0; i < pHexCfg->maxHwThreads; i++, a++)
-    {
-        strcpy(pHexCfg->pThreadNameArray[i], "HW-Thrd-");
-        pHexCfg->pThreadNameArray[i][8] = a;
-        pHexCfg->pThreadNameArray[i][9] = '\0';
+
+    /* Robust multi-digit thread names: "HW-Thrd-<index>" for 0..maxHwThreads-1 */
+    for (i = 0; i < pHexCfg->maxHwThreads; i++) {
+        /* Each element in pThreadNameArray points to a 20-char buffer,
+           so ensure we don’t exceed 19 chars + NUL. */
+        snprintf(pHexCfg->pThreadNameArray[i], MAX_STR_LEN_THREAD_NAME, "HW-Thrd-%u", i);
     }
-    strcpy(pHexCfg->pThreadNameArray[i], "GLOBAL");
+    /* The extra slot is reserved for the GLOBAL cache name */
+    snprintf(pHexCfg->pThreadNameArray[i], MAX_STR_LEN_THREAD_NAME, "GLOBAL");
 
     memset(hexa_info->pSbpHaltedThreadsPC, 0, (pHexCfg->maxHwThreads * sizeof(uint32_t *)));
     memset(hexa_info->pPerHwThrdReg, 0, (pHexCfg->maxHwThreads * sizeof(*(hexa_info->pPerHwThrdReg))));
@@ -503,7 +544,6 @@ static int initConfig(struct hexagon_common *hexagon)
     hexagon->hexa_info.is_spurious_breakpoint = 1;
     return ERROR_OK;
 }
-
 
 static void deinitConfig(struct hexagon_arch_info *hexa_info)
 {
@@ -564,6 +604,7 @@ static int hexagon_init_arch_info(struct target *target,
 static int hexagon_handle_target_request(void *priv);
 static uint64_t hexagon_etm_on(struct target *target);
 static void hexagon_wait_loop(void);
+void micro_second_sleep(uint32_t microseconds);
 static int hexagon_brkpt_setup(struct hexagon_common *hexagon);
 static int hexagon_reg_setup(struct hexagon_common *hexagon);
 static int hexagon_read_core_reg(struct target *target, struct reg *r, int regnum, uint32_t hwthrd);
@@ -581,12 +622,14 @@ static void hexagon_update_tlb_entry_in_structure(struct hexagon_arch_info *hexa
 void hexagon_start_time_cal_ms(void);
 void hexagon_end_time_cal_ms(void);
 #endif
-static int hexagon_dump_hwthrd_reg(struct target *target, uint32_t hwthrd);
+static int hexagon_dump_hwthrd_reg(struct target *target);
 int hexagon_read_gpr_registers(struct target *target, uint32_t hwthrd);
+int hexagon_read_gpr_for_hwthrd(struct target *target, uint32_t hwthrd_mask);
 int hexagon_read_ctrl_registers(struct target *target, uint32_t hwthrd);
+int hexagon_read_ctrl_regs_for_hwthrd(struct target *target, uint32_t hwthrd_mask);
 int hexagon_read_mmode_registers(struct target *target, uint32_t hwthrd);
 int hexagon_read_imask_register(struct target *target, uint32_t hwthrd);
-static int hexagon_restore_stuff_used_reg(struct target *target);
+
 int hexagon_read_global_ctrl_registers(struct target *target);
 void hexagon_debug_reason(struct target *target, uint64_t brkptinfo);
 static int hexagon_write_gpr_register(struct target *target, int regnum, uint32_t hwthrd, uint32_t value);
@@ -596,37 +639,54 @@ unsigned int get_phys_page(unsigned int lo, unsigned int hi, unsigned int mask);
 unsigned int get_phys_mask(unsigned int tlblo);
 static unsigned int hexagon_ct0(unsigned int d);
 static unsigned int hexagon_clrbit(unsigned int d, unsigned int bit);
-static unsigned int QURT_getPhysAddr_v2(uint64_t pg_tlblo, uint64_t pg_tlbhi);
+static unsigned int hexagon_getPhysAddr_v2(uint64_t pg_tlblo, uint64_t pg_tlbhi);
 static int hexagon_search_virtadd_in_tlb(struct hexagon_common *hexagon, uint64_t virt, target_addr_t *phys);
 static int hexagon_search_virtadd_in_vtlb(struct target *target, uint64_t virt_add, target_addr_t *phys);
-static void hexagon_memw_phys_read(struct target *target, target_addr_t phy_address, uint32_t *value);
+static int hexagon_memw_phys_read(struct target *target, target_addr_t phy_address, uint32_t *value);
+static int hexagon_translate_va_in_asid(uint32_t asid, uint64_t va, target_addr_t *phys);
 
-static void hexagon_memw_read(struct target *target, uint64_t virt_address, uint32_t *value);
-
+static int hexagon_memw_read(struct target *target, uint64_t virt_address, uint32_t *value);
+static int hexagon_isdb_cmd_status(struct target *target, uint32_t stuff_inst, uint32_t isdb_mmode_cmd);
 static void hexagon_stuff_reg_restore(struct target *target);
 
 static void hexagon_populate_vtlb_entries(struct target *target);
 static void hexagon_update_vtlb_entry_in_structure(uint64_t tlb_phy, uint64_t tlb_virtual, uint64_t index);
 static void hexagon_populate_vtlb_refresh_entries(struct target *target);
-// static void hexagon_stuff_reg_restore_r7(struct target *target);
-static void hexagon_memw_phys_read_buffer(struct target *target,target_addr_t phy_address, uint32_t size, uint8_t * buffer);
-static int hexagon_write_syscfg_register(struct target *target,uint32_t value);
+static int hexagon_memw_phys_read_buffer(struct target *target,target_addr_t phy_address, uint32_t size, uint8_t * buffer);
 static int hexagon_read_syscfg_register(struct target *target);
 static int hexagon_memw_write(struct target *target, uint64_t virt_address, uint32_t value, uint32_t size);
 static int hexagon_memw_write_buffer(struct target *target, uint64_t virt_address, uint32_t size, const uint8_t *buffer);
 static int hexagon_set_breakpoint(struct target *target, struct breakpoint *breakpoint, uint64_t bpconfig);
 static int hexagon_setup_isdb_config(struct target *target, uint64_t old_isdbcfg0, uint8_t hbp_num);
 static int hexagon_memw_write_instruction_memory(struct target *target, uint64_t virt_address, uint32_t value, uint8_t flag);
+static int hexagon_write_syscfg_register(struct target *target,uint32_t value);
+static int hexagon_memwrite_mmu_bypass(struct target *target, uint64_t virt_address, uint32_t value, uint32_t size);
+static int hexagon_physical_addr_store(struct target *target, uint64_t virt_addr, uint32_t value, uint32_t size);
 static int hexagon_unset_breakpoint(struct target *target, struct breakpoint *breakpoint);
-// static void hexagon_stuff_reg_restore(struct target *target);
-static uint32_t hexagon_print_pc(struct target *target);
-static int hexagon_dump_isdb_reg(struct hexagon_arch_info *hexa_info);
-static int hexagon_read_BRKPT_through_stuff(struct target *target, uint32_t hwthrd);
+static uint32_t hexagon_print_pc(struct target *target, uint32_t hw_thread);
+static int hexagon_read_BRKPT_through_stuff(struct target *target);
 static void hexagon_populate_vtlb_data(struct target *target);
-static void hexagon_print_vtlb_entries(void);
 static void hexagon_hw_watchdog_disable(struct target *target);
-// static void hexagon_enable_clock(struct target *target);
-static int hexagon_read_ISDB(struct target *target, uint32_t isdbsts, uint64_t stuffcmdStatusCheck);
+static int hexagon_read_ISDBST(struct target *target, uint32_t *isdbsts);
+static int hexagon_poll_mbxout(struct target *target);
+static int hexagon_poll_isdbready(struct target *target);
+static int hexagon_poll_mbxin(struct target *target);
+static bool hexagon_is_mmu_enabled(struct target *target);
+static bool hexagon_is_vtlb_initialized(struct target *target);
+void print_active_threads(struct target* target);
+int get_active_threads(struct target* target);
+void print_debug_threads(struct target* target);
+int get_debug_threads(struct target* target);
+void print_wait_run_threads(struct target* target);
+int get_wait_run_threads(struct target* target);
+static int hexagon_clear_vtlb_bitmap(struct target *target, bool check_bitmap_cleared);
+static int hexagon_update_vtlb_revision(struct target *target);
+int hexagon_vtlb_enable_bitmap(struct target *target,
+                              uint32_t bitmap_ptr_addr,
+                              uint32_t entries_ptr_addr,
+                              unsigned int entry_count);
+static void hexagon_vtlb_bitmap_logic_enable(struct target *target);
+static void hexagon_memory_map_refresh(struct target *target);
 
 /***************************** UNTRUSTED MODE Function declarations ***********************************************/
 //   parameters should explicitly specify void to indicate that it takes no arguments.
@@ -642,6 +702,432 @@ int hexagon_untrusted_mode(struct hexagon_common *hexagon);
 static uint32_t hexagon_untrusted_convert_essential_header(untrusted_essential header);
 void current_debug_thread(struct target *target, uint32_t selected_thread);
 
+static void hexagon_print_vtlb_data(void)
+{
+    tlb_entries *vtlb_entry = NULL;
+    uint64_t idx;
+    LOG_DEBUG("Printing the VTLB content");
+ 
+    for (idx=0; idx < hexagon_vtlb_data.valid_vtlb_no_of_entries; idx++)
+    {
+        vtlb_entry = hexagon_vtlb_entries + idx;
+        
+        LOG_DEBUG("logical,C:0x%X--0x%X| physical,  A:%d:0x%llX--0x%llX| asid, %d, glb,%d, page_size, 0x%llX,X,%d,R,%d,W,%d,0x%X--0x%X ",  vtlb_entry->virt_add_low, vtlb_entry->virt_add_high, vtlb_entry->asid,
+                  vtlb_entry->phy_add_low, vtlb_entry->phy_add_high, vtlb_entry->asid, vtlb_entry->globalbit, (unsigned long long)((vtlb_entry->page_size +1)*4*1024),vtlb_entry->X,vtlb_entry->R,vtlb_entry->W, vtlb_entry->phys_tlb_raw_data, vtlb_entry->virt_tlb_raw_data);
+    }
+}
+
+/****Pagetable implementation details ******/
+uint32_t hexagon_pgsize_encode_to_size[MAX_NUM_SUPPORTED_PAGE_SIZE] = {
+    SIZE_4K,
+    SIZE_16K,
+    SIZE_64K,
+    SIZE_256K,
+    SIZE_1M,
+    SIZE_4M,
+    SIZE_16M,
+    SIZE_64M,
+    SIZE_256M,
+    SIZE_1G,
+};
+
+/* Global static declarations to be used throughout pagetable algorithm */
+static const size_t g_protocol_usable_buf_size =
+    MAX_RSP_BUF_SIZE; // max transport buffer size ()from experimentation)
+                      // between stub and host/gdb
+
+/**
+    Count and return number of trailing zeros in unsigned int d
+    @param[in]  d           unsigned int with specific number of trailing zeros
+
+    @return
+        number of trailing zeros in unsigned int d input
+*/
+unsigned int ct0(unsigned int d)
+{
+    unsigned int bit;
+    if(d == 0)
+    {
+        return 32U;
+    }
+    for (bit = 0; bit < 32U; bit++) {
+        if ((d & ((unsigned int)1U << bit)) != 0U) {
+            return bit;
+        }
+    }
+    
+    //For avoiding compiler warning
+    return 32U;
+}
+
+uint32_t hexagon_getAsid_v2(uint32_t pg_tlb)
+{
+    union pg_tlbhi_t tlb;
+    tlb.raw = pg_tlb;
+    return tlb.info.asid;
+}
+
+uint32_t hexagon_getR_v2(uint32_t pg_tlb)
+{
+    union pg_tlblo_t tlb;
+    tlb.raw = pg_tlb;
+    if ((tlb.info.perm & 0x1U) != 0U) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+uint32_t hexagon_getW_v2(uint32_t pg_tlb)
+{
+    union pg_tlblo_t tlb;
+    tlb.raw = pg_tlb;
+    if ((tlb.info.perm & 0x2U) != 0U) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+uint32_t hexagon_getX_v2(uint32_t pg_tlb)
+{
+    union pg_tlblo_t tlb;
+    tlb.raw = pg_tlb;
+    if ((tlb.info.perm & 0x4U) != 0U) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+uint32_t hexagon_getU_v2(uint32_t pg_tlb)
+{
+    union pg_tlblo_t tlb;
+    tlb.raw = pg_tlb;
+    return (tlb.info.usr & 0x1U);
+}
+
+static const char *hexagon_printCacheFields_v2(uint32_t pg_tlb)
+{
+    union pg_tlblo_t tlb;
+    tlb.raw = pg_tlb;
+    /* Convert cache fields into text */
+    switch (tlb.info.cache) {
+    case 0:
+        return "Cachable, write-back, non-shared, non-L2-cacheable";
+    case 1:
+        return "Cachable, write-through, non-shared, non-L2-cacheable";
+    case 2:
+        return "RESERVED";
+    case 3:
+        return "RESERVED";
+    case 4:
+        return "Device-type";
+    case 5:
+        return "Cachable, write-through, non-shared, L2-cacheable";
+    case 6:
+        return "Uncached, shared";
+    case 7:
+        return "Cacheable, write-back, non-shared, L2-cacheable";
+    case 8:
+        return "Cacheable, write-back";
+    case 9:
+        return "Cacheable, write-through";
+    case 10:
+        return "Cacheable, write-back";
+    case 11:
+        return "Cacheable, write-through";
+    default:
+        return "Unknown";
+    }
+}
+
+uint32_t hexagon_getVirtAddr_v2(uint32_t pg_tlbhi)
+{
+    union pg_tlbhi_t tlbhi;
+    tlbhi.raw = pg_tlbhi;
+    return tlbhi.info.vir_addr;
+}
+
+void hexagon_print_single_tlb_entry(int32_t *index,
+     tlb_entries *entry, int32_t max_entires, char *op_buf)
+{
+    unsigned int tlblo = entry->phys_tlb_raw_data;
+    unsigned int tlbhi = entry->virt_tlb_raw_data;
+    while((tlblo == 0) && (tlbhi == 0))
+    {
+        *index = *index + 1;
+        /* If last entry is empty. we should just return and not update op_buf so that Final packet is sent instead.*/
+        if(*index == max_entires)
+        {
+            return;
+        }
+        entry = entry + 1;
+        tlblo = entry->phys_tlb_raw_data;
+        tlbhi = entry->virt_tlb_raw_data;
+    }
+
+    uint32_t tlblo_trailing_zeroes = ct0(tlblo);
+    /* Overwrite old pagetable data with NULL so it does not appear in final
+     * transmission */
+    memset(op_buf, 0, MAX_RSP_BUF_SIZE);
+    *op_buf = 'm'; // indicate that there is additional data to be transmitted
+                   // to host/gdb
+    /* Supported max pagesize of 1 GB in v81 doc leads to 9 trialing zeros.*/
+    if (tlblo_trailing_zeroes < MAX_NUM_SUPPORTED_PAGE_SIZE) {
+        snprintf(op_buf + 1, g_protocol_usable_buf_size,
+            "%s%u%s0x%x%s0x%x%s0x%x%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s", XML_INDEX,*index,XML_VPAGE,
+            (unsigned int)hexagon_getVirtAddr_v2(tlbhi), XML_PPAGE,
+            (unsigned int)hexagon_getPhysAddr_v2(tlblo, tlbhi), XML_SIZE,
+            (unsigned int)hexagon_pgsize_encode_to_size[tlblo_trailing_zeroes],XML_ASID_MID,
+            (unsigned int)hexagon_getAsid_v2(tlbhi), XML_R, (unsigned int)hexagon_getR_v2(tlblo), XML_W,
+            (unsigned int)hexagon_getW_v2(tlblo), XML_X,
+            (unsigned int)hexagon_getX_v2(tlblo), XML_U, (unsigned int)(entry->U),XML_CACHE,
+            entry->CCCC ,XML_S, (unsigned int)(entry->S),
+             XML_V, (unsigned int)(entry->validbit), XML_G, (unsigned int)(entry->globalbit),
+             XML_EP, (unsigned int)(entry->EP), XML_PPN_MSB, (unsigned int)(((entry->phy_page)>>23) & 0x1),XML_END);
+    } else {
+        snprintf(op_buf + 1, g_protocol_usable_buf_size,
+            "%s%u%s0x%x%s0x%x%s%s%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s%u%s", XML_INDEX,*index,XML_VPAGE,
+            (unsigned int)hexagon_getVirtAddr_v2(tlbhi), XML_PPAGE,
+            (unsigned int)hexagon_getPhysAddr_v2(tlblo, tlbhi), XML_SIZE,"\tInvalid size",XML_ASID_MID,
+            (unsigned int)hexagon_getAsid_v2(tlbhi), XML_R, (unsigned int)hexagon_getR_v2(tlblo), XML_W,
+            (unsigned int)hexagon_getW_v2(tlblo), XML_X,
+            (unsigned int)hexagon_getX_v2(tlblo), XML_U, (unsigned int)(entry->U),XML_CACHE,
+            entry->CCCC ,XML_S, (unsigned int)(entry->S),
+             XML_V, (unsigned int)(entry->validbit), XML_G, (unsigned int)(entry->globalbit),
+             XML_EP, (unsigned int)(entry->EP), XML_PPN_MSB, (unsigned int)(((entry->phy_page)>>23) & 0x1),XML_END);
+    }
+
+    *index = *index + 1;
+    return;
+}
+
+void hexagon_print_single_vtlb_entry(
+    unsigned int tlblo, unsigned int tlbhi, char *op_buf)
+{
+    uint32_t tlblo_trailing_zeroes = ct0(tlblo);
+    /* Overwrite old pagetable data with NULL so it does not appear in final
+     * transmission */
+    memset(op_buf, 0, MAX_RSP_BUF_SIZE);
+    *op_buf = 'm'; // indicate that there is additional data to be transmitted
+                   // to host/gdb
+    /* Supported max pagesize of 1 GB in v81 doc leads to 9 trialing zeros.*/
+    if (tlblo_trailing_zeroes < MAX_NUM_SUPPORTED_PAGE_SIZE) {
+        snprintf(op_buf + 1, g_protocol_usable_buf_size,
+            "%s%u%s0x%x%s0x%x%s0x%x%s%u%s%u%s%u%s\t%s%s", XML_ASID,
+            (unsigned int)hexagon_getAsid_v2(tlbhi), XML_VPAGE,
+            (unsigned int)hexagon_getVirtAddr_v2(tlbhi), XML_PPAGE,
+            (unsigned int)hexagon_getPhysAddr_v2(tlblo, tlbhi), XML_SIZE,
+            (unsigned int)hexagon_pgsize_encode_to_size[tlblo_trailing_zeroes],
+            XML_R, (unsigned int)hexagon_getR_v2(tlblo), XML_W,
+            (unsigned int)hexagon_getW_v2(tlblo), XML_X,
+            (unsigned int)hexagon_getX_v2(tlblo), XML_CACHE,
+            hexagon_printCacheFields_v2(tlblo), XML_END);
+    } else {
+        snprintf(op_buf + 1, g_protocol_usable_buf_size,
+            "%s%u%s0x%x%s0x%x%s%s%s%u%s%u%s%u%s\t%s%s", XML_ASID,
+            (unsigned int)hexagon_getAsid_v2(tlbhi), XML_VPAGE,
+            (unsigned int)hexagon_getVirtAddr_v2(tlbhi), XML_PPAGE,
+            (unsigned int)hexagon_getPhysAddr_v2(tlblo, tlbhi), XML_SIZE,
+            "\tInvalid Size", XML_R, (unsigned int)hexagon_getR_v2(tlblo), XML_W,
+            (unsigned int)hexagon_getW_v2(tlblo), XML_X,
+            (unsigned int)hexagon_getX_v2(tlblo), XML_CACHE,
+            hexagon_printCacheFields_v2(tlblo), XML_END);
+    }
+
+    return;
+}
+/* --------------------------------------------------------------
+ * Ensure the target’s TLB cache is fresh.
+ * -------------------------------------------------------------- */
+static int ensure_tlb_fresh(struct target *target)
+{
+    struct hexagon_common *hexagon   = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    int retval    = ERROR_OK;
+
+    /* -----------------------------------------------------------------
+     * 1.  MMU must be on before we can even try to read TLB entries.
+     * ----------------------------------------------------------------- */
+    if (!hexagon_is_mmu_enabled(target)) {
+        LOG_INFO("MMU not enabled – nothing to report yet");
+        return ERROR_OK;               /* not an error, just “no data” */
+    }
+
+    /* -----------------------------------------------------------------
+     * 2️.  The state machine may request a *forced* refresh (tlb_lldb_query_done).
+     * ----------------------------------------------------------------- */
+    if (qurt_context) {
+        qurt_context->tlb_fetched = false;     /* invalidate any stale cache */
+
+        retval = hexagon_read_tlb_entry(target);
+        if (retval != ERROR_OK) {
+            LOG_ERROR("Failed to read TLB entries (retval=%d)", retval);
+            return retval;                  /* propagate the failure */
+        }
+        qurt_context->tlb_lldb_query_done = true;     /* we satisfied the request */
+    }
+
+    return retval;
+}
+
+/*
+    Function to handle "tlb" LLDB command state machine and retireve data
+    entry by entry.
+*/
+int handle_tlb_state_machine(struct target *target, const char *packet, char *op_buf)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    tlb_entries *hwtlb_entry = NULL;
+    int ret_val = ERROR_OK;
+
+    /*State machine variables.*/
+    static uint32_t flag_first_iter = 1;
+    static int32_t curr_idx = 0;
+    static int32_t hwtlb_entries_total = 0;
+
+    /* --------------------------------------------------------------
+     * Make sure the TLB cache is up to date.
+     * -------------------------------------------------------------- */
+    if (qurt_context->tlb_lldb_query_done == true){
+        ret_val = ensure_tlb_fresh(target);
+        if (ret_val != ERROR_OK) {
+            /* The helper already emitted a helpful log message. */
+            return ret_val;                     
+        }
+    }
+
+    /*********************State machine logic***************
+     * curr_idx helps in tracking entry number in vtlb an dtlb tables.
+     * but flag_first_iter is required to detect if current iteration is 
+     * 1st iteration or not based on which we decied which 1/3 packets will go to
+     * LLDB client.
+     * Packet 1 - start packet 
+     * Packet 2 - data packet for each entry (curr_idx 0 <- >n -1)
+     * Packet 3 - Final packet $l\n</os_data>\n
+     * 
+    */
+    /*Start and End packets.*/
+    static const char *XML_INTRO_TLB = "m<osdata type=\"tlbinfo\">\n";
+    static const char *XML_FINAL = "l\n</osdata>\n";
+
+    if((strncmp(packet, "qXfer:osdata:read:tlbinfo:0,", 28) == 0))
+    {
+        flag_first_iter = 1;
+        curr_idx = 0;
+    }
+    else
+    {
+        flag_first_iter = 0;
+    }
+
+    hwtlb_entries_total = hexa_info->config.numTlbEntries;
+    hwtlb_entry = &(hexa_info->config.pTlbEntries[curr_idx]);
+    if(hwtlb_entries_total == 0)
+    {
+        //gdb send error E01
+        ret_val = 01;
+        goto RETURN_TLB;
+    }
+   
+    if(flag_first_iter == 1)
+    {
+        flag_first_iter = 0;
+        snprintf(op_buf, strlen(XML_INTRO_TLB),"%s", (char*)XML_INTRO_TLB);
+    }
+    else
+    {
+        if(curr_idx < hwtlb_entries_total)
+            hexagon_print_single_tlb_entry(&curr_idx, hwtlb_entry, hwtlb_entries_total, op_buf);
+        /* Send XML_FINAL packet for last entry.*/
+        if((curr_idx == hwtlb_entries_total) && (op_buf[0] == '\0'))
+        {
+            curr_idx = 0;
+            flag_first_iter = 1;
+            hwtlb_entries_total = 0;
+            snprintf(op_buf,  strlen(XML_FINAL),"%s", (char*)XML_FINAL);
+            goto RETURN_TLB;
+        }
+    }
+
+    RETURN_TLB:
+    return ret_val;
+}
+
+/*
+    Function to handle "pagetable" LLDB command state machine and retireve data
+    entry by entry.
+*/
+int handle_pagetable_state_machine(const char *packet, char *op_buf)
+{
+    tlb_entries *vtlb_entry = NULL;
+    int ret_val = ERROR_OK;
+    /*State machine variables.*/
+    static uint32_t flag_first_iter = 1;
+    static int32_t curr_idx = 0;
+    static int32_t vtlb_entries_total = 0;
+
+    /*********************State machine logic***************
+     * curr_idx helps in tracking entry number in vtlb an dtlb tables.
+     * but flag_first_iter is required to detect if current iteration is 
+     * 1st iteration or not based on which we decied which 1/3 packets will go to
+     * LLDB client.
+     * Packet 1 - start packet 
+     * Packet 2 - data packet for each entry (curr_idx 0 <- >n -1)
+     * Packet 3 - Final packet $l\n</os_data>\n
+     * 
+    */
+
+    /*Start and End packets.*/
+    static const char *XML_INTRO_PG = "m<osdata type=\"pagetableinfo\">\n";
+    static const char *XML_FINAL = "l\n</osdata>\n";
+
+    if((strncmp(packet, "qXfer:osdata:read:pagetable:0,", 30) == 0))
+    {
+        flag_first_iter = 1;
+        curr_idx = 0;
+    }
+    else
+    {
+        flag_first_iter = 0;
+    }
+
+    vtlb_entries_total = hexagon_vtlb_data.valid_vtlb_no_of_entries;
+    vtlb_entry = hexagon_vtlb_entries + curr_idx;
+    if((vtlb_entries_total == 0) || (!hexagon_vtlb_entries))
+    {
+        //gdb send error E01
+        ret_val = 01;
+        goto RETURN_PG;
+    }
+   
+    if(flag_first_iter == 1)
+    {
+        flag_first_iter = 0;
+        snprintf(op_buf, strlen(XML_INTRO_PG),"%s", (char*)XML_INTRO_PG);
+    }
+    else
+    {
+        /* Send XML_FINAL packet for last entry.*/
+        if(curr_idx == vtlb_entries_total)
+        {
+            curr_idx = 0;
+            flag_first_iter = 1;
+            vtlb_entries_total = 0;
+            snprintf(op_buf,  strlen(XML_FINAL),"%s", (char*)XML_FINAL);
+            goto RETURN_PG;
+        }
+        hexagon_print_single_vtlb_entry(
+            vtlb_entry->phys_tlb_raw_data, vtlb_entry->virt_tlb_raw_data, op_buf);
+        curr_idx++;
+    }
+
+    RETURN_PG:
+    return ret_val;
+}
 
 // 
 /**********************************Function Definitions*****************************************/
@@ -681,18 +1167,23 @@ static int hexagon_virt2phys(struct target *target, target_addr_t virt, target_a
     int ret_val = 0;
     virt_add = virt;
 
-
 #ifdef _VTLB_ENABLED
-    LOG_INFO ("virtual address : 0x%llx ", virt_add);
-    if (hexagon->hexa_info.mmu_init)
+    LOG_DEBUG ("virtual address : 0x%llx ", virt_add);
+    bool mmu_enabled = hexagon_is_mmu_enabled(target);
+    
+    if (mmu_enabled)
     {
         ret_val = hexagon_search_virtadd_in_tlb (hexagon, virt_add, phys);
-        if(ret_val == ERROR_OK)
+        if(ret_val == ERROR_OK){
+            LOG_DEBUG ("virtual address found in tlb ");
             return ret_val;
+        }
     
         ret_val = hexagon_search_virtadd_in_vtlb(target, virt_add, phys);
-
-        LOG_INFO ("virtual address : 0x%llx ; physical address :0x%llx", virt_add, *phys);
+        if (ret_val == ERROR_OK){
+            LOG_DEBUG ("virtual address found in vtlb ");
+        }
+        LOG_DEBUG ("virtual address : 0x%llx ; physical address :0x%llx", virt_add, *phys);
     }
 #endif
 
@@ -854,6 +1345,11 @@ static void hexagon_populate_vtlb_refresh_entries(struct target *target)
     // uint64_t output[2] = {0};
     uint32_t output[2] = {0};
 
+    bool vtlb_enabled = hexagon_is_vtlb_initialized(target);
+    if (!vtlb_enabled){
+        LOG_DEBUG("vtlb not enabled, returning");
+        return;
+    }
     hexagon_memw_read(target,hexagon_vtlb_data.QURTK_vtlb_main_VA-16,
                         &hexagon_vtlb_data.vtlb_current_counter);
     if(hexagon_vtlb_data.vtlb_previous_counter == hexagon_vtlb_data.vtlb_current_counter)
@@ -903,7 +1399,6 @@ static void hexagon_initialize_axi_ap(struct target *target)
     int retval,i;
     
     LOG_DEBUG("hexagon_initialize_axi_ap  Enter");
-    retval = enable_dbg_sys_pwr(swddp);
     
     if(debug_axi_ap == NULL)
     {
@@ -925,7 +1420,6 @@ static void hexagon_initialize_axi_ap(struct target *target)
                 return;
             }
         }
-        retval = enable_dbg_sys_pwr(swddp);
         retval = mem_ap_init(debug_axi_ap);
         if (retval != ERROR_OK)
         {
@@ -957,6 +1451,12 @@ static void hexagon_populate_vtlb_data(struct target *target)
 
     LOG_DEBUG("qurtk_vtlb_main_addr   = 0x%x ",qurt_context->qurtk_vtlb_main_addr);
     hexagon_memw_read(target, qurt_context->qurtk_vtlb_main_addr, &hexagon_vtlb_data.QURTK_vtlb_main_VA );
+    bool vtlb_enabled = hexagon_is_vtlb_initialized(target);
+    if (!vtlb_enabled){
+        LOG_DEBUG("vtlb not enabled, returning");
+        return;
+    }
+    
     LOG_DEBUG("hexagon_vtlb_data.QURTK_vtlb_main_VA   = 0x%x ",hexagon_vtlb_data.QURTK_vtlb_main_VA );
     
     hexagon_memw_read(target,hexagon_vtlb_data.QURTK_vtlb_main_VA-16,
@@ -996,6 +1496,8 @@ static void hexagon_populate_vtlb_data(struct target *target)
 #endif
 
     hexagon_populate_vtlb_entries(target);
+    qurt_context->vtlb_initialized = true;
+
     LOG_DEBUG("hexagon_populate_vtlb_data  Exit");
 }
 
@@ -1025,7 +1527,7 @@ static void hexagon_populate_vtlb_entries(struct target *target)
 
 #endif
 
-    hexagon_print_vtlb_entries();
+    hexagon_print_vtlb_data();
     
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
         hexagon_end_time_cal_ms();
@@ -1035,23 +1537,6 @@ static void hexagon_populate_vtlb_entries(struct target *target)
     LOG_DEBUG("hexagon_populate_vtlb_entries  Exit");
 
 
-}
-
-/* This function print the VTLB entries*/
-static void hexagon_print_vtlb_entries(void)
-{
-    tlb_entries * temp = NULL;
-    uint64_t i;
-    LOG_DEBUG("Printing the VTLB content");
-
-    for (i=0; i < hexagon_vtlb_data.valid_vtlb_no_of_entries; i++) 
-    {
-        temp = hexagon_vtlb_entries + i;
-        /*LOG_DEBUG("VA = 0x%x --> PA = 0x%x ", temp->virt_tlb_raw_data,temp->phys_tlb_raw_data);
-        LOG_DEBUG("VA Page = 0x%08x PA Page =  0x%08x and Page size = %d", temp->virt_page,temp->phy_page,temp->page_size);*/
-        LOG_DEBUG("VA = 0x%x -- 0x%x and PA = 0x%llx -- 0x%llx", temp->virt_add_low, temp->virt_add_high,
-                  temp->phy_add_low, temp->phy_add_high);
-    }
 }
 
 
@@ -1080,7 +1565,7 @@ static void hexagon_update_vtlb_entry_in_structure(uint64_t tlb_phy, uint64_t tl
     tlbhi.raw = tlb_virtual;
     virt_add = virt_page << 12;
 
-    phy_page = QURT_getPhysAddr_v2(tlblo.raw, tlbhi.raw);
+    phy_page = hexagon_getPhysAddr_v2(tlblo.raw, tlbhi.raw);
     phy_add = phy_page << 12;
 
     if((virt_add == 0x0) || (phy_add == 0x0) )
@@ -1155,54 +1640,24 @@ static void hexagon_update_vtlb_entry_in_structure(uint64_t tlb_phy, uint64_t tl
     temp->virt_add_low= virt_add;
     temp->virt_add_high = virt_add + size;
 
-    // temp->phy_add_low = temp->phy_page << 12;
-    // temp->phy_add_high = temp->phy_add_low + size;
-
     temp->phy_add_low = (uint64_t) temp->phy_page << 12;
     temp->phy_add_high = (uint64_t) temp->phy_add_low + size;
 
-    // LOG_DEBUG("Phy after left shift = 0x%llx",temp->phy_add_low);
-    // LOG_DEBUG("Phy page address before shift = 0x%llx",temp->phy_page);
     LOG_DEBUG("V bit =0x%x G bit = 0x%x ASID = 0x%x ", temp->validbit, temp->globalbit, temp->asid);
     LOG_DEBUG("VA = 0x%x -- 0x%x ; PA = 0x%llx -- 0x%llx", temp->virt_add_low,temp->virt_add_high, temp->phy_add_low,temp->phy_add_high);
-    //LOG_DEBUG("hexagon_update_vtlb_entry_in_structure Exit");
-}
-static void hexagon_memw_read_buffer(struct target *target, uint64_t virt_address, uint32_t size, uint8_t *buffer)
-{
-    uint32_t count, i;
-    uint8_t *temp;
-    if (virt_address == 0x0)
-    {
-        LOG_DEBUG("virt_address address passed as NULL");
-        return;
-    }
-    if ((size % 4) == 0)
-    {
-        count = size / 4;
-        temp = buffer;
-        for (i = 0; i < count; i++)
-        {
-            hexagon_memw_read(target, virt_address + 4 * i, (uint32_t *)temp);
-            temp = temp + 4;
-        }
-    }
-    else
-    {
-        LOG_DEBUG("size is not multiple of 4 bytes");
-    }
 }
 
 /* this interface is to read the  memory via memw interface*/
-static void hexagon_memw_read(struct target *target, uint64_t virt_address, uint32_t *value)
+static int hexagon_memw_read(struct target *target, uint64_t virt_address, uint32_t *value)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status, isdbsts;
+    uint32_t isdb_mmode_cmd;
     uint64_t stuff_inst[] = {0x6ea8c000, 0x9180c007, 0x6707c029};
     /* Stuff instruction 0x6ea8c000-->{r0 =isdbmbxin} 0x9180c007-->{r7 = memw(r0+#0) } 0x6707c029-->{isdbmbxout=r7}*/
-    int retval, i;
-    
-    isdb_mmode_cmd = 0x184;
+    int retval = ERROR_OK, i;
+
+    isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
     // isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
                             // ISDBCMD_TNUM_MASK_THREAD(0));
 
@@ -1211,78 +1666,454 @@ static void hexagon_memw_read(struct target *target, uint64_t virt_address, uint
 
     if (retval != ERROR_OK) 
             LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
-    for (i=0; i < 3; i++)
-    {
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
 
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD  return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
+    /* Poll ISDB MBXIN for write complete. */
+    retval = hexagon_poll_mbxin(target);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDB MBX_IN not found to be full");
+    }
+
+    /*For all elements in stuff_inst array.*/
+    for (i=0; i < (int)(sizeof(stuff_inst)/sizeof(stuff_inst[0])); i++)
+    {
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+        if (retval != ERROR_OK)
         {
-             LOG_DEBUG("ISDBcommand failed in monitor mode for i = %d", i);
-             return ;
+            LOG_ERROR("%s failed", __func__);
+            return retval;
         }
-    }
-    i=0;
-    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
 
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        i++;
-        if (i == 10)
-            break;
     }
-    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
+
+    retval = hexagon_poll_mbxout(target);
+    if (retval != ERROR_OK){
         LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
-        return;
     }
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, value);
-    
-    hexagon_wait_loop();
-    hexagon_wait_loop();
 
     if (retval != ERROR_OK) 
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed ");
+    
+    return ERROR_OK;
 }
 
+/* RTOS OS-awareness HW-thread register hook (used by src/rtos/qurt.c). Serves
+ * the per-HW-thread register list (R0..R31 + PC) straight from the driver's
+ * per-HW-thread cache with no target reads / no memw stuffing. Required by
+ * OpenOCD's SMP rtos_get_gdb_reg_list, which asks for a register list for
+ * every thread. */
+int hexagon_rtos_get_hwthread_reg_list(struct target *target, uint32_t tnum,
+        struct rtos_reg **reg_list, int *num_regs)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    const int ngp = 32;            /* R0..R31 */
+    const int n   = ngp + 1;       /* + PC */
+
+    if (!reg_list || !num_regs)
+        return ERROR_FAIL;
+    if (tnum >= hexa_info->config.maxHwThreads)
+        return ERROR_FAIL;
+
+    struct rtos_reg *out = calloc(n, sizeof(struct rtos_reg));
+    if (!out) {
+        LOG_ERROR("hexagon_rtos_get_hwthread_reg_list: out of memory");
+        return ERROR_FAIL;
+    }
+
+    for (int r = 0; r < ngp; r++) {
+        uint32_t v = hexa_info->pPerHwThrdReg[tnum][HEXAGON_R0 + r];
+        out[r].number = (uint32_t)r;          /* gdb R0..R31 */
+        out[r].size   = 32;
+        memcpy(out[r].value, &v, sizeof(v));
+    }
+	/* PC uses gdb WIRE regnum 40 (not 32, which is SA0). */
+	uint32_t pc = hexa_info->pPerHwThrdReg[tnum][HEXAGON_PC];
+    out[ngp].number = 40;
+    out[ngp].size   = 32;
+    memcpy(out[ngp].value, &pc, sizeof(pc));
+
+    *reg_list = out;
+    *num_regs = n;
+    return ERROR_OK;
+}
+
+/* Returns the 0-based HW thread number currently selected/halted, so the RTOS
+ * layer can mark the right HW thread as "current". */
+uint32_t hexagon_rtos_current_hwthread(struct target *target)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    return (uint32_t)hexa_info->thread_id_thread_select;
+}
+
+/* Returns true once the driver has populated its software VTLB from the QuRT
+ * kernel page tables — a reliable proxy for "QuRT init complete, memw reads of
+ * kernel VAs are safe". Used by the RTOS module as the SW-walk auto-enable
+ * gate. No target I/O. */
+bool hexagon_rtos_vtlb_ready(struct target *target)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    return hexagon->qurt_context.vtlb_initialized;
+}
+
+/* Read a 32-bit word from a kernel/island VA via the VTLB-translate + memw_phys
+ * path (no core-MMU instruction stuffing). Safe any time after the VTLB is
+ * populated. Returns ERROR_FAIL if the VA has no VTLB mapping. */
+/* Read a 32-bit word at a kernel virtual address via the software VTLB,
+ * bypassing the core's HW MMU. No memw instruction stuffing, no core-state
+ * disruption.
+ *
+ * CONTRACT: `address` MUST be 4-byte aligned. `memw_phys` requires word
+ * alignment; if an unaligned VA is passed we align the resulting PA down to
+ * the containing 4-byte word (equivalent to reading (address & ~3)). Callers
+ * that need a specific byte within a word should read the aligned word and
+ * mask/shift themselves (see qurt_read_u8_mmu()). */
+int hexagon_rtos_read_u32_phys(struct target *target, target_addr_t address,
+        uint32_t *value)
+{
+    target_addr_t pa = 0;
+    /* Kernel VAs are GLOBAL mappings (globalbit=1); passing asid=0 matches them
+     * via hexagon_translate_va_in_asid which accepts global entries for any ASID. */
+    if (hexagon_translate_va_in_asid(0, (uint64_t)address, &pa) != ERROR_OK) {
+        *value = 0;
+        return ERROR_FAIL;
+    }
+    /* Align to 4 bytes (memw_phys requires word alignment). Per the contract
+     * above, callers pass an aligned VA so this is normally a no-op; on an
+     * unaligned VA we intentionally read the containing word. */
+    target_addr_t aligned_pa = pa & ~((target_addr_t)0x3);
+    int retval = hexagon_memw_phys_read(target, aligned_pa, value);
+    if (retval != ERROR_OK) {
+        *value = 0;
+        return retval;
+    }
+    return ERROR_OK;
+}
+
+int hexagon_rtos_read_u32(struct target *target, target_addr_t address, uint32_t *value)
+{
+    uint32_t v = 0;
+    int retval = hexagon_memw_read(target, (uint64_t)address, &v);
+    /* memw stuffing clobbers r0/r7; restore them so the user-visible register
+     * state is not corrupted by our OS-awareness read. */
+    hexagon_stuff_reg_restore(target);
+    if (retval != ERROR_OK) {
+        *value = 0;
+        return retval;
+    }
+    *value = v;
+    return ERROR_OK;
+}
+
+/* Translate a user VA under a specific QuRT ASID to a physical address using
+ * the kernel VTLB. Lets OS-awareness read a parked thread's per-process data
+ * (living in a different ASID than the halted HW thread) without faulting the
+ * MMU. An entry matches if it is global or its asid == the requested asid and
+ * the VA falls in its range; returns ERROR_FAIL if none matches. */
+static int hexagon_translate_va_in_asid(uint32_t asid, uint64_t va,
+        target_addr_t *phys)
+{
+    if (!hexagon_vtlb_entries)
+        return ERROR_FAIL;
+
+    for (uint32_t i = 0; i < hexagon_vtlb_data.valid_vtlb_no_of_entries; i++) {
+        tlb_entries *e = hexagon_vtlb_entries + i;
+        if (va < e->virt_add_low || va > e->virt_add_high)
+            continue;
+        /* global mappings apply to every ASID; otherwise the ASID must match */
+        if (!e->globalbit && e->asid != (asid & 0x7f))
+            continue;
+        *phys = e->phy_add_low + (va - e->virt_add_low);
+        return ERROR_OK;
+    }
+    return ERROR_FAIL;
+}
+
+/* Read 'size' bytes from virtual 'address' as seen by the given QuRT ASID,
+ * via VTLB translation + memw_phys. Handles arbitrary size/alignment by
+ * reading word-aligned and trimming. Returns ERROR_FAIL (without faulting the
+ * target) if the VA is not mapped in that ASID's VTLB. */
+int hexagon_rtos_read_buffer_asid(struct target *target, uint32_t asid,
+        target_addr_t address, uint32_t size, uint8_t *buffer)
+{
+    if (!buffer)
+        return ERROR_FAIL;
+    if (size == 0)
+        return ERROR_OK;
+
+    target_addr_t aligned = address & ~((target_addr_t)0x3);
+    uint32_t lead  = (uint32_t)(address & 0x3);
+    uint32_t total = lead + size;
+    uint32_t words = (total + 3) / 4;
+
+	for (uint32_t w = 0; w < words; w++) {
+		target_addr_t va = aligned + 4 * w;
+		target_addr_t pa = 0;
+		if (hexagon_translate_va_in_asid(asid, (uint64_t)va, &pa) != ERROR_OK) {
+			/* VA not mapped in this ASID -> caller falls back to "NA". */
+			LOG_DEBUG("hexagon: asid-read MISS asid=%u va=0x%08x (no VTLB entry) "
+			         "vtlb_entries=%u", asid, (unsigned)va,
+			         hexagon_vtlb_data.valid_vtlb_no_of_entries);
+			return ERROR_FAIL;
+		}
+
+		LOG_DEBUG("hexagon: asid-read HIT  asid=%u va=0x%08x -> pa=0x%08x (memw_phys)",
+                 asid, (unsigned)va, (unsigned)pa);
+        uint32_t v = 0;
+        if (hexagon_memw_phys_read(target, pa, &v) != ERROR_OK)
+            return ERROR_FAIL;
+
+        for (uint32_t b = 0; b < 4; b++) {
+            uint32_t abs_off = w * 4 + b;
+            if (abs_off < lead)
+                continue;
+            uint32_t dst = abs_off - lead;
+            if (dst >= size)
+                break;
+            buffer[dst] = (uint8_t)((v >> (8 * b)) & 0xff);
+        }
+    }
+    return ERROR_OK;
+}
+
+static int hexagon_isdb_cmd_status(struct target *target, uint32_t stuff_inst, uint32_t isdb_mmode_cmd){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    int retval = 0;
+    uint32_t cmd_status = 0, stuff_exception = 0;
+    clock_t start_time = clock();
+    clock_t elapsed_time_us = 0;
+    const clock_t timeout_us = 10; // 10 microseconds timeout
+    uint32_t isdbsts = 0;
+    uint32_t isdb_prev = 0;
+
+    /* ISDB ready poll for ISDB ready.*/
+    retval = hexagon_poll_isdbready(target);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDB bit not ready");
+        LOG_DEBUG("0x%x, 0x%x",stuff_inst, isdb_mmode_cmd);
+    }
+
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdb_prev);
+
+    if (stuff_inst != 0){
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
+                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst);
+    #ifdef HEXAGON_DEBUG_LOGS
+        if (retval != ERROR_OK) 
+            LOG_ERROR("HEXAGON_ISDB_STFINST return value is not OK");
+    #endif
+
+    }
+
+    if (isdb_mmode_cmd != 0){
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
+                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
+    #ifdef HEXAGON_DEBUG_LOGS
+        if (retval != ERROR_OK) 
+            LOG_ERROR("HEXAGON_ISDB_ISDBCMD return value is not OK");
+    #endif
+    }
+
+    /* Poll until cmd_status is not 0 or timeout */
+    do {
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+#ifdef HEXAGON_DEBUG_LOGS
+        if (retval != ERROR_OK) 
+            LOG_ERROR("hexagon_isdb_cmd_status failed to read ISDBST");
+#endif
+        // micro_second_sleep(1);
+
+        // Calculate elapsed time in microseconds
+        elapsed_time_us = (clock() - start_time)*1000;
+        
+    } while (isdbsts != isdb_prev && elapsed_time_us < timeout_us);
+
+    cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
+    if (cmd_status != 0) {
+        LOG_ERROR("Command failed or timed out!");
+        return ERROR_FAIL;
+    }
+
+    stuff_exception = isdbsts & ISDBST_STUFF_CMD_STATUS;
+    if (stuff_exception) {
+        LOG_ERROR("Exception occurred!");
+#ifdef HEXAGON_DEBUG_LOGS
+        uint32_t num_thrds = hexagon_no_of_hw_threads(target);
+        hexagon_read_gpr_registers(target, num_thrds);
+        hexagon_read_ctrl_registers(target, num_thrds);
+        hexagon_dump_hwthrd_reg(target);
+#endif
+        return ERROR_FAIL;
+    }
+
+    return ERROR_OK;
+}
+static int hexagon_poll_mbxout(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    int retval = 0;
+    uint32_t cmd_status = 0;
+    uint32_t isdbsts;
+    int i = 0;
+
+    /* Poll until cmd_status is not 0 or timeout */
+    do {
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+        if (retval != ERROR_OK)
+            LOG_ERROR("hexagon_isdb_cmd_status failed to read ISDBST");
+
+        cmd_status = (isdbsts & ISDBST_ISDB_MAILBOX_OUT);
+        
+        // Calculate elapsed time in microseconds
+        i++;
+
+    } while (!cmd_status &&  i <= HEXAGON_MAX_REG_RETRY);
+
+    if(!(cmd_status))
+        {
+        LOG_DEBUG("Mailbox out bit not set");
+        return ERROR_FAIL;
+    }
+    
+    return ERROR_OK;
+
+}
+
+static int hexagon_poll_mbxin(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdbsts;
+    int retval = 0;
+    uint32_t cmd_status = 0;
+    int i = 0;
+
+
+    /* Poll until cmd_status is not 0 or timeout */
+    do {
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+        if (retval != ERROR_OK)
+            LOG_ERROR("hexagon_isdb_cmd_status failed to read ISDBST");
+
+        cmd_status = (isdbsts & ISDBST_ISDB_MAILBOX_IN);
+        
+        // Calculate elapsed time in microseconds
+        i++;
+
+    } while (!cmd_status &&  i <= HEXAGON_MAX_REG_RETRY);
+
+    if(!(cmd_status))
+    {
+        LOG_DEBUG("Mailbox in bit not set iter = %d",i);
+        return ERROR_FAIL;
+    }
+    return ERROR_OK;
+
+}
+
+static int hexagon_poll_isdbready(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdbsts;
+    int retval = 0;
+    uint32_t cmd_status = 0;
+    int i = 0;
+    // clock_t start_time = clock();
+    // double elapsed_time_us = 0;
+    // const double timeout_us = 5.0; // 50 microseconds timeout
+
+    /* Poll until cmd_status is not 0 or timeout */
+    do {
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+        if (retval != ERROR_OK)
+            LOG_ERROR("hexagon_isdb_cmd_status failed to read ISDBST");
+        cmd_status = (isdbsts & ISDBST_ISDB_READY);
+        if(cmd_status)
+        {
+            break;
+    }
+
+        micro_second_sleep(100000);
+        // Calculate elapsed time in microseconds
+        i++;
+
+    } while (i <= 100);
+
+    if(!(cmd_status))
+    {
+        LOG_DEBUG("ISDB ready bit not set iter = %d",i);
+        return ERROR_FAIL;
+    }
+    
+    return ERROR_OK;
+
+}
+// Enable L1 (data & instruction) and L2 caches for the target
+static void hexagon_enable_l1_l2_backing_read(struct target *target, uint32_t sys_cfg)
+{
+    /* -----------------------------------------------------------------
+     * 1. Force the L2 cache to be read‑only and write‑allocate.
+     *    SYSCFG_L2NRA – No Read‑Allocate for L2
+     *    SYSCFG_L2NWA – No Write‑Allocate for L2
+     * ----------------------------------------------------------------- */
+    sys_cfg |= SYSCFG_L2NRA | SYSCFG_L2NWA;
+
+    /* -----------------------------------------------------------------
+     * 2. Ensure L2 write‑back mode is *disabled* (we want write‑through).
+     * ----------------------------------------------------------------- */
+    sys_cfg &= ~SYSCFG_L2WB;
+
+    /* -----------------------------------------------------------------
+     * 3. Enable the L1 data cache.
+     * ----------------------------------------------------------------- */
+    sys_cfg |= SYSCFG_D_CACHE;   // L1 Data Cache
+
+    /* -----------------------------------------------------------------
+     * 4. Optionally enable the L1 instruction cache.
+     *    (Most targets need this; keep it enabled unless you have a
+     *    specific reason to turn it off.)
+     * ----------------------------------------------------------------- */
+    sys_cfg |= SYSCFG_I;   // L1 Instruction Cache
+
+    /* -----------------------------------------------------------------
+     * 5. Finally, enable the L2 cache itself.
+     * ----------------------------------------------------------------- */
+    sys_cfg |= SYSCFG_L2CFG;   // L2 Cache enable
+
+    /* -----------------------------------------------------------------
+     * 6. Write the updated value back to the target.
+     * ----------------------------------------------------------------- */
+    hexagon_write_syscfg_register(target, sys_cfg);
+}
 
 /* This function is used to read memory word using memw_phys instruction  
     In this function we passed the physical address as an argument*/
-// static void hexagon_memw_phys_read(struct target *target, target_addr_t phy_address, uint64_t *value)
-static void hexagon_memw_phys_read(struct target *target, target_addr_t phy_address, uint32_t *value)
-
+static int hexagon_memw_phys_read(struct target *target, target_addr_t phy_address, uint32_t *value)
 {
     struct hexagon_common * hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status, isdbsts;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
     uint64_t phy_add[2], t_phy_address = 0;
-    uint32_t stuff_inst[] = {0x6ea8c000,0x6ea8c001,0x9200e107,0x6707c029};
+    uint32_t stuff_inst[] = {HEXAGON_STUFF_MBXIN_TO_R0, HEXAGON_STUFF_MBXIN_TO_R1, HEXAGON_STUFF_R7_TO_MEMW_PHYS, 
+                    HEXAGON_STUFF_MBXOUT_TO_R7, HEXAGON_STUFF_ISYNC_INST};
     int retval,i;
-    
-    /* Stuff Inst  0x6ea8c000-->{r0 = isdbmbxin} , 0x6ea8c001-->{r1 = isdbmbxin} ,0x9200e107-->{r7 = memw_phys(r0,r1)}
-        0x6707c029-->{isdbmbxout = r7}  */
+    /* Stuff Inst  HEXAGON_STUFF_MBXIN_TO_R0 -->{r0 = isdbmbxin} , HEXAGON_STUFF_MBXIN_TO_R1 -->{r1 = isdbmbxin} ,
+    HEXAGON_STUFF_R7_TO_MEMW_PHYS -->{r7 = memw_phys(r0,r1)} 0x6707c029-->{isdbmbxout = r7} 
+    HEXAGON_STUFF_ISYNC_INST -->{isync} */
 
     t_phy_address = phy_address;
     if(t_phy_address == 0x0)
     {
-        LOG_DEBUG("Physical address passed as NULL");
-        return;
+        LOG_ERROR("Physical address passed as NULL");
+        return ERROR_FAIL;
     }
     hexagon_r0_used_stuff = 1;
         hexagon_r1_used_stuff = 1;
@@ -1292,88 +2123,59 @@ static void hexagon_memw_phys_read(struct target *target, target_addr_t phy_addr
     phy_add[1] = t_phy_address >> 11;
     LOG_DEBUG("physical address= 0x%llx phy_add[0] = 0x%llx  phy_add[1] = 0x%llx",phy_address, phy_add[0],phy_add[1]);
     
+    /* -----------------------------------------------------------------
+     *    Read current SYSCFG register. The helper updates
+     *    the global `hexagon_syscfg_reg` we copy it into a local variable
+     * ----------------------------------------------------------------- */
+    hexagon_read_syscfg_register(target);
+    uint32_t sys_cfg = hexagon_syscfg_reg;
+
+    hexagon_enable_l1_l2_backing_read(target, sys_cfg);
     
     for (i=0 ; i < 2; i++)
     {
-    // /*    
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    // */
-
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                             hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN,phy_add[i]);
         if (retval != ERROR_OK) 
                 LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
 
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-           if(isdb_cmd_status)
-           {
-             LOG_DEBUG("ISDB command failed in monitor mode for i = %d", i);
-             return ;
-          }
-    }
-    for (i=2; i < 4; i++)
-    {
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-            LOG_DEBUG("ISDB command failed in monitor mode for i = %d", i);
-            return ;
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_ERROR("%s failed", __func__);
+            return retval;
         }
     }
-    i=0;
-    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
+    for (i = 2; i < 4; i++){
 
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        i++;
-        if (i==10)
-            break;
-        // hexagon_wait_loop();
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_ERROR("%s failed", __func__);
+            return retval;
+        }
     }
-    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
-        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it isdbsts = 0x%x",isdbsts);
-        return;
+
+    retval = hexagon_poll_mbxout(target);
+    if (retval != ERROR_OK){
+        LOG_ERROR("hexagon_poll_mbxout timed out, read failed");
+        return retval;
     }
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, value);
     if (retval != ERROR_OK) 
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed ");
 
+    hexagon_write_syscfg_register(target, sys_cfg);
+    /* --------------------------------------------------------------------
+    * isync - Guarantees that all previous writes(SYSCFG, mailbox, etc.) are
+    * globally visible before the next instruction is fetched.
+    * --------------------------------------------------------------------*/
+    retval = hexagon_isdb_cmd_status(target, stuff_inst[4], isdb_mmode_cmd);
+    if (retval != ERROR_OK){
+        LOG_ERROR("%s failed", __func__);
+        return retval;
+    }
+
+    return retval;
 }
 
 
@@ -1381,20 +2183,14 @@ static int hexagon_remove_breakpoint(struct target *target, struct breakpoint *b
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     LOG_DEBUG("Entering %s\n",__FUNCTION__);
-    
-#if 0
-        if (target->state != TARGET_HALTED) {
-            LOG_WARNING("target not halted");
-            return ERROR_TARGET_NOT_HALTED;
-        }
-#endif
-        if (breakpoint->is_set) 
-        {
-            hexagon_unset_breakpoint(target, breakpoint);
-            if (breakpoint->type == BKPT_HARD)
-                hexagon->brp_num_available++;
-        }
-        return ERROR_OK;
+
+    if (breakpoint->is_set) 
+    {
+        hexagon_unset_breakpoint(target, breakpoint);
+        if (breakpoint->type == BKPT_HARD)
+            hexagon->brp_num_available++;
+    }
+    return ERROR_OK;
 }
 
 static int hexagon_unset_breakpoint(struct target *target, struct breakpoint *breakpoint)
@@ -1422,19 +2218,19 @@ static int hexagon_unset_breakpoint(struct target *target, struct breakpoint *br
         else 
         {
             LOG_DEBUG(" %s\t ----------------- %d\n",__FUNCTION__, __LINE__);
-            int brp_i = breakpoint->is_set - 1;
+            int brp_i = breakpoint->number;
             if ((brp_i < 0) || (brp_i >= hexagon->brp_num))
             {
                 LOG_DEBUG("Invalid BRP number in breakpoint");
                 return ERROR_OK;
             }
-//            LOG_DEBUG("rbp %i control 0x%0" PRIx32 " value 0x%0" PRIx64, brp_i,
-//                brp_list[brp_i].control, brp_list[brp_i].value);
+            LOG_DEBUG("remove hw bp %i control 0x%0" PRIx32 " value 0x%0" PRIx64, brp_i, 
+                brp_list[brp_i].control, brp_list[brp_i].value);
             brp_list[brp_i].used = 0;
             brp_list[brp_i].value = 0;
             brp_list[brp_i].control = 0;
 
-            int retrycount = 5;
+            int retrycount = HEXAGON_MAX_BKPT_RETRY;
             retval = ERROR_OK;
 
             do
@@ -1469,7 +2265,7 @@ static int hexagon_unset_breakpoint(struct target *target, struct breakpoint *br
 
             //HW breakpoint config/settings
             retval = ERROR_OK;
-            retrycount = 5;
+            retrycount = HEXAGON_MAX_BKPT_RETRY;
 
             do
             {
@@ -1498,8 +2294,8 @@ static int hexagon_unset_breakpoint(struct target *target, struct breakpoint *br
                 //if after 5 retries we are unable to set the HW bp then return from here
                 LOG_DEBUG("BRKPTCFG failed after 5 retries 0x%x", brp_list[brp_i].control);
                 return retval;
-        }
-            breakpoint->is_set = 0;
+            }
+            breakpoint->is_set = false;
             return ERROR_OK;
         }
     }
@@ -1603,7 +2399,6 @@ static int hexagon_set_breakpoint(struct target *target, struct breakpoint *brea
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
     struct hexagon_brp *brp_list = hexagon->brp_list;
-    struct adiv5_dap *swddp = hexa_info->dap;
     
     if (breakpoint->is_set)
     {
@@ -1648,11 +2443,15 @@ static int hexagon_set_breakpoint(struct target *target, struct breakpoint *brea
             LOG_DEBUG("ERROR Can't add more HW breakpoints");
             return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
         }
-        breakpoint->is_set = brp_i + 1;        //REVIEW: NMI Significance of breakpoint->is_set field, from the intuition, it should be 1/0. Keeping as it is AARCH64
+        breakpoint->is_set = true;        //REVIEW: NMI Significance of breakpoint->is_set field, from the intuition, it should be 1/0. Keeping as it is AARCH64
+        breakpoint->number = brp_i;
 
         brp_list[brp_i].used = 1;
         brp_list[brp_i].value = breakpoint->address & 0xFFFFFFFFFFFFFFFC;        //keeping 64 bit for now, last 2 bit is 0 for 32bit alignment
         brp_list[brp_i].control = bpconfig;                                     //REVIEW: assuming this will hold the value of BRKPTCFG0/1 for HW bp
+    
+        LOG_DEBUG("set hw bp %i control 0x%0" PRIx32 " value 0x%0" PRIx64, brp_i, 
+            brp_list[brp_i].control, brp_list[brp_i].value);
 
         //TODO: Check if T32 checks for system halted then sets HW BP, or during threads in RUN mode it sets the BP
         int retrycount;
@@ -1662,24 +2461,14 @@ static int hexagon_set_breakpoint(struct target *target, struct breakpoint *brea
         retval = ERROR_OK;
 
         //HW breakpoint PC address write
-        retrycount = 5;
-                
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        }
+        retrycount = HEXAGON_MAX_BKPT_RETRY;
 
         //HW breakpoint config/settings
         retval = ERROR_OK;
         brkptcfg = brp_list[brp_i].control;
         LOG_DEBUG(" %s\t :-------: %d\t :------------: brkptcfg = %llx\n",__FUNCTION__, __LINE__, brkptcfg);
-        retrycount = 5;
+        retrycount = HEXAGON_MAX_BKPT_RETRY;
         
-        retval = enable_dbg_sys_pwr(swddp);
-        // if (retval != ERROR_OK)
-        // {
-        //     LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        // }
         do
         {
             if (brp_i < 1)
@@ -1755,6 +2544,7 @@ static int hexagon_set_breakpoint(struct target *target, struct breakpoint *brea
         retval = ERROR_OK;
         
         uint64_t first_instrn_addr, current_addr;
+        uint32_t parse_bits;
         first_instrn_addr = 0;
         current_addr = breakpoint->address;
         uint8_t bkwd_code_arr[4]= {0}, packet_counter = 0;
@@ -1797,8 +2587,10 @@ static int hexagon_set_breakpoint(struct target *target, struct breakpoint *brea
             val.byte[1] = bkwd_code_arr[1];
             val.byte[2] = bkwd_code_arr[2];
             val.byte[3] = bkwd_code_arr[3];
-        
-            if(((val.word & (3<<14))>>14) == 0b11)
+
+            // Instruction can be end of packet or duplex
+            parse_bits = (val.word & INSTRUCTION_PARSE_FIELD) >> 14;
+            if((parse_bits == END_OF_PACKET) || (parse_bits == DUPLEX_PACKET))
             {
                 first_instrn_addr+=4;
                 LOG_DEBUG("First instruction of the packet found at address 0x%llx", first_instrn_addr);
@@ -1888,8 +2680,7 @@ static int hexagon_memw_write_instruction_memory(struct target *target,uint64_t 
 
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status,isdbsts;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
     uint64_t stuff_inst[] = {0x6ea8c000,0x6ea8c007,0xa180c700,0xa000c000,0xa800c000,0x56c0c000,0x57c0c002};
     uint64_t address[2];
     int retval = 0, i = 0;
@@ -1904,17 +2695,7 @@ static int hexagon_memw_write_instruction_memory(struct target *target,uint64_t 
     #endif
     
     LOG_DEBUG("hexagon_memw_write_instruction_memory  Enter");
-
-    // if (mmu_init)
-    //     retval=  hexagon_virt2phys(target, virt_address, &phy_addr);
-    // else
-    //     phy_addr = virt_address;
-
-    // if(retval == ERROR_FAIL)
-    // {
-    //     LOG_DEBUG("There is no TLB mapping for virtual address  = 0x%p ", address);
-    //     return retval;
-    // }
+    
     hexagon_r0_used_stuff = 1;
     hexagon_r7_used_stuff = 1;
 
@@ -1925,61 +2706,30 @@ static int hexagon_memw_write_instruction_memory(struct target *target,uint64_t 
     address[1]= value;
 
     LOG_DEBUG("virt_address =  0x%llx and value = 0x%x", virt_address, value);
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    // if (retval != ERROR_OK) 
-    //         LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    // */
 
     for(i = 0;  i < 2;  i++)
     {
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, address[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                    
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in monitor mode for i = %d", i);
-             return ERROR_FAIL;
+        if (retval != ERROR_OK){
+            LOG_ERROR("hexagon_memw_write_instruction_memory failed due to failure to write mailbox in");
+            return retval;
         }
+
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_ERROR("%s failed", __func__);
+            return retval;
+        }
+
     }
     
     for(i = 2; i < 7;  i++)
     {
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                    
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in monitor mode" );
-             return ERROR_FAIL;
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_ERROR("%s failed", __func__);
+            return retval;
         }
     }
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
@@ -1997,23 +2747,21 @@ static int hexagon_write_buffer (struct target *target, target_addr_t address,
 {
     int retval = ERROR_OK;
     target_addr_t phy_addr = 0;
-    uint32_t value= 0;
-    struct hexagon_common *hexagon = target_to_hexagon (target);
-    
+
     if(address == 0x0)
     {
-        LOG_DEBUG("Virtual address passed as NULL");
+        LOG_ERROR("Virtual address passed as NULL");
         return ERROR_FAIL;
     }
-    
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
             hexagon_start_time_cal_ms();
     #endif
+    bool mmu_enabled = hexagon_is_mmu_enabled(target);
         
-    if (!hexagon->hexa_info.mmu_init)
+    if (!mmu_enabled)
     {    
         LOG_INFO("writes can be performed only after MMUs are enabled, memory write failed");
-        return retval;
+        return ERROR_FAIL;
     }
 
     LOG_DEBUG("address  = 0x%llx and size = %d , phy add = 0x%llx", address,size,phy_addr);
@@ -2023,27 +2771,9 @@ static int hexagon_write_buffer (struct target *target, target_addr_t address,
         LOG_DEBUG("There is no TLB mapping for virtual address    = 0x%llx ", address);
         return retval;
     }
-    if (size == 3 )
-    {
-        memcpy(&value, buffer,2);
-        retval = hexagon_memw_write(target,address, value, 2);
-
-        value = 0;
-        //  requires a pointer, not the value of buffer[2]
-        memcpy(&value, &buffer[2],1);
-        retval = hexagon_memw_write(target,address, value, 1);
-
-    }
-    else if(size <= 4)
-    {
-        memcpy(&value, buffer,size);
-        retval = hexagon_memw_write(target,address, value,size);
-
-    }
-    else if ((size % 4) == 0)
-    {
-        retval = hexagon_memw_write_buffer(target, address, size, buffer);
-    }
+    /* Generic handler for potentially unaligned address and sizes.*/
+    retval = hexagon_memw_write_buffer(target, address, size, buffer);
+    hexagon_stuff_reg_restore(target);
         
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
             hexagon_end_time_cal_ms();
@@ -2055,32 +2785,62 @@ static int hexagon_write_buffer (struct target *target, target_addr_t address,
 
 
 /*this function is use to write memory buffer using memw interface */
-static int hexagon_memw_write_buffer(struct target *target, uint64_t virt_address, uint32_t size, const uint8_t  * buffer)
+/*--------------------------------------------------------------*/
+/* Write a buffer of any size to an (potentially unaligned) address */
+/*--------------------------------------------------------------*/
+static int hexagon_memw_write_buffer(struct target *target,
+                                     uint64_t virt_address,
+                                     uint32_t size,
+                                     const uint8_t *buffer)
 {
-    uint32_t count,i,value,retval = ERROR_OK;
-    // Changed temp to const uint8_t * to preserve the const qualifier and avoid warning
-    const uint8_t * temp;
+    uint32_t retval = ERROR_OK;
+    const uint8_t *ptr = buffer;
+    uint64_t addr = virt_address;
+    uint32_t remaining = size;
+    uint32_t val = 0;
 
-    count = size/4;
-    temp = buffer;
-
-    for (i=0; i < count;  i++)
-    {
-        memcpy(&value, temp, 4);
-        retval = hexagon_memw_write(target, virt_address + 4*i , value, 4);
-        temp = temp+4;
+    /* ---- 1‑byte writes until the address is 4‑byte aligned ---- */
+    while ((addr & HEXAGON_MOD_4_BINARY_MASK) && remaining) {
+        memcpy(&val, ptr, BYTE_SIZE);
+        retval = hexagon_physical_addr_store(target, addr, val, BYTE_SIZE);
+        if (retval != ERROR_OK)
+            return retval;
+        addr   += BYTE_SIZE;
+        ptr    += BYTE_SIZE;
+        remaining--;
     }
+
+    /* ---- 4‑byte writes for the bulk of the data ---- */
+    while (remaining >= WORD_SIZE) {
+        memcpy(&val, ptr, WORD_SIZE);
+        retval = hexagon_physical_addr_store(target, addr, val, WORD_SIZE);
+        if (retval != ERROR_OK)
+            return retval;
+        addr   += WORD_SIZE;
+        ptr    += WORD_SIZE;
+        remaining -= WORD_SIZE;
+    }
+
+    /* ---- Handle any trailing bytes (< 4) ---- */
+    while (remaining) {
+        memcpy(&val, ptr, BYTE_SIZE);
+        retval = hexagon_physical_addr_store(target, addr, val, BYTE_SIZE);
+        if (retval != ERROR_OK)
+            return retval;
+        addr   += BYTE_SIZE;
+        ptr    += BYTE_SIZE;
+        remaining--;
+    }
+
     return retval;
 }
-
 
 /*This function used to write memory using memw interface  */
 static int hexagon_memw_write(struct target *target,uint64_t virt_address, uint32_t value, uint32_t size)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdb_mmode_cmd = 0x184, isdbsts = 0,sys_cfg;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD, sys_cfg;
     uint32_t stuff_inst[] = {0x6ea8c000, 0x6ea8c007, 0xa180c700, 0xa000c000, 0xa800c000, 0xa840c000};
     // uint32_t stuff_inst[] = {0x6ea8c01f, 0x6ea8c01f, 0xab1edf08, 0x6ea8c01e, 0x6ea8c01f, 0x921ffe1f, 0x671fc029 ,0xa800c000, 0xa840c000 };
 
@@ -2126,199 +2886,620 @@ static int hexagon_memw_write(struct target *target,uint64_t virt_address, uint3
         // LOG_DEBUG("size is %d", size );
         // address[0]= virt_address;ss
 
-
     }
     LOG_DEBUG("address is 0x%llx\nvalue to be written is 0x%x", virt_address, value );
 
     address[0]= virt_address;
     address[1]= value;
 
-    // LOG_DEBUG("address = 0x%x, value = 0x%x", address, value);
     LOG_DEBUG("address[0] = 0x%llx, address[1] = 0x%llx", address[0], address[1]);
-
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    // if (retval != ERROR_OK) 
-    //         LOG_DEBUG("enable_dbg_sys_pwr return value is not OK"); 
-    // */
 
     hexagon_r0_used_stuff = 1;
     hexagon_r7_used_stuff = 1;
 
     retval = hexagon_read_syscfg_register(target);
-    if(retval == ERROR_OK)
-    {
+    if(retval == ERROR_OK){
         sys_cfg = hexagon_syscfg_reg;
         sys_cfg = sys_cfg | SYSCFG_L2NRA | SYSCFG_L2NWA;
         sys_cfg = sys_cfg & ~(SYSCFG_L2WB);
         LOG_DEBUG("Writing value in SYSCFG  = 0x%x ", sys_cfg);
-        hexagon_write_syscfg_register(target,sys_cfg);
         
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_STFINST, 0xa840c000);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        
-        retval = hexagon_read_ISDB(target, isdbsts, ISDBST_ISDB_CMD_STATUS);
-
+        /* Kept commented since we need to find why uncommenting is leading to not reaching main.*/
+        //hexagon_write_syscfg_register(target,sys_cfg);
+        //hexagon_isdb_cmd_status(target, syncht_opcode, isdb_mmode_cmd);
     } 
-    for(i = 0; i < 2;  i++)
-    {
+
+    for(i = 0; i < 2;  i++){
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, address[i]);
         LOG_DEBUG ("writing address[i] as 0x%llx", address[i]);
     
         if (retval != ERROR_OK) 
                 LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
         
-        retval = hexagon_read_ISDB(target, isdbsts, ISDBST_ISDB_CMD_STATUS);
-
+        hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
     }
-    for(i = 2; i < 6 ; i++)
-    {
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
 
-        
-        retval = hexagon_read_ISDB(target, isdbsts, ISDBST_ISDB_CMD_STATUS);
+    for (i=2; i < 4; i++){
+
+        hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
     }
+
     LOG_DEBUG("hexagon_memw_write  Exit");
     return ERROR_OK;
 }
 
+/*****************************************************************************************
+ * hexagon_memwrite_mmu_bypass
+ *
+ * Description
+ * ------------
+ * Implements a low‑level memory write using the Hexagon ISDB “stuff” instruction
+ * interface while bypassing the MMU.  The routine supports writing a single byte,
+ * a half‑word (2 bytes) or a full word (4 bytes) to an arbitrary virtual address.
+ *
+ * Flow
+ * ----
+ * 1. Retrieve the Hexagon private data structures from the target.
+ * 2. Obtain the DAP pointer (swddp) for later power‑control calls.
+ * 3. Prepare the generic ISDB monitor‑mode command (`HEXAGON_ISDB_MMODE_CMD`).
+ * 4. Select the appropriate “stuff” opcode for the requested size:
+ *      • size == 1 → 0xa100c700   (memb  r0+#0 = r7)
+ *      • size == 2 → 0xa140c700   (memh  r0+#0 = r7)
+ *      • otherwise   → default 0xa180c700 (memw  r0+#0 = r7)
+ * 5. Load the target address and the data value into the ISDB mailbox‑in
+ *    registers (`HEXAGON_ISDB_ISDBMBXIN`).  This is performed in two steps:
+ *      – address[0] = virt_address
+ *      – address[1] = value
+ *    Each element is written with `mem_ap_write_atomic_u32`.
+ * 6. Mark registers r0 and r7 as “used” by the stuff sequence (`hexagon_r0_used_stuff`,
+ *    `hexagon_r7_used_stuff`) so they can be restored later.
+ * 7. Execute the prepared stuff instructions:
+ *      a) For i = 0,1 – write the mailbox values and issue the corresponding
+ *         `hexagon_isdb_cmd_status` to load r0 (address) and r7 (data).
+ *      b) For i = 2,3 – perform the actual memory write (`memw`/`memb`/`memh`) and
+ *         follow it with an `isync` and a `syncht` to ensure ordering.
+ * 8. Return `ERROR_OK` on success or the error code from the first failing
+ *    operation.
+ *
+ * Parameters
+ * ----------
+ * target        – Pointer to the OpenOCD target structure.
+ * virt_address  – Virtual address to write to.
+ * value         – 32‑bit value containing the data to be written.
+ * size          – Number of bytes to write (1, 2 or 4).  Values other than 1 or 2
+ *                 fall back to a 4‑byte word write.
+ *
+ * Return Value
+ * ------------
+ * ERROR_OK on success, otherwise an OpenOCD error code (e.g. ERROR_FAIL,
+ * ERROR_TIMEOUT, etc.) propagated from the underlying DAP or ISDB operations.
+ *
+ * Notes
+ * -----
+ * • The function does **not** perform any alignment checks – the caller must
+ *   ensure that `virt_address` is appropriate for the requested `size`.
+ * • After the write completes, the caller should invoke `hexagon_stuff_reg_restore`
+ *   (or the higher‑level write APIs) to restore the temporary r0/r7 state.
+ *****************************************************************************************/
+static int hexagon_memwrite_mmu_bypass(struct target *target,uint64_t virt_address, uint32_t value, uint32_t size)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
+    uint32_t stuff_inst[] = {HEXAGON_STUFF_MBXIN_TO_R0, HEXAGON_STUFF_MBXIN_TO_R7, HEXAGON_STUFF_R7_TO_MEMW, HEXAGON_STUFF_ISYNC_INST, HEXAGON_STUFF_SYNCHT_INST, HEXAGON_STUFF_SYNCHT_INST};
+
+    uint64_t address[2];
+    int retval,i = 0;
+
+    /* 
+    Stuff inst  HEXAGON_STUFF_MBXIN_TO_R0-->{r0 = isdbmbxin }HEXAGON_STUFF_MBXIN_TO_R7-->{r7 = isdbmbxin} 
+    HEXAGON_STUFF_R7_TO_MEMW-->{memw(r0+#0) = r7 } HEXAGON_STUFF_ISYNC_INST-->{isync} HEXAGON_STUFF_BARRIER_INST-->{barrier } HEXAGON_STUFF_SYNCHT_INST-->{syncht } 
+    */
+
+    LOG_DEBUG("hexagon_memw_write Enter");
+
+
+    LOG_DEBUG("size is %d", size);
+
+    if(size == 1)
+    {
+        stuff_inst[2] = HEXAGON_STUFF_R7_TO_MEMB;  /* {memb(r0+#0) = r7} */
+    }
+    if(size == 2)
+    {
+        stuff_inst[2] = HEXAGON_STUFF_R7_TO_MEMH;  /* {memh(r0+#0) = r7} */
+    }
+    LOG_DEBUG("address is 0x%llx\nvalue to be written is 0x%x", virt_address, value );
+
+    address[0]= virt_address;
+    address[1]= value;
+
+    LOG_DEBUG("address[0] = 0x%llx, address[1] = 0x%llx", address[0], address[1]);
+
+    hexagon_r0_used_stuff = 1;
+    hexagon_r7_used_stuff = 1;
+
+    for(i = 0; i < 2;  i++){
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
+                                hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, address[i]);
+        LOG_DEBUG ("writing address[i] as 0x%llx", address[i]);
+    
+        if (retval != ERROR_OK) 
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
+        
+        hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+    }
+
+    for (i=2; i <= 3; i++){
+
+        hexagon_isdb_cmd_status(target, stuff_inst[i], isdb_mmode_cmd);
+    }
+
+    LOG_DEBUG("hexagon_memw_write  Exit");
+    return ERROR_OK;
+}
+
+/*====================================================================*/
+/*  Store a word when the physical address is known (or can be      */
+/*  obtained from a VA→PA translation).                               */
+/*====================================================================*/
+/*
+ * This routine now **always** forces the MMU off and applies a temporary
+ * L2‑cache configuration (no‑read‑allocate, no‑write‑allocate,
+ * write‑through) before performing the store.  The original SYSCFG
+ * value is restored at the end.
+ *
+ * Supported configurations:
+ *   – MMU OFF, D‑cache ON, L2 ON
+ *   – MMU OFF, D‑cache ON, L2 OFF
+ *   – MMU OFF, D‑cache OFF, L2 OFF (backing storage)
+ *   – The only unsupported case is “MMU OFF, D‑cache OFF, L2 ON”.
+ *
+ * Steps performed:
+ *   1. Read SYSCFG.
+ *   2. Reject the unsupported configuration.
+ *   3. If MMU is ON, translate VA → PA; otherwise the address is already
+ *      physical.
+ *   4. Build a temporary SYSCFG that clears the MMU bit and forces the
+ *      L2 cache to the required mode.
+ *   5. Write the temporary SYSCFG.
+ *   6. (No syncht is issued – it is unnecessary for this flow.)
+ *   7. Perform the store with `hexagon_memwrite_mmu_bypass`.
+ *   8. Restore the original SYSCFG.
+ *   9. (No final syncht is issued.)
+ *
+ * All errors are propagated; if the temporary SYSCFG was written we
+ * attempt to restore the original value before returning.
+ */
+static int hexagon_physical_addr_store(struct target *target,
+                                         uint64_t virt_addr,
+                                         uint32_t value,
+                                         uint32_t size)
+{
+    int retval = ERROR_OK;
+    uint32_t orig_syscfg = 0;          /* SYSCFG saved at entry            */
+    uint32_t tmp_syscfg;               /* temporary SYSCFG for the store   */
+    /* syncht opcode is no longer used – it has been removed from the flow */
+    target_addr_t phys_addr = 0;
+
+    /*-----------------------------------------------------------*/
+    /* 1. Read the SYSCFG register                               */
+    /*-----------------------------------------------------------*/
+    retval = hexagon_read_syscfg_register(target);
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("Failed to read SYSCFG");
+        return retval;
+    }
+    orig_syscfg = hexagon_syscfg_reg;   /* keep a copy of the original value */
+
+    /*-----------------------------------------------------------*/
+    /* 2. Decode cache/MMU bits and reject the only unsupported   */
+    /*    configuration (MMU OFF, D‑cache OFF, L2 ON)             */
+    /*-----------------------------------------------------------*/
+    bool mmu_on    = (orig_syscfg & SYSCFG_MMU_BIT) != 0;          /* SYSCFG[0]  */
+    bool dcache_on = (orig_syscfg & SYSCFG_D_CACHE) != 0;          /* SYSCFG[2]  */
+    uint32_t l2_cfg = (orig_syscfg >> SYSCFG_L2_CACHE) & SYSCFG_L2_CACHE_BIT_MASK;/* SYSCFG[18:16] */
+
+    if (!dcache_on && l2_cfg != 0) {
+        LOG_ERROR(" D‑cache OFF, L2 cache ON Not supported yet");
+        return ERROR_FAIL;
+    }
+
+    /*-----------------------------------------------------------*/
+    /* 3. Translate VA → PA only when MMU is currently ON        */
+    /*-----------------------------------------------------------*/
+    if (mmu_on) {
+        retval = hexagon_virt2phys(target, virt_addr, &phys_addr);
+        if (retval != ERROR_OK) {
+            LOG_DEBUG("No VA→PA mapping for 0x%llx", virt_addr);
+            return retval;
+        }
+    } else {
+        phys_addr = virt_addr;      /* address already physical */
+    }
+
+    /*-----------------------------------------------------------*/
+    /* 4‑5. Build temporary SYSCFG (MMU forced off, L2 forced to   */
+    /*      no‑read‑allocate, no‑write‑allocate, write‑through)   */
+    /*-----------------------------------------------------------*/
+    tmp_syscfg = orig_syscfg;
+    tmp_syscfg &= ~ SYSCFG_MMU_BIT;   /* force MMU off unconditionally */
+    tmp_syscfg |=  SYSCFG_L2NRA;   /* L2NRA */
+    tmp_syscfg |=  SYSCFG_L2NWA;   /* L2NWA */
+    tmp_syscfg &= ~ SYSCFG_L2WB;  /* L2WB  */
+
+    LOG_DEBUG("Original SYSCFG=0x%08x  Temporary SYSCFG=0x%08x",
+              orig_syscfg, tmp_syscfg);
+
+    retval = hexagon_write_syscfg_register(target, tmp_syscfg);
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("Failed to write temporary SYSCFG (0x%08x)", tmp_syscfg);
+        return retval;
+    }
+
+    /*-----------------------------------------------------------*/
+    /* 6. No syncht required – the cache mode change is already   */
+    /*    visible to the core for the subsequent store.          */
+    /*-----------------------------------------------------------*/
+
+    /*-----------------------------------------------------------*/
+    /* 7. Perform the actual store (address is now physical)      */
+    /*-----------------------------------------------------------*/
+    retval = hexagon_memwrite_mmu_bypass(target, phys_addr, value, size);
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("memw_write failed for address 0x%llx", phys_addr);
+        /* attempt to restore the original SYSCFG before exiting */
+        (void)hexagon_write_syscfg_register(target, orig_syscfg);
+        return retval;
+    }
+
+    /*-----------------------------------------------------------*/
+    /* 8‑9. Restore original SYSCFG (no final syncht needed)     */
+    /*-----------------------------------------------------------*/
+    retval = hexagon_write_syscfg_register(target, orig_syscfg);
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("Failed to restore original SYSCFG (0x%08x)", orig_syscfg);
+        return retval;
+    }
+
+    return ERROR_OK;
+}
+
+
+/*================================================================*/
+/* hexagon‑untrusted – MMU on‑the‑fly helper                     */
+/*================================================================*/
+
+/// Returns *true* when the target’s MMU is enabled.
+/// The check is performed by reading the SYSCFG register and
+/// applying the mask you supplied: (orig_syscfg & SYSCFG_MMU_BIT) != 0
+static bool hexagon_is_mmu_enabled(struct target *target)
+{
+    uint32_t orig_syscfg = 0;
+    int retval;
+
+    /*-----------------------------------------------------------*/
+    /* 1. Read the SYSCFG register                               */
+    /*-----------------------------------------------------------*/
+    retval = hexagon_read_syscfg_register(target);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("Failed to read SYSCFG (retval=%d)", retval);
+        return false;
+    }
+    orig_syscfg = hexagon_syscfg_reg;   /* keep a copy of the original value */
+
+
+    /* Apply the mask you gave */
+    bool mmu_on = (orig_syscfg & SYSCFG_MMU_BIT) != 0U;  // explicit: nonzero → true
+
+    /* Keep the historic flag in sync for any code that only reads it */
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    hexagon->hexa_info.mmu_init = mmu_on;
+
+#ifdef HEXAGON_DEBUG_LOGS
+    LOG_DEBUG("MMU is %s (SYSCFG=0x%08x)",
+              mmu_on ? "enabled" : "disabled", orig_syscfg);
+#endif
+    return mmu_on;
+}
+static int hexagon_clear_vtlb_bitmap(struct target *target, bool check_bitmap_cleared)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    uint32_t bitmap_addr;
+    int retval;
+
+    /* Base address contains pointer to bitmap array */
+    qurt_context->bitmap_addr = qurt_context->qurtk_vtlb_bitmap;
+
+    retval = hexagon_memw_read(target,
+                               qurt_context->bitmap_addr,
+                               &bitmap_addr);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("Failed to read bitmap base address");
+        return retval;
+    }
+
+    /* Number of 32-bit bitmap words */
+    uint32_t bitmap_words =
+        hexagon_vtlb_data.vtlb_no_of_entries / 32;
+
+    /* Clear bitmap */
+    for (uint32_t i = 0; i < bitmap_words; i++) {
+        retval = hexagon_memw_write(target, bitmap_addr, 0x0, 4);
+        if (retval != ERROR_OK) {
+            LOG_ERROR("Bitmap clear failed at 0x%x", bitmap_addr);
+            return retval;
+        }
+        bitmap_addr += 4;
+    }
+
+    /* Verification: re-read and check the bitmap content */
+    if (check_bitmap_cleared) {
+        /* Re-read base pointer */
+        retval = hexagon_memw_read(target,
+                                qurt_context->bitmap_addr,
+                                &bitmap_addr);
+        if (retval != ERROR_OK)
+            return retval;
+
+        /* Verify that all entries previously forced to 0 are indeed zero */
+        bool all_zero = true;
+        uint32_t read_val = 0;
+        uint32_t nonzero_count = 0;
+
+        /* bitmap_words should match the count used in the clear loop (~line 3039) */
+        for (uint32_t i = 0; i < bitmap_words; i++) {
+            retval = hexagon_memw_read(target, bitmap_addr, &read_val);
+            if (retval != ERROR_OK)
+                return retval;
+
+            if (read_val != 0U) {
+                all_zero = false;
+                nonzero_count++;
+                LOG_DEBUG("VTLB bitmap check: addr=0x%08x val=0x%08x (expected 0)",
+                        bitmap_addr, read_val);
+            }
+            bitmap_addr += 4U;  /* advance to next 32-bit word */
+        }
+
+        if (!all_zero) {
+            LOG_ERROR("VTLB bitmap clear verification FAILED: %u of %u words non-zero",
+                    nonzero_count, bitmap_words);
+            return ERROR_FAIL;
+        }
+
+        /* Success path print for working case */
+        LOG_DEBUG("VTLB bitmap clear verification SUCCESS: all %u entries are zero",
+                bitmap_words);
+    }
+
+    return ERROR_OK;
+}
+
+/* Enablement of bitmap logic will be done from vtlb enable  */
+static void hexagon_vtlb_bitmap_logic_enable(struct target *target)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+
+    if (qurt_context->vtlb_bitmap_logic_init_done){
+        LOG_DEBUG("vtlb_bitmap_logic_init_done is done");
+        return;
+    }
+    int retval;
+
+    retval = hexagon_vtlb_enable_bitmap(target,
+                                     (uint32_t)qurt_context->bitmap_addr,
+                                     (uint32_t)qurt_context->qurtk_vtlb_entries,
+                                     hexagon_vtlb_data.vtlb_no_of_entries);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("hexagon_vtlb_enable_bitmap failed (%d); deferring", retval);
+        return; /* do not mark done; we'll try again on a subsequent call */
+    }
+
+    retval = hexagon_clear_vtlb_bitmap(target, true);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("hexagon_clear_vtlb_bitmap failed (%d); deferring", retval);
+        return ;
+    }
+
+    retval = hexagon_update_vtlb_revision(target);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("hexagon_update_vtlb_revision failed (%d); deferring", retval);
+        return;
+    }
+
+    qurt_context->vtlb_bitmap_logic_init_done = true;
+    LOG_INFO("VTLB bitmap enabled, cleared, and revision cached (one-time init)");
+    
+    return;
+}
+
+/*====================================================================*/
+/*  hexagon_is_vtlb_initialized – check whether the VTLB unit is active   */
+/*====================================================================*/
+static bool hexagon_is_vtlb_initialized(struct target *target)
+{
+    struct hexagon_common   *hexagon   = target_to_hexagon(target);
+    struct qurt_context_t   *qurt_context      = &hexagon->qurt_context;
+    uint32_t                 vtlb_main = 0;
+    int                      retval;
+
+    /* --------------------------------------------------------------
+     * 1.  The address of the VTLB “main” register is supplied by the
+     *     ELF (or by a previous “set” command) and lives in
+     *     qctx->qurtk_vtlb_main_addr.
+     * -------------------------------------------------------------- */
+    if (qurt_context->qurtk_vtlb_main_addr == 0) {
+        LOG_DEBUG("VTLB main address not configured – VTLB disabled");
+        return false;
+    }
+
+    /* --------------------------------------------------------------
+     * 2.  Read the VTLB main register through the Hexagon “memw”
+     *     instruction helper.  The helper already takes care of any
+     *     required MMU‑to‑physical translation, so we can call it
+     *     directly.
+     * -------------------------------------------------------------- */
+    retval = hexagon_memw_read(target,
+                               qurt_context->qurtk_vtlb_main_addr,
+                               &vtlb_main);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("Failed to read VTLB main register at 0x%x "
+                  "(retval=%d)", qurt_context->qurtk_vtlb_main_addr, retval);
+        return false;
+    }
+
+    /* --------------------------------------------------------------
+     * 3.  Store the value in the global VTLB data structure – this is
+     *     what the rest of the code expects (e.g. hexagon_populate_vtlb_*).
+     * -------------------------------------------------------------- */
+    hexagon_vtlb_data.QURTK_vtlb_main_VA = vtlb_main;
+
+    /* --------------------------------------------------------------
+     * 4.  A non‑zero value means the VTLB unit is enabled.
+     * -------------------------------------------------------------- */
+    if (vtlb_main == 0) {
+        LOG_DEBUG("VTLB main register reads 0 - VTLB not enabled");
+        return false;
+    }
+
+    if (qurt_context->vtlb_initialized == true){
+        hexagon_vtlb_bitmap_logic_enable(target);
+    }
+    LOG_DEBUG("VTLB enabled - QURTK_vtlb_main_VA = 0x%08x", vtlb_main);
+    return true;
+}
 
 static int hexagon_read_buffer (struct target *target, target_addr_t address,
         uint32_t size, uint8_t *buffer)
 {
     int retval = ERROR_OK;
-    long long int phy_addr = 0;
-    uint32_t value;
-    struct hexagon_common *hexagon = target_to_hexagon(target);
+    target_addr_t phy_addr = 0;
 
 #ifdef  HEXAGON_DEBUG_LOGS
     start_buffer = clock();
 #endif
-    
-    
 
-    if(address == 0x0)
-    {
+    if (!buffer) {
+        LOG_ERROR("hexagon_read_buffer: destination buffer is NULL");
+        return ERROR_FAIL;
+    }
+    if (size == 0) {                     
+        LOG_DEBUG("hexagon_read_buffer: size == 0 – nothing to read");
+        return ERROR_OK;                
+    }
+
+    if(address == 0x0){
         LOG_DEBUG("Virtual address passed as NULL");
         return ERROR_FAIL;
     }
+
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
             hexagon_start_time_cal_ms();
     #endif
+    bool mmu_enabled = hexagon_is_mmu_enabled(target);
         
-    if (hexagon->hexa_info.mmu_init) //after QURTOS_INIT only memw reads with VA
+    if (mmu_enabled)
     {
-        // retval=  hexagon_virt2phys(target, address,&phy_addr);
-
-        if(size < 4)
-        {
-
-            hexagon_memw_read(target, address, &value);
-            LOG_DEBUG("retrieved value using  hexagon_memw_read for address = 0x%llx \
-                         size < 4  = 0x%x and value = 0x%x", address, size, value);
-            switch(size)
-            {
-                case 1:
-                    buffer[0] = (uint8_t) (value >> 0);
-                    break;
-                case 2: 
-                    target_buffer_set_u16(target, buffer, value);
-                    break;
-                case 3:
-                    target_buffer_set_u24(target, buffer, value);
-                    break;
-            }
-        }
-        else if (size == 4)
-        {
-            hexagon_memw_read(target, address, &value);
-            LOG_DEBUG("retrieved value using  hexagon_memw_read for address = 0x%llx \
-                         size == 4  = 0x%x and value = 0x%x ", address, size, value);
-
-            target_buffer_set_u32(target, buffer , value);
-        }
-        else if ((size % 4) == 0 )
-        {
-            hexagon_memw_read_buffer(target,address,size, buffer);
-            LOG_DEBUG("hexagon_memw_read_buffer for address = 0x%llx for size = 0x%x", address, size);
-
-        }
-    }
-
-    else if (!hexagon->hexa_info.mmu_init) // this is for SW_ENTRY till QURTOS_init 
-    {      
-        phy_addr = address;
-
-        //LOG_DEBUG("hexagon_read_buffer address  = 0x%x and size = %u , phy add = 0x%x", (uint32_t)address,size,(uint32_t)phy_addr);
-    
-        if(retval == ERROR_FAIL)
-        {
-            LOG_DEBUG("There is no TLB mapping for virtual address    = 0x%x ", (uint32_t)address);
+        retval=  hexagon_virt2phys(target, address, &phy_addr);
+        if(retval == ERROR_FAIL){
+            LOG_DEBUG("There is no TLB mapping for virtual address = 0x%x ", (uint32_t)address);
             return retval;
         }
-    
-        if(size < 4)
-        {
-
-            hexagon_memw_phys_read(target,phy_addr, &value);
-            LOG_DEBUG("retrieved value using  hexagon_memw_phys_read for address = 0x%llx \
-                         size < 4  = 0x%x and value = 0x%x ", phy_addr, size, value);
-            switch(size)
-            {
-                case 1:
-                    buffer[0] = (uint8_t) (value >> 0);
-                    break;
-                case 2: 
-                    target_buffer_set_u16(target, buffer, value);
-                    break;
-                case 3:
-                    target_buffer_set_u24(target, buffer, value);
-                    break;
-            }
-        }
-        else if (size == 4)
-        {
-            hexagon_memw_phys_read(target,phy_addr, &value);
-            LOG_DEBUG("retrieved value using  hexagon_memw_phys_read for address = 0x%llx \
-                         size == 4  = 0x%x and value = 0x%x ", phy_addr, size, value);
-            target_buffer_set_u32(target, buffer , value);
-        }
-        else if ((size % 4) == 0 )
-        {
-            hexagon_memw_phys_read_buffer(target,phy_addr,size, buffer);
-            LOG_DEBUG("hexagon_memw_phys_read_buffer for address = 0x%llx for size = 0x%x", address, size);
-
-        }
     }
+    else if (!mmu_enabled){
+        phy_addr = address;
+    }
+
+    /* ---------------------------------------------------------------
+    Unified read buffer implementation
+    Generic implementation - handles any size request and any address alignment.
+    --------------------------------------------------------------- */
+
+    /* Align address down to its 4‑byte word.
+    * phy_addr          – original (possibly unaligned) address
+    * HEXAGON_MOD_4_BINARY_MASK (0x3) – low‑2 bits = byte offset (0‑3)
+    * HEXAGON_ALIGN_MASK ( ~HEXAGON_MOD_4_BINARY_MASK ) – clears those bits
+    * Result: greatest address ≤ phy_addr that is a multiple of 4,
+    *         i.e. the word‑aligned base address required by Hexagon
+    *         word‑access primitives. */
+    target_addr_t aligned_addr = phy_addr & ((target_addr_t) HEXAGON_ALIGN_MASK);
+    /* Extract the byte offset (0‑3) of phy_addr within its 4‑byte word.
+    * HEXAGON_MOD_4_BINARY_MASK (0x3) – isolates the low‑2 bits.
+    * Cast to uint32_t because the value always fits in 2 bits. */
+    uint32_t offset = (uint32_t)(phy_addr & HEXAGON_MOD_4_BINARY_MASK);   // 0‑3
+
+    /* ---------------------------------------------------------------
+    The macro adds 3 (max remainder) then masks off the low two bits,
+    yielding the smallest multiple of 4 ≥ (offset+size).
+    --------------------------------------------------------------- */
+    uint32_t total_len = HEXAGON_ROUND_UP_TO_4(offset + size);   // round‑up to 4 bytes
+
+
+    /* ---------------------------------------------------------------
+    Use a tiny stack buffer (16 bytes = max 4 words) for the common
+    small‑read case – zero‑cost allocation, no malloc failure.
+    Fall back to malloc only for larger reads.
+    --------------------------------------------------------------- */
+    uint8_t stack_buf[16];                /* 16‑byte stack buffer */
+    uint8_t *tmp_buf = (total_len <= sizeof(stack_buf))
+                       ? stack_buf
+                       : malloc(total_len);
+
+    if (!tmp_buf) {
+        LOG_ERROR("allocation failed in hexagon_read_buffer");
+        return ERROR_FAIL;
+    }
+
+    /* Bulk read the aligned region */
+    retval = hexagon_memw_phys_read_buffer(target, aligned_addr,
+                                total_len, tmp_buf);
+
+    /* On exception, timeout, or any error condition, update the register cache
+     * with the latest values from the target before returning. */
+    if (retval != ERROR_OK)
+    {
+        LOG_ERROR("%s failed", __func__);
+        /* Free only if we actually allocated from the heap */
+        if (tmp_buf != stack_buf)
+           free(tmp_buf);
+
+        uint32_t num_thrds = hexagon_no_of_hw_threads(target);
+        hexagon_read_gpr_registers(target, num_thrds);
+        hexagon_read_ctrl_registers(target, num_thrds);
+        hexagon_read_mmode_registers(target, num_thrds);
+        hexagon_read_global_ctrl_registers(target);
+        hexagon_dump_hwthrd_reg(target);
+        hexagon_stuff_reg_restore(target);
+        return retval;
+    }
+
+    /* ---------------------------------------------------------------
+        Trim the extra bytes:
+        - Leading bytes (0 … offset‑1) are skipped by starting the copy at
+            tmp_buf + offset.
+        - Trailing bytes (if any) are ignored because we copy only `size`
+            bytes. No further action is needed.
+   --------------------------------------------------------------- */
+    memcpy(buffer, tmp_buf + offset, size);
+
+    LOG_DEBUG("hexagon_read_buffer: requested %u bytes @ 0x%llx "
+            "(aligned @ 0x%llx, offset %u, total_len %u)",
+            size, phy_addr, aligned_addr, offset, total_len);
+                
+    /* Free only if we actually allocated from the heap */
+    if (tmp_buf != stack_buf) {
+        free(tmp_buf);
+    }
+
 #ifdef HEXAGON_DEBUG_LOGS
     end_buffer = clock();
     buffer_execution = ((double)(end_buffer - start_buffer))/CLOCKS_PER_SEC;
-    // LOG_INFO("AFTER read_buffer %lf", buffer_execution);
 #endif
-
-    
+    hexagon_stuff_reg_restore(target);
 
     return retval;
 }
@@ -2326,17 +3507,16 @@ static int hexagon_read_buffer (struct target *target, target_addr_t address,
 
 /* This function is used to read memory of request size using memw_phys  instruction  
     In this function we passed the physical address as an argument */
-static void hexagon_memw_phys_read_buffer(struct target *target,target_addr_t phy_address, uint32_t size, uint8_t * buffer)
+static int hexagon_memw_phys_read_buffer(struct target *target,target_addr_t phy_address, uint32_t size, uint8_t * buffer)
 {
     uint32_t count, i;
     uint8_t * temp;
-
-    
+    int retval;
 
     if(phy_address == 0x0)
     {
-        LOG_DEBUG("Physical address passed as NULL");
-        return;
+        LOG_ERROR("Physical address passed as NULL");
+        return ERROR_FAIL;
     }
     if ((size % 4) == 0)
     {
@@ -2345,7 +3525,11 @@ static void hexagon_memw_phys_read_buffer(struct target *target,target_addr_t ph
         for (i=0; i < count; i++)
         {
             // hexagon_memw_phys_read(target, phy_address+ 4*i, (uint64_t*) temp);
-            hexagon_memw_phys_read(target, phy_address+ 4*i, (uint32_t *) temp);
+            retval = hexagon_memw_phys_read(target, phy_address+ 4*i, (uint32_t *) temp);
+            if (retval != ERROR_OK){
+                LOG_ERROR("%s failed", __func__);
+                return retval;
+            }
             temp = temp+4;
         }
     }
@@ -2353,6 +3537,8 @@ static void hexagon_memw_phys_read_buffer(struct target *target,target_addr_t ph
     {
         LOG_DEBUG("size is not multiple of 4 bytes");
     }
+
+    return ERROR_OK;
 }
 
 
@@ -2360,9 +3546,9 @@ static int hexagon_read_syscfg_register(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-    int retval,i=0;
-    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
+    int retval = ERROR_OK;
+    uint32_t isdb_mmode_cmd;
+    uint32_t syscfg_read_opcode = 0x6e92c007, mbxout_opcode = 0x6707c029;
     /*Stuff inst  {r7 = syscfg}  {isdbmbxout = r7} */
 
     hexagon_r7_used_stuff  = 1;
@@ -2371,89 +3557,13 @@ static int hexagon_read_syscfg_register(struct target *target)
     isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
                             ISDBCMD_TNUM_MASK_THREAD(0));
 
-    
+    hexagon_isdb_cmd_status(target, syscfg_read_opcode, isdb_mmode_cmd);
 
-    /* Monitor mode */
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    // */
+    hexagon_isdb_cmd_status(target, mbxout_opcode,isdb_mmode_cmd);
 
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-    hexa_info->debug_base + HEXAGON_ISDB_STFINST, 0x6e92c007);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-
-    /* wait till the stuff instruction is executed */
-    // hexagon_wait_loop();
-    
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-
-    /* 0 - cmd sucessfull, 1 - failure */
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    if (isdb_cmd_status)
-    {
-         LOG_DEBUG("ISDBcommand failed in monitor mode");
-         return ERROR_OK;
-    }
-    /*there are 2 stuff instruction here programming second inst */
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    // if (retval != ERROR_OK) 
-    //     LOG_DEBUG("enable_dbg_sys_pwr return value is not OK"); 
-    // */
-
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-              hexa_info->debug_base + HEXAGON_ISDB_STFINST,0x6707c029);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-    
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-
-    /* wait till the stuff instruction is executed */
-    // hexagon_wait_loop();
-                
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    
-
-    /* 0 - cmd success, 1 - cmd failure */ 
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    if (isdb_cmd_status)
-    {
-         LOG_DEBUG("ISDBcommand failed in monitor mode");
-         return ERROR_OK;
-    }
-    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-        hexagon_wait_loop();
-        i++;
-        if (i==10)
-            break;
-    }
-
-    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-    {
-        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading SYSCFG register ");
+    retval = hexagon_poll_mbxout(target);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
         return ERROR_FAIL;
     }
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
@@ -2467,91 +3577,42 @@ static int hexagon_read_syscfg_register(struct target *target)
     return ERROR_OK;
 }
 
-
 /* This function is used to write value in syscfg register */
 static int hexagon_write_syscfg_register(struct target *target,uint32_t value)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     int retval,i;
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd;
     uint32_t stuff_inst[] = {0x6ea8c007  ,0x6707c012,0x57c0c002,0xa840c000};
     /* Stuff instruction  0x6ea8c007-->{r7 = isdbmbxin } 0x6707c012-->{syscfg = r7} 0x57c0c002--> { isync }, 0xa840c000-->  { syncht } */
-    
 
     hexagon_r7_used_stuff = 1;
 
 
-
-    /* Monitor mode */
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) 
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    // */
     
     isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
                                           ISDBCMD_TNUM_MASK_THREAD(0));
-    
-
 
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
     hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, value);
 
+    // ISDB MBXIN polling
+    retval = hexagon_poll_mbxin(target);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDB MBX_IN not found to be full");
+    }
 
     if (retval != ERROR_OK) 
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
 
-    for(i = 0;  i < 4;  i++)
-    {
-
-
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK"); 
-        // */
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[i]);
-
-
-
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-
-
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-
-        /* 0 - cmd sucessfull, 1 - failure */
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in monitor mode");
-             return ERROR_FAIL;
-        }
+    for(i = 0;  i < 4;  i++){
+        hexagon_isdb_cmd_status(target, stuff_inst[i],isdb_mmode_cmd);
     }
 
     return ERROR_OK;
 }
 
-
-
-// /* This function is used to restore r7 used during stuff */
-// static void hexagon_stuff_reg_restore_r7(struct target *target)
-// {    
-    
-//     hexagon_write_gpr_register(target, HEXAGON_R7, HEXAGON_HW_THREAD0, 
-//                     gpPerHwThrdReg[HEXAGON_HW_THREAD0][HEXAGON_R7]);
-    
-// }
 
 static int hexagon_read_memory(struct target *target, target_addr_t address,
     uint32_t size, uint32_t count, uint8_t *buffer)
@@ -2587,22 +3648,24 @@ int hexagon_get_gdb_reg_list(struct target *target,
     switch (reg_class) 
     {
         case REG_CLASS_GENERAL:
-        *reg_list_size = HEXAGON_GPR_REGS * 2;    //try with 1 hw thread.
-        *reg_list = malloc(sizeof(struct reg *) * (*reg_list_size));
-        memset(*reg_list, 0, sizeof(struct reg *) * (*reg_list_size));
-        /* dump GPR for all Hw thread */
-        x = 0;
-        cache = hexa_info->core_cache;
-        while ((cache->next != NULL) && (x < *reg_list_size))
-        {
-            for (i = 0; i < HEXAGON_GPR_REGS ; i++)
-            {
-                (*reg_list)[x++] = hexagon_reg_current(hexa_info, i, cache);
-            }
-            cache = cache->next;
-        }
+		{
+			uint64_t hwthrd = hexa_info->thread_id_thread_select;
 
+			/* walk to the currently-selected hw thread's cache (0-based) */
+			cache = hexa_info->core_cache;
+			for (i = 0; (i < hwthrd) && (cache->next != NULL); i++)
+				cache = cache->next;
 
+			*reg_list_size = HEXAGON_GPR_REGS + 1;    /* GPRs + PC, for the selected thread only */
+			*reg_list = malloc(sizeof(struct reg *) * (*reg_list_size));
+			memset(*reg_list, 0, sizeof(struct reg *) * (*reg_list_size));
+
+			x = 0;
+			for (i = 0; i < HEXAGON_GPR_REGS; i++)
+				(*reg_list)[x++] = hexagon_reg_current(hexa_info, i, cache);
+
+			(*reg_list)[x++] = hexagon_reg_current(hexa_info, HEXAGON_PC, cache);
+		}
         return ERROR_OK;
         
         case REG_CLASS_ALL:     
@@ -2671,7 +3734,6 @@ static int hexagon_halt(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon (target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
     int retval = ERROR_OK;
     uint64_t prev_target_state, counter=0, sys_cfg;
     bool halted = false; 
@@ -2680,7 +3742,11 @@ static int hexagon_halt(struct target *target)
     int64_t now, then = timeval_ms();
     LOG_DEBUG("hexagon_halt");
     
-    //retval = enable_dbg_sys_pwr(swddp);
+    if (hexagon->is_hexagon_untrusted == true){
+        LOG_DEBUG("There is no need to halt Q6 to perform OEMPD Debug, skipping");
+        return ERROR_OK;
+    }
+
     retval = hexagon_check_state_one(target, ISDBST_DEBUG_MODE_STATUS, &halted, &debug_thread);
     if (halted == false)
     {
@@ -2699,20 +3765,8 @@ static int hexagon_halt(struct target *target)
         {
             /* We have a halting debug event */
             target->state = TARGET_HALTED;
-            //enum target_debug_reason debug_reason = target->debug_reason;
 
-// #ifdef _VTLB_ENABLED
-            // hexagon_sync(target);
-            if (hexa_info->mmu_init)
-                if(!qurt_context->vtlb_initialized)
-                {
-                    LOG_DEBUG("hexagon_populate_vtlb_data ");
-
-                    hexagon_populate_vtlb_data(target);
-                    if(hexagon_vtlb_data.vtlb_no_of_entries > 0)
-                        qurt_context->vtlb_initialized = 1;
-                }
-// #endif
+            hexagon_memory_map_refresh(target);
                     
             LOG_DEBUG("hexagon_halt  target->debug_reason =%d",target->debug_reason);
 
@@ -2764,23 +3818,12 @@ static int hexagon_halt(struct target *target)
         sys_cfg = sys_cfg | SYSCFG_L2NRA | SYSCFG_L2NWA;
         sys_cfg = sys_cfg & ~(SYSCFG_L2WB);
         //LOG_DEBUG("Writing value in SYSCFG  = 0x%x ", sys_cfg);
-        hexagon_write_syscfg_register(target, sys_cfg);
+        /* Kept commented since we need to find why uncommenting is leading to not reaching main.*/
+        //hexagon_write_syscfg_register(target, sys_cfg);
     }
-    if (hexa_info->mmu_init)
-    {
-        if(qurt_context->vtlb_initialized > 1)
-        {
-            LOG_DEBUG("hexagon_populate_vtlb_refresh_entries");
 
-            hexagon_populate_vtlb_refresh_entries(target);
-        }
-        else
-        {
-            if(hexagon_vtlb_data.vtlb_no_of_entries > 0)
-                qurt_context->vtlb_initialized++;
-        }
-    }
-    
+    hexagon_memory_map_refresh(target);
+
     return retval;
 }
 
@@ -2803,19 +3846,20 @@ int hexagon_read_tlb_entry(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-    uint32_t isdbsts;
-    // uint64_t read_val[1][2];
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
     uint32_t read_val[1][2];
-    int retval, i=0;
+    int retval = ERROR_OK;
     uint32_t k=0;
-    uint32_t isdb_mmode_cmd = 0x184, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
     
     uint32_t stuff_inst[1][4] ={{0x7800c022,0x6c42c000,0x6700c029,0x6701c029}};
     /*stuff inst 0x7800c022-->{r2 = #1},0x6c42c000-->{r1:0 = tlbr(r2)},0x6700c029-->{isdbmbxout = r0},0x6701c029-->{isdbmbxout = r1 } */
-                                        
-    LOG_DEBUG("hexagon_read_tlb_entry Enter");
-    
+                             
+    if (qurt_context->tlb_fetched == true){
+        LOG_DEBUG("TLB entries already fetched, skipping");
+        return ERROR_OK;
+    } 
+
     hexagon_r0_used_stuff = 1;
     hexagon_r1_used_stuff = 1;
     hexagon_r2_used_stuff = 1;
@@ -2824,103 +3868,31 @@ int hexagon_read_tlb_entry(struct target *target)
             hexagon_start_time_cal_ms();
     #endif
     
-    for(k=0; k < hexa_info->config.numTlbEntries; k++)
-    {
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        }
-        // */
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[0][0] + k*0x20 );
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        hexagon_wait_loop();
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-            LOG_DEBUG("ISDBcommand failed in monitor mode retrying");
-            continue;
+    for(k=0; k < hexa_info->config.numTlbEntries; k++){
 
-            // retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            //                              hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);   
-            // isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            // if (isdb_cmd_status)
-            //         continue;
+        hexagon_isdb_cmd_status(target, stuff_inst[0][0] + k*0x20,isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
+            continue;
         }
-                
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[0][1]);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
+
+        hexagon_isdb_cmd_status(target, stuff_inst[0][1],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
             LOG_DEBUG("ISDBcommand failed in monitor mode");
             continue;
         }
                 
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[0][2]);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-                }
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            }
-    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-    
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-            LOG_DEBUG("ISDBcommand failed in monitor mode for k = %d",k);
+        hexagon_isdb_cmd_status(target, stuff_inst[0][2],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
             continue;
         }
-        while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-                
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            i++;
-            if (i==100)
-                break;
-            hexagon_wait_loop();
-        }
-                
-        i = 0;
-        if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-            LOG_DEBUG("ISDBST status not set for mailbox for k= %d",k);
+
+        retval = hexagon_poll_mbxout(target);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
             continue;
         }
-    
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                         hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &read_val[0][0]);
         if (retval != ERROR_OK) 
@@ -2928,52 +3900,15 @@ int hexagon_read_tlb_entry(struct target *target)
             LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", read_val[0][0]);
         }
                 
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    
-        /* procedure to read the second time mailbox resgiter*/
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[0][3]);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-    
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if(isdb_cmd_status)
-        {
-            LOG_DEBUG("ISDBcommand failed in monitor mode for k = %d",k);
+        hexagon_isdb_cmd_status(target, stuff_inst[0][3],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
             continue;
         }
         
-        while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    
-            i++;
-            if (i==100)
-                break;
-            hexagon_wait_loop();
-        }
-        i = 0;
-        if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-            LOG_DEBUG("ISDBST status not set for mailbox for k= %d",k);
+        retval = hexagon_poll_mbxout(target);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
             continue;
         }
     
@@ -2985,31 +3920,29 @@ int hexagon_read_tlb_entry(struct target *target)
         }
         hexagon_update_tlb_entry_in_structure(hexa_info, read_val[0][0], read_val[0][1] ,k);
     }
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            //LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", read_val[1]);
 
-    // LOG_DEBUG("Printing TLB Entries" );
     for (k=0; k < hexa_info->config.numTlbEntries; k++)
     {
         LOG_DEBUG("VA raw = 0x%x --> PA raw  = 0x%x ", \
             hexa_info->config.pTlbEntries[k].virt_tlb_raw_data, hexa_info->config.pTlbEntries[k].phys_tlb_raw_data);
 
-        LOG_DEBUG("VA = 0x%x -- 0x%x and PA = 0x%llx -- 0x%llx", \
+        LOG_DEBUG("VA = 0x%x -- 0x%x and PA = 0x%llx -- 0x%llx CCCC: %x", \
                  hexa_info->config.pTlbEntries[k].virt_add_low, hexa_info->config.pTlbEntries[k].virt_add_high, \
-                 hexa_info->config.pTlbEntries[k].phy_add_low, hexa_info->config.pTlbEntries[k].phy_add_high);
+                 hexa_info->config.pTlbEntries[k].phy_add_low, hexa_info->config.pTlbEntries[k].phy_add_high, hexa_info->config.pTlbEntries[k].CCCC);
     }
 
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
             hexagon_end_time_cal_ms();
             LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total);
     #endif
-    return ERROR_OK;
 
+    qurt_context->tlb_fetched = true;
+    
+    return ERROR_OK;
 }
 
 
-static unsigned int QURT_getPhysAddr_v2(uint64_t pg_tlblo, uint64_t pg_tlbhi)
+static unsigned int hexagon_getPhysAddr_v2(uint64_t pg_tlblo, uint64_t pg_tlbhi)
  {
     union pg_tlblo_t tlblo;
     union pg_tlbhi_t tlbhi;
@@ -3106,7 +4039,7 @@ static void  hexagon_update_tlb_entry_in_structure(struct hexagon_arch_info *hex
     }
     tlblo.raw = tlb_phy;
     tlbhi.raw = tlb_virtual;
-    hexa_info->config.pTlbEntries[index].phy_page = QURT_getPhysAddr_v2(tlb_phy, tlb_virtual);
+    hexa_info->config.pTlbEntries[index].phy_page = hexagon_getPhysAddr_v2(tlb_phy, tlb_virtual);
     hexa_info->config.pTlbEntries[index].virt_page = VIRT_PAGE(tlb_virtual);
     virt_add = hexa_info->config.pTlbEntries[index].virt_page << 12;
     phy_add  = hexa_info->config.pTlbEntries[index].phy_page << 12;
@@ -3123,7 +4056,7 @@ static void  hexagon_update_tlb_entry_in_structure(struct hexagon_arch_info *hex
     mask = get_phys_mask(tlb_phy);
     hexa_info->config.pTlbEntries[index].virt_tlb_raw_data = tlb_virtual;
     hexa_info->config.pTlbEntries[index].phys_tlb_raw_data = tlb_phy;
-    hexa_info->config.pTlbEntries[index].phy_page = QURT_getPhysAddr_v2(tlblo.raw, tlbhi.raw );
+    hexa_info->config.pTlbEntries[index].phy_page = hexagon_getPhysAddr_v2(tlblo.raw, tlbhi.raw );
     hexa_info->config.pTlbEntries[index].virt_page = VIRT_PAGE(tlb_virtual);
     
     hexa_info->config.pTlbEntries[index].asid = ASID(tlb_virtual);
@@ -3196,76 +4129,250 @@ static void  hexagon_update_tlb_entry_in_structure(struct hexagon_arch_info *hex
         hexa_info->config.pTlbEntries[index].virt_add_low,hexa_info->config.pTlbEntries[index].virt_add_high,hexa_info->config.pTlbEntries[index].phy_add_low,hexa_info->config.pTlbEntries[index].phy_add_high);
 }
 
-
-static int hexagon_dump_hwthrd_reg(struct target *target, uint32_t hwthrd)
+static void hexagon_log_register(const char *thread_name, const char *reg_name, uint8_t *val, int bits)
 {
-    struct hexagon_common *hexagon = target_to_hexagon(target);
-    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    
-    struct reg_cache *cache;
-    uint64_t  i;
-    uint64_t current_pc_thread_select;
-
-    if (hwthrd == hexa_info->config.maxHwThreads)
+    if (bits == 32)
     {
-        /* dump registers for all Hw thread */
-        cache = hexa_info->core_cache;
-        while (cache->next != NULL)
-        {
-            for (i = 0; i < HEXAGON_PER_THREAD_REGS ; i++)
-            {
-                current_pc_thread_select = *((uint64_t *)cache->reg_list[41].value);
-                
-            #ifdef BREAKPOINT_THREAD_SELECT
-                if (((unsigned int)current_pc_thread_select == (unsigned int)hexa_info->breakpoint_address_thread_select))
-                {   
-                    hexa_info->thread_id_thread_select = *((uint64_t *)cache->reg_list[72].value);
-
-                }
-            #endif
-                LOG_DEBUG("%s : %s = 0x%x", cache->name, 
-                    cache->reg_list[i].name, *(cache->reg_list[i].value));
-            }
-            cache = cache->next;
-        }
-
-        /* dump the global registers */
-        for (i = 0; i < HEXAGON_GLOBAL_REGS ; i++)
-        {
-            LOG_DEBUG("%s : %s = 0x%x", cache->name, 
-                cache->reg_list[i].name, *(cache->reg_list[i].value));
-        }
+        LOG_DEBUG("%s : %s = 0x%08x", thread_name, reg_name, *(uint32_t *)val);
+    }
+    else if (bits == 64)
+    {
+        LOG_DEBUG("%s : %s = 0x%016llx", thread_name, reg_name, *(uint64_t *)val);
+    }
+    else if (bits == 128)
+    {
+        LOG_DEBUG("%s : %s = 0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                  thread_name, reg_name,
+                  val[15], val[14], val[13], val[12],
+                  val[11], val[10], val[9], val[8],
+                  val[7], val[6], val[5], val[4],
+                  val[3], val[2], val[1], val[0]);
     }
     else
     {
-        /* dump registers for the requested Hw thread */
-        cache = hexa_info->core_cache;
-        i= 0;
-        while ((cache != NULL) && i < hwthrd)
-        {
-            cache = cache->next;
-            i++;
-        }
-        
-        for (i = 0; i < HEXAGON_PER_THREAD_REGS ; i++)
-        {
-            LOG_DEBUG("%s : %s = 0x%x", cache->name, 
-                cache->reg_list[i].name, *(cache->reg_list[i].value));
-        }            
+        LOG_DEBUG("%s : %s = [Unsupported width: %d bits]", thread_name, reg_name, bits);
     }
-    LOG_DEBUG("exiting hexagon_dump_hwthrd_reg");
-    return ERROR_OK;    
 }
-#if 1
+
+static int hexagon_dump_hwthrd_reg(struct target *target)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+
+    struct reg_cache *cache, *global_cache = NULL;
+    uint64_t i;
+    const char *hw_thread_prefix = "HW-Thrd-";
+    size_t prefix_len = sizeof("HW-Thrd-") - 1;
+
+    /* 1) Query active thread bitmask once */
+    int active_mask = get_active_threads(target); /* bit i set => thread i is active */
+
+    /* 2) Iterate caches; remember GLOBAL node, skip inactive threads */
+    cache = hexa_info->core_cache;
+    while (cache != NULL) {
+        /* Detect GLOBAL cache by name and remember it (stop per-thread loop) */
+        if (strcmp(cache->name,
+                   hexa_info->config.pThreadNameArray[hexa_info->config.maxHwThreads]) == 0) {
+            global_cache = cache;
+            break;
+        }
+        int thrd_idx = -1;
+
+        /* Parse "HW-Thrd-<index>" robustly (supports index >= 10) */
+        if (!strncmp(cache->name, hw_thread_prefix, prefix_len)) {
+            thrd_idx = atoi(cache->name + prefix_len);  // robust for multi-digit indices
+        }
+
+        /* Skip if we have a valid thread index and it's inactive */
+        if (thrd_idx >= 0) {
+            if ((active_mask & (1 << thrd_idx)) == 0) {
+                cache = cache->next;
+                continue; /* inactive -> do not log its registers */
+            }
+        }
+
+        /* Dump registers for this active thread */
+        for (i = 0; i < HEXAGON_PER_THREAD_REGS; i++) {
+            hexagon_log_register(cache->name,
+                                 cache->reg_list[i].name,
+                                 cache->reg_list[i].value,
+                                 cache->reg_list[i].size);
+        }
+
+        cache = cache->next;
+    }
+
+    /* 3) Dump GLOBAL registers safely */
+    if (global_cache != NULL) {
+        for (i = 0; i < HEXAGON_GLOBAL_REGS; i++) {
+            hexagon_log_register(global_cache->name,
+                                 global_cache->reg_list[i].name,
+                                 global_cache->reg_list[i].value,
+                                 global_cache->reg_list[i].size);
+        }
+    }else{
+        LOG_WARNING("GLOBAL reg_cache not found; skipping global register dump");
+    }
+
+    LOG_DEBUG("exiting hexagon_dump_hwthrd_reg");
+    return ERROR_OK;
+}
+
+void print_active_threads(struct target *target){
+    uint32_t active_threads;
+
+    active_threads = get_active_threads(target);
+    LOG_DEBUG("Active threads =  0x%x", active_threads);
+
+}
+
+int get_active_threads(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdbst, active_threads;
+    int retval;
+
+    if (hexa_info->isdbver == HEXAGON_V81){
+
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                hexa_info->debug_base + HEXAGON_ISDB_ISDBST1, &isdbst);
+
+        if (retval != ERROR_OK) 
+        {
+            LOG_ERROR("HEXAGON_ISDB_ISDBST read failed 0x%x", isdbst);
+            return ERROR_OK;
+        }
+
+        active_threads = isdbst & ISDBST1_OFF_MODE_STATUS;
+    }
+    else{
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbst);
+
+        if (retval != ERROR_OK) 
+        {
+            LOG_ERROR("HEXAGON_ISDB_ISDBST read failed 0x%x", isdbst);
+            return ERROR_OK;
+        }
+        active_threads = (isdbst & ISDBST_OFF_MODE_STATUS) >> ISDBST_OFF_MODE_STATUS_SHIFT;
+    }
+
+    return active_threads;
+}
+
+void print_debug_threads(struct target *target){
+    uint32_t debug_threads;
+
+    debug_threads = get_debug_threads(target);
+    LOG_DEBUG("Debug threads =  0x%x", debug_threads);
+
+}
+
+int get_debug_threads(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdbst, debug_threads;
+    int retval;
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbst);
+
+    if (retval != ERROR_OK) 
+    {
+        LOG_ERROR("HEXAGON_ISDB_ISDBST read failed 0x%x", isdbst);
+        return ERROR_OK;
+    }
+
+    debug_threads = (isdbst & ISDBST_DEBUG_MODE_STATUS) >> ISDBST_DEBUG_MODE_STATUS_SHIFT;
+    return debug_threads;
+}
+
+void print_wait_run_threads(struct target *target){
+    uint32_t wait_run_threads;
+
+    wait_run_threads = get_wait_run_threads(target);
+    LOG_DEBUG("Wait_Run threads =  0x%x", wait_run_threads);
+
+}
+
+int get_wait_run_threads(struct target *target){
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t isdbst, wait_run_threads;
+    int retval;
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbst);
+
+    if (retval != ERROR_OK) 
+    {
+        LOG_ERROR("HEXAGON_ISDB_ISDBST read failed 0x%x", isdbst);
+        return ERROR_OK;
+    }
+
+    wait_run_threads = (isdbst & ISDBST_WAITRUN_MODE_STATUS) >> ISDBST_WAITRUN_MODE_STATUS_SHIFT;
+    return wait_run_threads;
+}
+
+int hexagon_read_gpr_for_hwthrd(struct target *target, uint32_t hwthrd_mask)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    struct reg_cache *cache;
+    int retval, reg;
+    uint32_t hwthrd, maxhwt, isdb_mmode_cmd;
+
+    cache = hexa_info->core_cache;
+    maxhwt = hexa_info->config.maxHwThreads;
+
+    /* restore GPR register for specific Hw thread */
+    for ( hwthrd = 0; hwthrd < maxhwt; hwthrd++, cache = cache->next){
+        if (hwthrd_mask & (1<<hwthrd)){
+
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwthrd));
+            for(reg = 0; reg < HEXAGON_GPR_REGS; reg++){
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_gpr_read[reg],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed in user mode; retval =  %d", retval);
+                    return retval;
+                }
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
+                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                    cache->reg_list[reg].valid = false;
+                    continue;
+                }
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwthrd][reg]));
+                if (retval != ERROR_OK) {
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwthrd][reg]);
+                    return retval;
+                }
+                // Cast to uint8_t * to match the type of cache->reg_list[j].value 
+                cache->reg_list[reg].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwthrd][reg];
+                cache->reg_list[reg].valid = true;
+
+                #ifdef  _DEBUG_HEXAGON_
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+                LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, hwthrd, reg);
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexa_info->pPerHwThrdReg[hwthrd][reg]);
+                #endif
+            }
+        }
+    }
+
+    return ERROR_OK;
+}
+
 /** Read registers of the the current context **/
 int hexagon_read_gpr_registers(struct target *target, uint32_t hwthrd)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     struct reg_cache *cache;
-    int retval,j,k=0, loop,x;
-    uint32_t isdb_mmode_cmd,isdb_cmd_status,isdbsts, i=0;
+    int retval, maxhwt, hwt, reg;
+    uint32_t active_threads;
+    uint32_t isdb_mmode_cmd;
     
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_gpr_registers entry - hw thrd: %d", hwthrd);
@@ -3275,116 +4382,45 @@ int hexagon_read_gpr_registers(struct target *target, uint32_t hwthrd)
         hexagon_start_time_cal_ms();
     #endif
 
+    active_threads = get_active_threads(target);
+
     cache = hexa_info->core_cache;
-    if (hwthrd == hexa_info->config.maxHwThreads)
-    {
-        loop = hexa_info->config.maxHwThreads;
-        i = 0;
-    }
-    else
-    {
-        loop = 1;
-        i= 0;
-        while ((cache != NULL) && i < hwthrd)
-        {
-            cache = cache->next;
-            i++;
-        }
-    }
+    maxhwt = hexa_info->config.maxHwThreads;
     
-        /* Get registers per Hw thread */
-    for (x = 0; x < loop && cache != NULL; x++, i++, cache=cache->next)
-    {
-        /* pack the ISDB command for the relevant Hw thread */
-        isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
-                                                    ISDBCMD_TNUM_MASK_THREAD(i));
-        #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("hexagon_read_gpr_registers  isdb_mmode_cmd = %d and i = %d", isdb_mmode_cmd, i);
-        #endif
-    
-        for (j = 0; j < HEXAGON_GPR_REGS; j++)
-        {
-            /* monitor  mode */
-            // /*    
-            retval = enable_dbg_sys_pwr(swddp);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-            } 
-            // */
-            
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_gpr_read[j]);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            }
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            }
+    /* Get registers per Hw thread */
+    for(hwt = 0; (hwt < maxhwt) && (cache != NULL); hwt++, cache= cache->next){
 
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-            
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK) 
-            {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-            }
+        if((1<<hwt) & active_threads){  // if the thread is on, then only read its local registers
 
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwt));
 
-            /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-
-            if (isdb_cmd_status)
-            {
-                    LOG_DEBUG("ISDBcommand failed in user mode");
+            for(reg = 0; reg < HEXAGON_GPR_REGS; reg++){
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_gpr_read[reg],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed in user mode; retval =  %d", retval);
                     return ERROR_OK;
-            }
-            else
-                {
-                while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                    hexagon_wait_loop();
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDB status read for Mboxout %d time", j);
-                    #endif
-                    
-                    k++;
-                    if (k==10)
-                        break;
                 }
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
-                #endif
 
-                k = 0;
-                if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
-                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", j);
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
+                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                    cache->reg_list[reg].valid = false;
                     continue;
                 }
-
-
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[x][j]));
-                if (retval != ERROR_OK) 
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[x][j]);
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwt][reg]));
+                if (retval != ERROR_OK) {
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwt][reg]);
                 }
 
                 // Cast to uint8_t * to match the type of cache->reg_list[j].value 
-                cache->reg_list[j].value = (uint8_t *) &hexa_info->pPerHwThrdReg[x][j];
-                cache->reg_list[j].valid = true;
-            
-                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+                cache->reg_list[reg].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwt][reg];
+                cache->reg_list[reg].valid = true;
 
                 #ifdef  _DEBUG_HEXAGON_
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
                 LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
                 LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexa_info->pPerHwThrdReg[x][j]);
                 #endif
@@ -3404,19 +4440,111 @@ int hexagon_read_gpr_registers(struct target *target, uint32_t hwthrd)
     
     return ERROR_OK;
 }
-#endif
 
+
+/**
+ * @brief Read Hexagon control registers for the hardware thread(s) selected.
+ *
+ * This function refreshes all valid Hexagon control registers (SA0–CTRL_MAX,
+ * excluding reserved registers such as C5 and C20–C29) for each hardware thread
+ * whose bit is set in `hwthrd_mask`.
+ *
+ * It is typically used after a single-step operation to restore only the control
+ * registers of the stepped thread, instead of reading all threads' registers.
+ *
+ *
+ * The function:
+ *  - Packs an ISDB STUFF command for each selected hardware thread
+ *  - Executes the appropriate STUFF instruction sequence to read each control register
+ *  - Polls mailbox-out for read completion
+ *  - Updates the per-thread register cache (`reg_list[reg]`)
+ *
+ * @param target        Pointer to the OpenOCD target instance.
+ * @param hwthrd_mask   Bitmask specifying which hardware thread(s) to read.
+ *                      (bit N set ⇒ read registers for thread N)
+ *
+ * @return ERROR_OK on success; ERROR_FAIL if any ISDB command fails.
+ */
+
+int hexagon_read_ctrl_regs_for_hwthrd(struct target *target, uint32_t hwthrd_mask)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    struct reg_cache *cache;
+    int retval, reg;
+    uint32_t isdb_mmode_cmd, maxhwt, hwthrd;
+
+    cache = hexa_info->core_cache;
+    maxhwt = hexa_info->config.maxHwThreads;
+
+    /* restore ctrl registers for specific Hw thread */
+    for(hwthrd = 0; hwthrd < maxhwt; hwthrd++, cache = cache->next){
+
+        if (hwthrd_mask & (1<<hwthrd)){
+
+            /* pack the ISDB command for the relevant Hw thread */
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwthrd));
+
+            /* Mark r7 as dirty as it is being used for stuff instruction */
+            cache->reg_list[HEXAGON_R7].dirty = true;
+
+            for(reg = HEXAGON_SA0; reg < HEXAGON_CTRL_MAX; reg++){
+                if ((reg == HEXAGON_C5_RESRV) || (reg >= HEXAGON_C20_RESRV && reg <= HEXAGON_C29_RESRV)){
+                    continue;
+                }
+
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][0],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][0], retval);
+                    return retval;
+                }
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][1],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][1], retval);
+                    return retval;
+                }
+
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
+                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                    cache->reg_list[reg].valid = false;
+                    continue;
+                }
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwthrd][reg]));
+                if (retval != ERROR_OK) {
+                    LOG_ERROR("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwthrd][reg]);
+                    return retval;
+                }
+
+                // Cast to uint8_t * to match the type of cache->reg_list[j].value 
+                cache->reg_list[reg].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwthrd][reg];
+                cache->reg_list[reg].valid = true;
+
+
+                #ifdef  _DEBUG_HEXAGON_
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+                LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexagon->pPerHwThrdReg[x][j]);
+                #endif
+            }
+        }
+    }
+
+    return ERROR_OK;
+
+}
 
 /** Read registers of the the current context **/
 int hexagon_read_ctrl_registers(struct target *target, uint32_t hwthrd)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     struct reg_cache *cache;
-    int retval, j, k,l=0, x, loop;
-    uint32_t isdbsts,i=0;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    int retval;
+    uint32_t isdb_mmode_cmd, active_threads, maxhwt, hwt, reg;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_ctrl_registers entry - hw thrd: %d", hwthrd);
@@ -3425,165 +4553,63 @@ int hexagon_read_ctrl_registers(struct target *target, uint32_t hwthrd)
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
         hexagon_start_time_cal_ms();
     #endif
-    
+
+    active_threads = get_active_threads(target);
+
     cache = hexa_info->core_cache;
-    if (hwthrd == hexa_info->config.maxHwThreads)
-    {
-        loop = hexa_info->config.maxHwThreads;
-        i = 0;
-    }
-    else
-    {
-        loop = 1;
-        i= 0;
-        while ((cache != NULL) && i < hwthrd)
-        {
-            cache = cache->next;
-            i++;
-        }
-    }
+    maxhwt = hexa_info->config.maxHwThreads;
 
-        /* Get per Hw thread control registers */
-    for (x = 0; x < loop && cache != NULL; x++, i++, cache=cache->next)
-    {
-        /* pack the ISDB command for the relevant Hw thread */
-        isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
-                                                    ISDBCMD_TNUM_MASK_THREAD(i));
-        #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("hexagon_read_ctrl_registers  isdb_mmode_cmd = %d and i = %d", isdb_mmode_cmd, i);
-        #endif
-        /* Mark r7 as dirty as it is being used for stuff instruction */
-        cache->reg_list[HEXAGON_R7].dirty = true;
-        
-        //k = 0;
-        for (j = HEXAGON_SA0, k = 0; j < HEXAGON_CTRL_MAX; j++, k++)
-        {
+    /* Get per Hw thread control registers */
+    for(hwt = 0; (hwt < maxhwt) && (cache != NULL); hwt++, cache = cache->next){
 
-            if ((j == HEXAGON_C5_RESRV) || (j >= HEXAGON_C20_RESRV && j <= HEXAGON_C29_RESRV))
-            {
-            //k++;
-                continue;
-            }
+        if((1<<hwt) & active_threads){  // if the thread is on, then only read its local registers
 
-            
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_ctrl_reg_read[k][0]);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            }
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD_CDSP return value is not OK");
-            }
+            /* pack the ISDB command for the relevant Hw thread */
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwt));
 
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-            
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-            }
+            /* Mark r7 as dirty as it is being used for stuff instruction */
+            cache->reg_list[HEXAGON_R7].dirty = true;
 
+            for(reg = HEXAGON_SA0; reg < HEXAGON_CTRL_MAX; reg++){
+                if ((reg == HEXAGON_C5_RESRV) || (reg >= HEXAGON_C20_RESRV && reg <= HEXAGON_C29_RESRV)){
+                    continue;
+                }
 
-            /* 0 - cmd sucessfull, 1 - failure */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            if (isdb_cmd_status)
-            {
-                    LOG_DEBUG("ISDBcommand failed in Monitor mode");
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][0],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][0], retval);
                     return ERROR_OK;
-            }
-            else
-            {
-                /*there are 2 stuff instruction here programming second inst */
-                // /*
-                retval = enable_dbg_sys_pwr(swddp);
+                }
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][1],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_ctrl_reg_read[reg-HEXAGON_SA0][1], retval);
+                    return ERROR_OK;
+                }
+
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
+                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                    cache->reg_list[reg].valid = false;
+                    continue;
+                }
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwt][reg]));
                 if (retval != ERROR_OK) {
-                    LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                }
-                // */
-
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_ctrl_reg_read[k][1]);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwt][reg]);
                 }
 
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-                }
+                // Cast to uint8_t * to match the type of cache->reg_list[j].value 
+                cache->reg_list[reg].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwt][reg];
+                cache->reg_list[reg].valid = true;
 
-                /* wait till the stuff instruction is executed */
-                hexagon_wait_loop();
-                            
+
+                #ifdef  _DEBUG_HEXAGON_
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                         hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                    LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                }
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
+                LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexagon->pPerHwThrdReg[x][j]);
                 #endif
-                
-                /* 0 - cmd success, 1 - cmd failure */ 
-                isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-                if (isdb_cmd_status)
-                {
-                        LOG_DEBUG("ISDBcommand failed in Monitor mode");
-                        return ERROR_OK;
-                }
-                else
-                {            
-                    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                        hexagon_wait_loop();
-                        #ifdef  _DEBUG_HEXAGON_
-                        LOG_DEBUG("ISDB status read for Mboxout %d time", j);
-                        #endif
-                            
-                        l++;
-                        if (l==10)
-                            break;
-                    }
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
-                    #endif
-
-                    l = 0;
-                    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", j);
-                        continue;
-                    }
-
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[x][j]));
-                    if (retval != ERROR_OK) 
-                    {
-                        LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT_CDSP read failed 0x%x", hexa_info->pPerHwThrdReg[x][j]);
-                    }
-
-                    // Cast to uint8_t * to match the type of cache->reg_list[j].value 
-                    cache->reg_list[j].value = (uint8_t *)&(hexa_info->pPerHwThrdReg[x][j]);
-                    cache->reg_list[j].valid = true;
-                        
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexagon->pPerHwThrdReg[x][j]);
-                    #endif
-                }
             }
 
         }
@@ -3597,7 +4623,6 @@ int hexagon_read_ctrl_registers(struct target *target, uint32_t hwthrd)
     LOG_DEBUG("hexagon_read_ctrl_registers exit - hw thrd: %d", hwthrd);
     #endif
 
-    
     return ERROR_OK;
         
 }
@@ -3607,184 +4632,73 @@ int hexagon_read_mmode_registers(struct target *target, uint32_t hwthrd)
 {
     struct hexagon_common    *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     struct reg_cache *cache;
-    int retval , j, k,l=0, x, loop;
-    uint32_t isdbsts,i=0;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    int retval;
+    uint32_t isdb_mmode_cmd, active_threads, maxhwt, hwt, reg;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_mmode_registers entry - hw thrd: %d", hwthrd);
     #endif
 
-    
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
         hexagon_start_time_cal_ms();
     #endif
 
+    active_threads = get_active_threads(target);
+
     cache = hexa_info->core_cache;
-    if (hwthrd == hexa_info->config.maxHwThreads)
-    {
-        loop = hexa_info->config.maxHwThreads;
-        i = 0;
-    }
-    else
-    {
-        loop = 1;
-        i= 0;
-        while ((cache != NULL) && i < hwthrd)
-        {
-            cache = cache->next;
-            i++;
-        }
-    }
+    maxhwt = hexa_info->config.maxHwThreads;
+
     /* Get per Hw thread control registers */
-    for (x = 0; x < loop && cache != NULL; x++, i++, cache=cache->next)
-    {
-        /* pack the ISDB command for the relevant Hw thread */
-        isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
-                                ISDBCMD_TNUM_MASK_THREAD(i));
-        #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("hexagon_read_mmode_registers  isdb_mmode_cmd = %d and i = %d", isdb_mmode_cmd, i);
-        #endif
-        /* Mark r7 as dirty as it is being used for stuff instruction */
-        cache->reg_list[HEXAGON_R7].dirty = true;
+    for(hwt = 0; (hwt < maxhwt) && (cache != NULL); hwt++, cache = cache->next){
+
+        if((1<<hwt) & active_threads){  // if the thread is on, then only read its local registers
+
+            /* pack the ISDB command for the relevant Hw thread */
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwt));
             
-        for (j = HEXAGON_SGP0, k = 0; j < HEXAGON_MMODE_PERTHRD_MAX; j++, k++)
-        {
-            if (j >= HEXAGON_S12_RESRV && j <= HEXAGON_S15_RESRV)
-            {
-                continue;
-            }
-            /* Monitor mode */
-            // /*
-            retval = enable_dbg_sys_pwr(swddp);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-            }
-            // */
-    
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_mmode_reg_read[k][0]);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            }
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            }
+            /* Mark r7 as dirty as it is being used for stuff instruction */
+            cache->reg_list[HEXAGON_R7].dirty = true;
 
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-            
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-            }
-
-
-            /* 0 - cmd sucessfull, 1 - failure */
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            if (isdb_cmd_status)
-            {
-                 LOG_DEBUG("ISDBcommand failed in Monitor mode");
-                 return ERROR_OK;
-            }
-            else
-            {
-                /*there are 2 stuff instruction here programming second inst */
-                // /*
-                retval = enable_dbg_sys_pwr(swddp);
-                if (retval != ERROR_OK) {
-                    LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                }
-                // */
-
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                          hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_mmode_reg_read[k][1]);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+            for(reg = HEXAGON_SGP0; reg < HEXAGON_MMODE_PERTHRD_MAX; reg++){
+                if (reg >= HEXAGON_S12_RESRV && reg <= HEXAGON_S15_RESRV){
+                    continue;
                 }
 
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_mmode_reg_read[reg-HEXAGON_SGP0][0],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_mmode_reg_read[reg-HEXAGON_SGP0][0], retval);
+                    return ERROR_OK;
+                }
+                retval = hexagon_isdb_cmd_status(target, stuff_inst_mmode_reg_read[reg-HEXAGON_SGP0][1],isdb_mmode_cmd);
+                if (retval != ERROR_OK){
+                    LOG_ERROR("ISDBcommand failed for instruction: 0x%x; retval =  %d", stuff_inst_mmode_reg_read[reg-HEXAGON_SGP0][1], retval);
+                    return ERROR_OK;
                 }
 
-                /* wait till the stuff instruction is executed */
-                hexagon_wait_loop();
-                            
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
+                    LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                    cache->reg_list[reg].valid = false;
+                    continue;
+                }
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwt][reg]));
+                if (retval != ERROR_OK) {
+                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwt][reg]);
                 }
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
-                #endif
-                
-                    /* 0 - cmd success, 1 - cmd failure */ 
-                    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-                if (isdb_cmd_status)
-                {
-                     LOG_DEBUG("ISDBcommand failed in monitor  mode");
-                     return ERROR_OK;
-                }
-                else
-                {            
-                    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
 
-                        hexagon_wait_loop();
-
-                        #ifdef  _DEBUG_HEXAGON_
-                        LOG_DEBUG("ISDB status read for Mboxout %d time", j);
-                        #endif
-                            
-                        l++;
-                        if (l==10)
-                            break;
-                    }
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
-                    #endif
-
-                    l = 0;
-                    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", j);
-                        continue;
-                    }
-
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[x][j]));
-                    if (retval != ERROR_OK) 
-                    {
-                        LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[x][j]);
-                    }
-
-                    // Cast to uint8_t * to match the type of cache->reg_list[j].value 
-                    cache->reg_list[j].value = (uint8_t *)&hexa_info->pPerHwThrdReg[x][j];
-                    cache->reg_list[j].valid = true;    
+                // Cast to uint8_t * to match the type of cache->reg_list[j].value 
+                cache->reg_list[reg].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwt][reg];
+                cache->reg_list[reg].valid = true;
                         
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexa_info->pPerHwThrdReg[x][j]);
-                    #endif
-                }
+                #ifdef  _DEBUG_HEXAGON_
+                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+                LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, x, j);
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", hexa_info->pPerHwThrdReg[x][j]);
+                #endif
             }
         }
     }
@@ -3808,11 +4722,9 @@ int hexagon_read_imask_register(struct target *target, uint32_t hwthrd)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     struct reg_cache *cache;
-    int retval, k,l=0, x, loop;
-    uint32_t isdbsts,i=0;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    int retval;
+    uint32_t isdb_mmode_cmd, active_threads, maxhwt, hwt;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_imask_register entry - hw thrd: %d", hwthrd);
@@ -3822,206 +4734,56 @@ int hexagon_read_imask_register(struct target *target, uint32_t hwthrd)
         hexagon_start_time_cal_ms();
     #endif
 
-    
+    active_threads = get_active_threads(target);    
     
     cache = hexa_info->core_cache;
-    if (hwthrd == hexa_info->config.maxHwThreads)
-    {
-        loop = hexa_info->config.maxHwThreads;
-        k = 0;
-    }
-    else
-    {
-        loop = 1;
-        i= 0;
-        while ((cache != NULL) && i < hwthrd)
-        {
-            cache = cache->next;
-            i++;
-        }
-        k = i;
-    }
+    maxhwt = hexa_info->config.maxHwThreads;
 
     /* Get per Hw thread control registers */
-    for (x = 0, k = 0; x < loop && cache != NULL; x++, cache=cache->next, k++)
-    {
-        /* pack the ISDB command for the relevant Hw thread */
-        isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
-                        ISDBCMD_TNUM_MASK_THREAD(k));
-        //LOG_DEBUG("hexagon_read_imask_register  isdb_mmode_cmd = %d and i = %d", isdb_mmode_cmd, k);
-        /* Monitor mode */
-        // /*
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        }
-        // */
-        
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_mmode_imask_reg_read[k][0]);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
+    for(hwt = 0; (hwt < maxhwt) && (cache != NULL); hwt++, cache = cache->next){
 
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-        
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
+        if((1<<hwt) & active_threads){  // if the thread is on, then only read its local registers
 
+            isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF,ISDBCMD_MONITOR_LVL,
+                                                        ISDBCMD_TNUM_MASK_THREAD(hwt));           
 
-        /* 0 - cmd sucessfull, 1 - failure */
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in Monitor mode");
-             return ERROR_OK;
-        }
-        else
-        {
-            /*there are 2 stuff instruction here programming second inst */
-            // /*
-            retval = enable_dbg_sys_pwr(swddp);
+            retval = hexagon_isdb_cmd_status(target, stuff_inst_mmode_imask_reg_read[hwt][0],isdb_mmode_cmd);
+            if (retval != ERROR_OK){
+                LOG_ERROR("ISDBcommand failed in Monitor mode; retval =  %d", retval);
+                return retval;
+            }
+            retval = hexagon_isdb_cmd_status(target, stuff_inst_mmode_imask_reg_read[hwt][1],isdb_mmode_cmd);
+            if (retval != ERROR_OK){
+                LOG_ERROR("ISDBcommand failed  in Monitor mode; retval =  %d", retval);
+                return retval;
+            }
+            retval = hexagon_isdb_cmd_status(target, stuff_inst_mmode_imask_reg_read[hwt][2],isdb_mmode_cmd);
+            if (retval != ERROR_OK){
+                LOG_ERROR("ISDBcommand failed in Monitor mode; retval =  %d", retval);
+                return retval;
+            }
+
+            retval = hexagon_poll_mbxout(target);
+            if (retval != ERROR_OK){
+                LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it");
+                continue;
+            }
+            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                    hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &(hexa_info->pPerHwThrdReg[hwt][HEXAGON_IMASK]));
             if (retval != ERROR_OK) {
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-            }
-            // */
-
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                      hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_mmode_imask_reg_read[k][1]);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[hwt][HEXAGON_IMASK]);
             }
 
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            }
+            // Cast to uint8_t * to match the type of cache->reg_list[HEXAGON_IMASK].value 
+            cache->reg_list[HEXAGON_IMASK].value = (uint8_t *) &hexa_info->pPerHwThrdReg[hwt][HEXAGON_IMASK];
+                    
 
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-                        
+            #ifdef  _DEBUG_HEXAGON_
             retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                     hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-            }
-            #ifdef  _DEBUG_HEXAGON_
-            LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
+            LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, k, HEXAGON_IMASK);
+            LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", gpPerHwThrdReg[k][HEXAGON_IMASK]);
             #endif
-            
-            /* 0 - cmd success, 1 - cmd failure */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            if (isdb_cmd_status)
-            {
-                 LOG_DEBUG("ISDBcommand failed in monitor mode");
-                 return ERROR_OK;
-            }
-            else
-            {
-
-                /*there are 3 stuff instruction here programming second inst */
-                // /*    
-                retval = enable_dbg_sys_pwr(swddp);
-                if (retval != ERROR_OK) {
-                    LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                } 
-                // */
-
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                          hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_mmode_imask_reg_read[k][2]);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-                }
-
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-                }
-
-                /* wait till the stuff instruction is executed */
-                hexagon_wait_loop();
-                            
-                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                }
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
-                #endif
-                
-                /* 0 - cmd success, 1 - cmd failure */ 
-                isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-                if (isdb_cmd_status)
-                {
-                     LOG_DEBUG("ISDBcommand failed in monitor mode");
-                     return ERROR_OK;
-                }
-                else
-                {
-                    while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                        hexagon_wait_loop();
-                        #ifdef  _DEBUG_HEXAGON_
-                        LOG_DEBUG("ISDB status read for Mboxout %d time", x);
-                        #endif
-                            
-                        l++;
-                        if (l==10)
-                            break;
-                    }
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, k, HEXAGON_IMASK);
-                    #endif
-
-                    l = 0;
-                    if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                    {
-                        LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", HEXAGON_IMASK);
-                        continue;
-                    }
-
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &hexa_info->pPerHwThrdReg[k][HEXAGON_IMASK]);
-                    if (retval != ERROR_OK) 
-                    {
-                        LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", hexa_info->pPerHwThrdReg[k][HEXAGON_IMASK]);
-                    }
-
-                // Cast to uint8_t * to match the type of cache->reg_list[HEXAGON_IMASK].value 
-                cache->reg_list[HEXAGON_IMASK].value = (uint8_t *) &hexa_info->pPerHwThrdReg[k][HEXAGON_IMASK];
-                    
-                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x, thrd = %d, reg = %d", isdbsts, k, HEXAGON_IMASK);
-                LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", gpPerHwThrdReg[k][HEXAGON_IMASK]);
-                #endif
-            }
-            }
         }
     }
 
@@ -4033,52 +4795,18 @@ int hexagon_read_imask_register(struct target *target, uint32_t hwthrd)
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_imask_register exit - hw thrd: %d", hwthrd);
     #endif
-
     
     return ERROR_OK;    
 }
-
-
-static int hexagon_restore_stuff_used_reg(struct target *target)
-{
-    struct hexagon_common *hexagon = target_to_hexagon(target);
-    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct reg_cache *cache;
-    int i=0;
-
-    
-    LOG_DEBUG("hexagon_restore_stuff_used_reg");
-    
-    i= 0;
-    cache = hexa_info->core_cache;
-    while (cache != NULL)
-    {
-        /* check whether R7 is being used for stuff instruction */
-        if (cache->reg_list[HEXAGON_R7].dirty == true)
-        {
-            LOG_DEBUG("Writing modifed R7");
-        
-            hexagon_write_core_reg(target, HEXAGON_R7, i, *((uint64_t*)cache->reg_list[HEXAGON_R7].value));
-            cache->reg_list[HEXAGON_R7].dirty = false;
-        }
-            cache = cache->next;
-            i++;
-    }
-
-    
-    return ERROR_OK;
-}
-
 
 /** Read registers of the the current context **/
 int hexagon_read_global_ctrl_registers(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     struct reg_cache *cache;
-    int retval ,j,l=0, x;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status,isdbsts;
+    int retval ,j, x;
+    uint32_t isdb_mmode_cmd;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_read_global_ctrl_registers  entry");
@@ -4111,114 +4839,26 @@ int hexagon_read_global_ctrl_registers(struct target *target)
             continue;
         }
 
-        /* Monitor mode */
-        // /*
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        } 
-        // */
-        
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_global_reg_read[j][0]);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
+        retval = hexagon_isdb_cmd_status(target, stuff_inst_global_reg_read[j][0],isdb_mmode_cmd);
 
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-        
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
         if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-
-
-        /* 0 - cmd sucessfull, 1 - failure */
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
         {
              LOG_DEBUG("ISDBcommand failed in Monitor mode");
              return ERROR_OK;
         }
         else
         {
-            /*there are 2 stuff instruction here programming second inst */
-            // /*
-            retval = enable_dbg_sys_pwr(swddp);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-            } 
-            // */
+            retval = hexagon_isdb_cmd_status(target, stuff_inst_global_reg_read[j][1],isdb_mmode_cmd);
 
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                      hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_global_reg_read[j][1]);
             if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            }
-
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            }
-
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-                        
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-            }
-            #ifdef  _DEBUG_HEXAGON_
-            LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
-            #endif
-            
-            /* 0 - cmd success, 1 - cmd failure */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            if (isdb_cmd_status)
             {
                  LOG_DEBUG("ISDB command failed in monitor mode");
                  return ERROR_OK;
             }
             else
             {            
-                while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-
-                    hexagon_wait_loop();
-
-                    #ifdef  _DEBUG_HEXAGON_
-                    LOG_DEBUG("ISDB status read for Mboxout %d time", x);
-                    #endif
-                        
-                    l++;
-                    if (l==10)
-                        break;
-                }
-
-                #ifdef  _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, reg = %d", isdbsts, x);
-                #endif
-
-                l = 0;
-                if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
                     LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", x);
                     continue;
                 }
@@ -4234,9 +4874,10 @@ int hexagon_read_global_ctrl_registers(struct target *target)
                 cache->reg_list[j].value = (uint8_t *) &global_reg[j];
                 cache->reg_list[j].valid = true;
                     
+
+                #ifdef  _DEBUG_HEXAGON_
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                         hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                #ifdef  _DEBUG_HEXAGON_
                 LOG_DEBUG("ISDBST status after reading MBXOUT = 0x%x,  reg = %d", isdbsts, x);
                 LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", global_reg[j]);
                 #endif
@@ -4261,7 +4902,7 @@ int hexagon_write_hvx_registers(struct target *target, uint32_t value)
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
     int retval, j = 0;
-    uint32_t isdbsts,isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd;
     uint64_t opcode = 0x19a0e020;
 
 #ifdef _HEXAGON_TARGET_TIME_PROFILING
@@ -4275,59 +4916,31 @@ int hexagon_write_hvx_registers(struct target *target, uint32_t value)
 
     for (j = 0; j < 32; j++)
     {
+    #ifdef _DEBUG_HEXAGON_
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
         if (retval != ERROR_OK)
             LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
         LOG_DEBUG("ISDB status before ISDBMBXIN write 0x%x", isdbsts);
+    #endif
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                          hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, 0x9);
         if (retval != ERROR_OK)
             LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_STFINST, 0x6ea8c000);
+
+        retval = hexagon_isdb_cmd_status(target, 0x6ea8c000,isdb_mmode_cmd);
+
         if (retval != ERROR_OK)
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        hexagon_wait_loop();
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
         {
             LOG_DEBUG("ISDB command failed in monitor mode");
             return ERROR_OK;
         }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_STFINST, opcode + j);
+
+        retval = hexagon_isdb_cmd_status(target,  opcode + j,isdb_mmode_cmd);
+
         if (retval != ERROR_OK)
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        LOG_DEBUG("ISDB status after opcode + j  write 0x%x", isdbsts);
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        hexagon_wait_loop();
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
         {
+
             LOG_DEBUG("ISDB command failed in monitor  mode");
         }
     }
@@ -4344,8 +4957,8 @@ int hexagon_read_hvx_registers(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    int retval, i, j, l = 0;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status, isdbsts;
+    int retval, i, j;
+    uint32_t isdb_mmode_cmd;
     uint64_t vextract_opcode_v0 = 0x9200c021;
     hexagon_r0_used_stuff = 1;
     hexagon_r1_used_stuff = 1;
@@ -4369,76 +4982,36 @@ int hexagon_read_hvx_registers(struct target *target)
     {
         for (j = 0; j < 16; j++)
         {
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-#ifdef _DEBUG_HEXAGON_
-            LOG_DEBUG("ISDB status before ISDBMBXIN write 0x%x", isdbsts);
-#endif
             retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                              hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, j * 4);
             if (retval != ERROR_OK)
                 LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_STFINST, 0x6ea8c000);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            hexagon_wait_loop();
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_STFINST, vextract_opcode_v0 + 100 * i);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            hexagon_wait_loop();
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_STFINST, 0x6701c029);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-            hexagon_wait_loop();
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-#ifdef _DEBUG_HEXAGON_
-            LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
-#endif
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-            if (isdb_cmd_status)
-            {
+
+            retval = hexagon_isdb_cmd_status(target, 0x6ea8c000,isdb_mmode_cmd);
+
+            if (retval != ERROR_OK){
+                LOG_DEBUG("ISDB command failed in monitor mode");
+            }
+            
+            retval = hexagon_isdb_cmd_status(target, vextract_opcode_v0 + 100 * i,isdb_mmode_cmd);
+            if (retval != ERROR_OK){
+                LOG_DEBUG("ISDB command failed in monitor mode");
+            }
+
+            retval = hexagon_isdb_cmd_status(target, 0x6701c029,isdb_mmode_cmd);
+            if (retval != ERROR_OK){
                 LOG_DEBUG("ISDB command failed in monitor mode");
                 return ERROR_OK;
             }
             else
             {
-                while (!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
-                    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                                                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                    l++;
-                    if (l == 10)
-                        break;
-                }
-#ifdef _DEBUG_HEXAGON_
-                LOG_DEBUG("ISDBST status before reading MBXOUT = 0x%x, reg = %d", isdbsts, j);
-#endif
-                l = 0;
-                if (!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-                {
+
+                retval = hexagon_poll_mbxout(target);
+                if (retval != ERROR_OK){
                     LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", j);
                     continue;
                 }
+                
                 retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXOUT, &hexa_info->hvx_register[i][j]);
                 if (retval != ERROR_OK)
@@ -4469,9 +5042,8 @@ int hexagon_read_hvx_registers(struct target *target)
 
 int hexagon_read_current_registers(struct target *target, uint32_t hwthrd)
 {
-    struct hexagon_common *hexagon = target_to_hexagon (target);
-    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
 
     /* read general purpose registers (R0-R1) */
     hexagon_read_gpr_registers(target, hwthrd);
@@ -4485,36 +5057,48 @@ int hexagon_read_current_registers(struct target *target, uint32_t hwthrd)
     /* read global control registers */
     hexagon_read_global_ctrl_registers(target);
 
-    /* Restore the register used stuff instruction */
-    hexagon_restore_stuff_used_reg(target);
-    
     LOG_DEBUG("Dumping Registers %s", target_name(target));
-    hexagon_dump_hwthrd_reg(target, hexa_info->config.maxHwThreads);
-    if (hexa_info->mmu_init)
-        hexagon_read_tlb_entry(target);
+    hexagon_dump_hwthrd_reg(target);
 
+    bool mmu_enabled = hexagon_is_mmu_enabled(target);
+
+    if (mmu_enabled == true && qurt_context->tlb_fetched == false)
+        hexagon_read_tlb_entry(target);
+#ifdef HEXAGON_DEBUG_LOGS
+    else
+        LOG_DEBUG("TLB entries already fetched, skipping");
+#endif
+    hexagon_stuff_reg_restore(target);
+    
     return ERROR_OK;
 }
 
 
-static uint32_t hexagon_print_pc(struct target *target)
+static uint32_t hexagon_print_pc(struct target *target, uint32_t hw_thread)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
     struct reg_cache *cache;
-    uint32_t i;
+    uint32_t i, pc;
 
-    /* dump registers for the requested HW thread */
+
+    if (hw_thread >= hexa_info->config.maxHwThreads) {
+        LOG_DEBUG("Invalid HW thread %u", hw_thread+1);
+        return 0;
+    }
+
+    /* Walk to the requested HW thread */
     cache = hexa_info->core_cache;
-    for ( i = 0 ; i  <  hexa_info->config.maxHwThreads;  i++)
-    {
-        LOG_DEBUG("Value of PC  %s : %s = 0x%x", cache->name, cache->reg_list[HEXAGON_PC].name, 
-                    *(cache->reg_list[HEXAGON_PC].value));
+    for (i = 0; i < hw_thread; i++) {
         cache = cache->next;
     }
-    cache = hexa_info->core_cache;
-    /* return PC value for HW thread 0 but printing it for all HW thread*/
-    return  *(cache->reg_list[HEXAGON_PC].value);
+
+    pc = *(uint32_t *)(cache->reg_list[HEXAGON_PC].value);
+
+    LOG_DEBUG("PC for HW thread %u (%s:%s) = 0x%x",
+              hw_thread, cache->name, cache->reg_list[HEXAGON_PC].name,
+              pc);
+    return pc;
 }
 
 
@@ -4539,11 +5123,10 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
 #endif
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
-    struct adiv5_dap *swddp = hexa_info->dap;
     int retval = ERROR_OK;
-    uint64_t isdbcmd;
-    uint32_t output = 0, isdbsts = 0, isdb_cmd_status = 0;
+    uint32_t isdbcmd;
+    uint32_t isdbsts = 0;
+    uint32_t thread_mask = 0, hwthrd_mask = 0;
 
 #ifdef HEXAGON_DEBUG_LOGS
     LOG_INFO("Inside Step function");
@@ -4571,40 +5154,17 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
     func_start = clock();
 #endif
 
-    if (hexa_info->multi_thr_enabled == true)
-    {
-        isdbcmd |= ISDBCMD_CMD_ISTEP;
-        isdbcmd |= ISDBCMD_MONITOR_LVL;
-        isdbcmd |= ISDBCMD_TNUM_MASK_THREAD(hexa_info->thread_id_thread_select);    
-    }
-    else
-    {
+    thread_mask |= ISDBCMD_MONITOR_LVL;
+    thread_mask |= ISDBCMD_TNUM_MASK_THREAD(hexa_info->thread_id_thread_select);    
+    hwthrd_mask = thread_mask >> ISDBCMD_TNUM_SHIFT;
+    LOG_DEBUG("hwthrd_mask : 0X%X", hwthrd_mask);
 
-        isdbcmd=0x183;
-    }
-    retval = enable_dbg_sys_pwr(swddp);
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdbcmd);
+    isdbcmd = ISDBCMD_CMD_ISTEP | thread_mask;
+    LOG_DEBUG("isdbcmd : 0X%X", isdbcmd);
 
-    if (retval != ERROR_OK) 
-    {
-        LOG_DEBUG("ISDCMD write failed 0x%llx", isdbcmd);
-        return retval;
-    }
-    /* Wait for some time  to enable ISDB clk */
-    hexagon_wait_loop();
-    
-        
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    
-    /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    if(isdb_cmd_status)
-    {
+    retval = hexagon_isdb_cmd_status(target, 0, isdbcmd);
+
+    if (retval != ERROR_OK){
          LOG_DEBUG("ISDB command failed returning from hexagon_step function ");
          return ERROR_FAIL;
     }
@@ -4621,7 +5181,7 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
     func_start = clock();
 #endif    
     /* read general purpose registers (R0-R1) */
-    hexagon_read_gpr_registers(target, hexa_info->config.maxHwThreads);
+    hexagon_read_gpr_for_hwthrd(target, hwthrd_mask);
 #ifdef HEXAGON_DEBUG_LOGS
     func_end = clock();
     func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
@@ -4631,8 +5191,8 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
 #ifdef HEXAGON_DEBUG_LOGS
     func_start = clock();
 #endif     
-    /* read per thread control registers */
-    hexagon_read_ctrl_registers(target, hexa_info->config.maxHwThreads);
+    /* Refresh ctrl regs for only the stepped hardware thread to ensure accurate post-step state. */
+    hexagon_read_ctrl_regs_for_hwthrd(target, hwthrd_mask);
     
 #ifdef HEXAGON_DEBUG_LOGS
     func_end = clock();
@@ -4666,11 +5226,11 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
 #ifdef HEXAGON_DEBUG_LOGS
     func_start = clock();
 #endif        
-    hexagon_restore_stuff_used_reg(target);
+    hexagon_stuff_reg_restore(target);
 #ifdef HEXAGON_DEBUG_LOGS
     func_end = clock();
     func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
-    LOG_INFO("hexagon_restore_stuff_used_reg:  %lf", func_time);
+    LOG_INFO("hexagon_stuff_reg_restore:  %lf", func_time);
 // #endif
 
     double before_vtlb;
@@ -4679,56 +5239,16 @@ static int hexagon_step(struct target *target, int current, target_addr_t addres
     LOG_INFO("before_vtlb:  %lf", before_vtlb);
 #endif
 
-// #ifdef HEXAGON_DEBUG_LOGS
-//     func_start = clock();
-// #endif       
-    hexagon_read_tlb_entry(target);
-// #ifdef HEXAGON_DEBUG_LOGS
-//     func_end = clock();
-//     func_time = ((double)(func_end - func_start))/CLOCKS_PER_SEC;
-// #endif
-    if (qurt_context->QURTK_vtlb_revision != 0x0)
-    {
-        qurt_context->refresh_indicator = qurt_context->QURTK_vtlb_revision;
-        hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
-        qurt_context->refresh_indicator = output;
-        hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
-        #ifdef HEXAGON_DEBUG_LOGS
-            LOG_INFO("QURTK_vtlb_revision at 0x%x is 0x%x and the previous revision number is 0x%x", qurt_context.refresh_indicator, output, qurt_context.revision_num );
-        #endif     
-    }
-    if (hexa_info->mmu_init)
-    {   
-        if (qurt_context->bitmap_init == false) // before bitmap array has been read once and cleared, we need to populate all entries once
-            {
-        #ifdef HEXAGON_DEBUG_LOGS
-                LOG_INFO("Populating all entries");
-        #endif    
-            hexagon_populate_vtlb_refresh_entries(target);
-            }
-            else if (output != qurt_context->revision_num) 
-            {
-                
-                qurt_context->revision_num = output;
-                retval = hexagon_update_modified_vtlb_entry(target);
-            }
-            // else
-            // {
-            //     LOG_INFO("no vtlb update needed");
-            // }
-        // #ifdef HEXAGON_DEBUG_LOGS
-            // end = clock();
-            // execution_time = ((double)(end - start ))/CLOCKS_PER_SEC;
-            // LOG_INFO("Overall execution:  %lf", execution_time);
-        // #endif
-    }
-    sbp_step_executed = 1;
+#ifdef HEXAGON_DEBUG_LOGS
+    func_start = clock();
+#endif       
 
-    //LOG_DEBUG("Exiting %s\n",__FUNCTION__);
+    hexagon_memory_map_refresh(target);
+
+    sbp_step_executed = 1;
 
     return ERROR_OK;
 }
-
 
 static int hexagon_update_modified_vtlb_entry(struct target *target)
 {
@@ -4812,14 +5332,13 @@ static int hexagon_update_modified_vtlb_entry(struct target *target)
 }
 
 
+#if 0
 static int hexagon_dump_isdb_reg(struct hexagon_arch_info *hexa_info)
 {
-    struct adiv5_dap *swddp = hexa_info->dap;
     uint32_t reg_value;
     int retval = ERROR_OK, i;
 
     /* dump the all registers */ 
-    retval = enable_dbg_sys_pwr(swddp);
     for (i = 0; i < HEXAGON_MAX_ISDB_REG; i++)
     {
         reg_value = 0;
@@ -4838,547 +5357,131 @@ static int hexagon_dump_isdb_reg(struct hexagon_arch_info *hexa_info)
 
     return retval;
 }
+#endif
 
 
+/* Resume execution of the Hexagon target using ISDB */
 static int hexagon_resume(struct target *target, int current, target_addr_t address,
     int handle_breakpoints, int debug_execution)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    uint32_t isdbcmd, isdbsts, thread_mask;
     int retval = ERROR_OK;
-    uint64_t isdbcmd,  isdb_cmd_status;
-    uint32_t isdbsts;
-    static int retry_cnt = 0;
-    // hexagon_sync(target);
-    
-    hexagon_dump_isdb_reg(&hexagon->hexa_info);
-    for (uint32_t j = 0; j < hexa_info->config.maxHwThreads; j++)
-    {
-        hexagon_read_BRKPT_through_stuff(target,j);
-    }
-    LOG_DEBUG("Entering, Params passed: current = %d  :  address = 0x%llx  :handle_breakpoints = %d  :    debug_execution = %d", 
-                current, address, handle_breakpoints, debug_execution);
-    if (target->state != TARGET_HALTED)
-    {
+
+    LOG_DEBUG("Entering, Params passed: current=%d address=0x%llx handle_breakpoints=%d debug_execution=%d", 
+              current, address, handle_breakpoints, debug_execution);
+
+    /* Log breakpoint registers (informational only) */
+    hexagon_read_BRKPT_through_stuff(target);
+
+    hexagon_stuff_reg_restore(target);
+
+    if (target->state != TARGET_HALTED) {
         LOG_DEBUG("Resume is requested when target is not halted, polling again");
         hexagon_poll(target);
         if (target->state != TARGET_HALTED)
             return ERROR_TARGET_NOT_HALTED;
     }
 
-#ifdef  _HEXAGON_TARGET_TIME_PROFILING
-        hexagon_start_time_cal_ms();
+#ifdef _HEXAGON_TARGET_TIME_PROFILING
+    hexagon_start_time_cal_ms();
 #endif
-    
-    if(((hexa_info->brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0)) == HEXA_DBG_SWBRKPT){
-        
-        LOG_DEBUG("Halted reason HEXA_DBG_SWBRKPT");
-        
-        //basic sanity before proceeding
-        struct breakpoint *current_breakpoint = target->breakpoints;
-        uint8_t PC_matched_with_sbp_addr = 0;
-        struct reg_cache *cache = hexa_info->core_cache;
-        uint8_t i = 0;
-        
-        while(current_breakpoint != NULL)
-        {
-            LOG_DEBUG("Current PC : 0x%x ", *((uint32_t *)cache->reg_list[HEXAGON_PC].value));
-            LOG_DEBUG("current_breakpoint->address = 0x%llx", current_breakpoint->address);
-            LOG_DEBUG("current_breakpoint->type = 0x%x", current_breakpoint->type);
-            LOG_DEBUG("current_breakpoint->is_set = 0x%x", current_breakpoint->is_set);
-            LOG_DEBUG("current_breakpoint->orig_instr = 0x%hhn", current_breakpoint->orig_instr);
-            LOG_DEBUG("current_breakpoint->next = 0x%p",(void *) current_breakpoint->next);
-            i = 0;
-            cache = hexa_info->core_cache;
-            while ((cache != NULL))
-            {
-                LOG_DEBUG("*((uint32_t*)cache->reg_list[HEXAGON_PC].value) = 0x%x", *((uint32_t*)cache->reg_list[HEXAGON_PC].value));
-                if (*((uint32_t *)cache->reg_list[HEXAGON_PC].value) == ((current_breakpoint->address)))
-                {
-                    LOG_DEBUG("breakpoint address match with PC found in the bp-list, Replacing the original instruction in place of breakpoint");
-                    PC_matched_with_sbp_addr = 1;
-                    break;
-                }
-                    
-                cache = cache->next;
-                i++;
-            }
-            if(PC_matched_with_sbp_addr)
-                break;
-                
-        //    LOG_DEBUG("Reached here" );
-            current_breakpoint = current_breakpoint->next;
-        //    LOG_DEBUG("Reached here" );
-            
-            if(current_breakpoint)
-            {
-                LOG_DEBUG("current_breakpoint->address = 0x%llx", current_breakpoint->address);
-                LOG_DEBUG("current_breakpoint->type = 0x%x", current_breakpoint->type);
-                LOG_DEBUG("current_breakpoint->is_set = 0x%x", current_breakpoint->is_set);
-                LOG_DEBUG("current_breakpoint->orig_instr = 0x%p", (void *)current_breakpoint->orig_instr);
-                LOG_DEBUG("current_breakpoint->next = 0x%p", (void *) current_breakpoint->next);
-            }
-            //LOG_DEBUG("Reached here" );
-        }
-        if (hexa_info->multi_thr_enabled==false)
-            isdbcmd=0x182;
-        
-        if(!PC_matched_with_sbp_addr)
-        {
-            LOG_INFO("breakpoint not found in the list, trying to force resume");
-            if (retval == ERROR_OK)
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                     hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdbcmd);
-            if (retval == ERROR_OK)
-            {
-                goto resumed;
-            }
-            return retval;
-        }
-        
 
-        retval = hexagon_write_ctrl_register(target, HEXAGON_PC, i, current_breakpoint->address);
-        
-        //do a step 0x11 isdbcmd
-        if(!sbp_step_executed)
-        {
-            retval = hexagon_step(target, 1, 0x00, 0); //current = 1: continue on current pc, otherwise continue at <address> modified the PC so step from the current PC
-        }
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("Step command failed");
-
-        //Replace original instrn with brkpt instruction
-        retval = ERROR_OK;        
-        
-        retval = hexagon_memw_write_instruction_memory(target, current_breakpoint->address, 0x6c20c000, 0);;
-        if (retval != ERROR_OK) 
-            LOG_DEBUG("hexagon_memw_write_instruction_memory return value is not OK");
-        //continue
-        LOG_DEBUG("All steps are successful before continuing in case of sw BP");
-        
-    }
-retry:
-    //Todo: check the position of retry label, in case of very frequent breakpoints, whether it
-    //        needs to be placed above the SW preakpoint preprocessing or it's current place, i.e Just before continue cmd
-
-    retval = isdbsts = isdb_cmd_status = 0;
-    hexagon_stuff_reg_restore(target);
-
-    if (hexa_info->multi_thr_enabled == true)
-    {
-        if(hexa_info->config.maxHwThreads == 2)
-        {
-            /* Send ISDB command(Resume) to resume all halted threads*/
-            isdbcmd |= ISDBCMD_CMD_RESUME;
-            isdbcmd |= ISDBCMD_MONITOR_LVL;
-            isdbcmd |= ISDBCMD_TNUM_MASK_2;
-        }
-        else if(hexa_info->config.maxHwThreads == 4)
-        {
-            /* Send ISDB command(Resume) to resume all halted threads*/
-            isdbcmd |= ISDBCMD_CMD_RESUME;
-            isdbcmd |= ISDBCMD_MONITOR_LVL;
-            isdbcmd |= ISDBCMD_TNUM_MASK_4;
-            
-        }
-        else if(hexa_info->config.maxHwThreads == 6)
-        {
-            /* Send ISDB command(Resume) to resume all halted threads*/
-            isdbcmd |= ISDBCMD_CMD_RESUME;
-            isdbcmd |= ISDBCMD_MONITOR_LVL;
-            isdbcmd |= ISDBCMD_TNUM_MASK_6;
-        }
-        else if(hexa_info->config.maxHwThreads == 8)
-        {
-            /* Send ISDB command(Resume) to resume all halted threads*/
-            isdbcmd |= ISDBCMD_CMD_RESUME;
-            isdbcmd |= ISDBCMD_MONITOR_LVL;
-            isdbcmd |= ISDBCMD_TNUM_MASK_8;
-        }
-    }
+    /* Select thread mask for resume: all threads if MT enabled, else thread 0 */
+    if (hexa_info->multi_thr_enabled)
+        thread_mask = ISDBCMD_ALL_THREADS_MASK(hexa_info->config.maxHwThreads);
     else
-    {
-        // single thread resume
-        isdbcmd = 0x182;
-    }
+        thread_mask = ISDBCMD_TNUM_MASK_THREAD(0);
 
-    LOG_DEBUG("Writing HEXAGON_ISDB_ISDBCMD = 0x%llx, to resume target", isdbcmd);
-    // retval = enable_dbg_sys_pwr(swddp);
+    isdbcmd = ISDBCMD_CMD_RESUME | ISDBCMD_MONITOR_LVL | thread_mask;
 
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdbcmd);
-    if (retval != ERROR_OK) 
-    {
-        LOG_DEBUG("ISDCMD write failed 0x%llx", isdbcmd);
+    LOG_DEBUG("Writing isdbcmd=0x%08x to HEXAGON_ISDB_ISDBCMD to resume target", isdbcmd);
+
+    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, 
+             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, 
+             isdbcmd);
+    if (retval != ERROR_OK) {
+        LOG_ERROR("ISDBCMD write failed isdbcmd=0x%08x", isdbcmd);
         return retval;
     }
-    retval = hexagon_read_ISDB(target, isdbsts, ISDBST_ISDB_CMD_STATUS);
-    
-    uint8_t isdbst_read_retry_cnt = 0;
-    while(isdbst_read_retry_cnt < 4)
-    {
-        
-        if(!((isdbsts & ISDBST_DEBUG_MODE_STATUS) >> 8))
-        //  here debug mode status bits are expected to be 0 when resumed
-        {
-            LOG_DEBUG("target resumed; ISDBST_DEBUG_MODE_STATUS is 0x%x", ((isdbsts & ISDBST_DEBUG_MODE_STATUS)>>8));
-            LOG_DEBUG("ISDBST_DEBUG_MODE_STATUS value after trying target resume: 0x%x", ((isdbsts & ISDBST_DEBUG_MODE_STATUS)>>8));
-            LOG_DEBUG("ISDBST_WAITRUN_MODE_STATUS value after trying target resume: 0x%x", ((isdbsts & ISDBST_WAITRUN_MODE_STATUS)>>24));
-            goto resumed;
-        }
-        retval = enable_dbg_sys_pwr(swddp);
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        LOG_DEBUG("HEXAGON_ISDB_ISDBST value after trying target resume: 0x%x", isdbsts);
 
-        isdbst_read_retry_cnt++;
+    /* Read ISDB status after issuing resume command */
+    retval = hexagon_read_ISDBST(target, &isdbsts);
+    if (retval != ERROR_OK)
+        return retval;
+
+    /* ISDBST bit[4] indicates ISDB command status (0 = success, 1 = failed) */
+    if(isdbsts & ISDBST_ISDB_CMD_STATUS) {
+        LOG_ERROR("ISDB resume command failed, ISDBST=0x%08x", isdbsts);
+        return ERROR_FAIL;
     }
-    
-    LOG_DEBUG("ISDBST_DEBUG_MODE_STATUS value after trying target resume: 0x%x", ((isdbsts & ISDBST_DEBUG_MODE_STATUS)>>8));
-    LOG_DEBUG("ISDBST_WAITRUN_MODE_STATUS value after trying target resume: 0x%x", ((isdbsts & ISDBST_WAITRUN_MODE_STATUS)>>24));
-    
-    if((isdbsts & ISDBST_DEBUG_MODE_STATUS)>>8)
-    //  if it is nonzero
+    LOG_DEBUG("ISDB resume command successful ");
 
-    {
-        LOG_DEBUG("Unable to resume target; ISDBST_DEBUG_MODE_STATUS is nonzero 0x%x", ((isdbsts & ISDBST_DEBUG_MODE_STATUS)>>8));
+    /* Bug fix: reset tlb_fetched so TLB is re-read on the next halt */
+    qurt_context->tlb_fetched = false;
 
-        //handle retry here
-        retry_cnt++;
-        if (retry_cnt < 4)
-        {
-            goto retry;
-        }
-        LOG_DEBUG("Unable to resume target After 10 Retry");
-        hexagon_read_gpr_registers(target, hexa_info->config.maxHwThreads);
-        hexagon_read_ctrl_registers(target, hexa_info->config.maxHwThreads);
-
-        return ERROR_TARGET_FAILURE;        
-    }
-    //LOG_DEBUG("hexagon_halt  target->debug_reason =%d",target->debug_reason);
-
-resumed:
-    LOG_DEBUG("Target %s resumed and PC 0x%x", target_name(target),hexagon_print_pc(target));
-    
-    hexagon_write_syscfg_register(target,hexagon_syscfg_reg);
-    hexagon_stuff_reg_restore(target);
+    /* Update target state after successful resume */
     target->debug_reason = DBG_REASON_NOTHALTED;
-    
-    /* Wait for some time  to enable ISDB clk */
+
+    /* Wait for ISDB state to stabilize after resume command */
     hexagon_wait_loop();
 
-    // LOG_INFO("finished long wait");
-    if (!debug_execution)
-    {
+    if (!debug_execution) {
         target->state = TARGET_RUNNING;
         target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
-        LOG_DEBUG(" !debug_execution : target resumed at 0x%x" , hexagon_print_pc(target));
-    } 
-    else 
-    {
+    } else {
         target->state = TARGET_DEBUG_RUNNING;
         target_call_event_callbacks(target, TARGET_EVENT_DEBUG_RESUMED);
-        LOG_DEBUG("target debug resumed at 0x%x" , hexagon_print_pc(target));
-    }    
-
-    
-#ifdef  _HEXAGON_TARGET_TIME_PROFILING
-        hexagon_end_time_cal_ms();
-        LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total);
-#endif
-    
-    
-    //resetting the global data structures to keep track of Business logic involved in SW BP
-
-    for (uint32_t j=0; j < hexa_info->config.maxHwThreads;  j++)
-    {
-        hexa_info->pSbpHaltedThreadsPC[j] = 0;
     }
 
-    sbp_step_executed = 0;
+#ifdef _HEXAGON_TARGET_TIME_PROFILING
+    hexagon_end_time_cal_ms();
+    LOG_DEBUG("Total time taken  %" PRId64 "ms", hexagon_time_total);
+#endif
+
+    LOG_DEBUG("Hexagon resumed at PC 0x%08x", hexagon_print_pc(target, hexa_info->thread_id_thread_select));
     return ERROR_OK;
 }
 
 
-static int hexagon_read_BRKPT_through_stuff(struct target *target, uint32_t hwthrd)
+static int hexagon_read_BRKPT_through_stuff(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     // uint32_t isdb_mmode_cmd = 0x0;
 
-    int retval , i=0;
+    int retval = ERROR_OK;
     uint64_t stuff_inst[][4] = {{0x6ea4c007, 0x6707c029},
                         {0x6ea6c007, 0x6707c029},
                         {0x6ea5c007, 0x6707c029},
                         {0x6ea7c007, 0x6707c029}};        //r7=PC0,PC1,CFG0,CFG1; isdbmbxout = r7;
     uint32_t read_val[4] = {};
-    uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd = 0x184;
+    uint32_t isdb_mmode_cmd = HEXAGON_ISDB_MMODE_CMD;
     // isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
     //                                             ISDBCMD_TNUM_MASK_THREAD(hwthrd));
-    uint32_t  isdb_cmd_status;
 
     LOG_DEBUG("%s ------ %d\n",__FUNCTION__,__LINE__);
-
-    
-
-                
-    /*there are 2 stuff instruction, here programming first inst */
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    }
-    // */
     
     for (int j = 0; j < 4; j++)
     {
-        // /*
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        }
-        // */
         /*there are 2 stuff instruction, here programming first inst */
-        
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][0]);
-        if (retval != ERROR_OK)
-        {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK for stuff_inst[j][0],j=%d",j);
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK for stuff_inst[j][0],j=%d",j);
-        }
-    
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-                
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-        if (isdbsts == 0x0)
-        {
-            LOG_DEBUG("ERROR: ISDBSTS reg has become 0x0");
-            // return ERROR_FAIL;
-        }
-            
-        LOG_DEBUG("ISDBST read status after first stuff inst j = %d, 0x%x", j,isdbsts);
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    
-        if (isdb_cmd_status)
-        {
-            LOG_DEBUG("ISDBcommand failed in monitor  mode");
-            // /*
-            retval = enable_dbg_sys_pwr(swddp);
-            if (retval != ERROR_OK) {
-                    LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-            }
-            // */
-            
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][0]);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK for stuff_inst[j][0],j= %d",j);
-            }
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK for stuff_inst[j][0],j=%d", j);
-            }
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                    LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                
-            }
-            LOG_DEBUG("ISDBST read status 0x%x", isdbsts);
-            /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    
-            if (isdb_cmd_status)
-            {
-                LOG_DEBUG("ISDBcommand failed in user mode");
-                    //  /* 
-                retval = enable_dbg_sys_pwr(swddp);
-                if (retval != ERROR_OK) {
-                        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                }
-                // */
-                
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][0]);
-                if (retval != ERROR_OK)
-                {
-                        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-                }
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
-                }
-                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                if (retval != ERROR_OK)
-                {
-                        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                    
-                }
-                LOG_DEBUG("ISDBST read status 0x%x", isdbsts);
-                /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-                isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-                if(isdb_cmd_status)
-                {
-                     LOG_DEBUG("ISDBcommand failed in Guest mode");
-                     return ERROR_OK;
-                }
-            }
-        }
-        /*there are 2 stuff instruction, here programming second inst */
-        // /*
-        retval = enable_dbg_sys_pwr(swddp);
-        if (retval != ERROR_OK) {
-                LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-        }
-        // */
-        
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][1]);
-        if (retval != ERROR_OK)
-        {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                         hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-                    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-                LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-        LOG_DEBUG("ISDBST read status after 2nd stuff inst 0x%x", isdbsts);
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
-        {
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[j][0],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
             LOG_DEBUG("ISDBcommand failed in monitor mode");
-            // /*
-            retval = enable_dbg_sys_pwr(swddp);
-            if (retval != ERROR_OK) {
-                    LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
+            return ERROR_OK;
             }
-            // */
-            
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][1]);
-            if (retval != ERROR_OK)
-            {
-                    LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-            }
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-            if (retval != ERROR_OK)
-            {
-                LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
-            }
-    
-            /* wait till the stuff instruction is executed */
-            hexagon_wait_loop();
-            
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-            if (retval != ERROR_OK)
-            {
-                    LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                
-            }
-            LOG_DEBUG("ISDBST read status 0x%x", isdbsts);
-            /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-            isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-    
-            if(isdb_cmd_status)
-            {
-                  LOG_DEBUG("ISDBcommand failed in user  mode");
-                // /* 
-                retval = enable_dbg_sys_pwr(swddp);
-                if (retval != ERROR_OK) {
-                        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                }
-                // */
-                
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst[j][1]);
-                if (retval != ERROR_OK)
-                {
-                        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-                }
-                retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-                if (retval != ERROR_OK)
-                {
-                    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD isdb_mmode_cmd return value is not OK");
-                }
-    
-                /* wait till the stuff instruction is executed */
-                hexagon_wait_loop();
-            
-                retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                        hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                if (retval != ERROR_OK)
-                {
-                        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-                    
-                }
-                LOG_DEBUG("ISDBST read status 0x%x", isdbsts);
-                /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-                isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-                if(isdb_cmd_status)
-                {
-                       LOG_DEBUG("ISDBcommand failed in Guest  mode");
+
+        retval = hexagon_isdb_cmd_status(target, stuff_inst[j][1],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+                LOG_DEBUG("ISDBcommand failed in monitor mode");
                      return ERROR_OK;
                 }
-            }
-        }
-        retval = enable_dbg_sys_pwr(swddp);
-                if (retval != ERROR_OK) {
-                        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-                }
-        /*reading mailboxout status in ISDBST register */
-        while(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-                /* wait till the stuff instruction is executed */
-                hexagon_wait_loop();
-            i++;
-            if (i==10)
-                break;
-        }
-        LOG_DEBUG("ISDBST status value before  reading mailbox register 0x%x, i = %d", isdbsts,i);
-        i = 0;
-        if(!(isdbsts & ISDBST_ISDB_MAILBOX_OUT))
-        {
-            LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for iteration %d", j);
+
+        retval = hexagon_poll_mbxout(target);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBST status not set for mailbox so skiping reading it for register R%d", j);
             continue;
         }
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
@@ -5387,15 +5490,15 @@ static int hexagon_read_BRKPT_through_stuff(struct target *target, uint32_t hwth
         {
             LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT read failed 0x%x", read_val[j]);
         }
+    #ifdef  _DEBUG_HEXAGON_
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                 hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXOUT value 0x%x", read_val[j]);
         LOG_DEBUG("ISDBST status value after  reading mailbox register 0x%x ", isdbsts);
+    #endif
     }
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    }
+    LOG_DEBUG("BRKPTPC0: 0X%x, BRKPTPC1: 0X%x, BRKPTCFG0: 0X%x, BRKPTCFG1: 0X%x", 
+              read_val[0], read_val[1], read_val[2], read_val[3]);
 
     return ERROR_OK;
 }
@@ -5406,7 +5509,6 @@ static int hexagon_check_state_one(struct target *target,
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     uint32_t isdbsts = 0;
     int retval;
 
@@ -5417,8 +5519,6 @@ static int hexagon_check_state_one(struct target *target,
     }
     
     /*    Check ISDB status for threads in  debug mode */
-    retval = enable_dbg_sys_pwr(swddp);
-    
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
     if (retval != ERROR_OK)
@@ -5449,11 +5549,14 @@ static int hexagon_debug_entry(struct target *target)
     // static uint8_t vtlb_initialized = 0;
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
-    struct adiv5_dap *swddp = hexa_info->dap;
+    struct hexagon_brp *brp_list = hexagon->brp_list;
+    struct reg_cache *cache = NULL;
     int retval = ERROR_OK;
-    uint32_t brkptinfo = 0;
-    uint64_t *thrd_src;
+    uint32_t brkptinfo = 0, brkptinfo1 = 0;
+    uint64_t *thrd_src, thread_pc_value = 0;
+    uint64_t hw_brkpt0 = 0, hw_brkpt1 = 0;
+    uint32_t hw_thread_idx = 0;
+    bool hw_brkpt_hit = false;
 
     thrd_src = (uint64_t *) malloc (hexa_info->config.maxHwThreads * sizeof(uint64_t));
     if (thrd_src == NULL) {
@@ -5464,8 +5567,6 @@ static int hexagon_debug_entry(struct target *target)
     memset(thrd_src, 0, hexa_info->config.maxHwThreads * sizeof(uint64_t));
 
     LOG_DEBUG("hexagon_debug_entry  %s", target_name(target));
-
-    retval = enable_dbg_sys_pwr(swddp);
     
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO, &brkptinfo);
@@ -5478,63 +5579,68 @@ static int hexagon_debug_entry(struct target *target)
     
     LOG_DEBUG("TARGET_HALTED, HEXAGON_ISDB_BRKPTINFO = 0x%x \n",brkptinfo);
 
-    if(hexa_info->config.maxHwThreads == 2)
-    {
-        thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0));
-        thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE)>>(3));
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+            hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO, &brkptinfo);
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("BRKPTINFO read failed 0x%x", brkptinfo);
+        free(thrd_src);
+        return retval;
     }
-    else     if(hexa_info->config.maxHwThreads == 4)
-    {
-        thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0));
-        thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE)>>(3));
-        thrd_src[2] = ((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE)>>(6));
-        thrd_src[3] =  ((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE)>>(9));
+
+    if (hexa_info->config.maxHwThreads > NUM_HW_THREAD_IN_TILE0) {
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO1, &brkptinfo1);
+        if (retval != ERROR_OK) {
+            LOG_DEBUG("BRKPTINFO read failed 0x%x", brkptinfo);
+            free(thrd_src);
+            return retval;
+        }    
     }
-    else if (hexa_info->config.maxHwThreads == 6)
-    {
-        thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0));
-        thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE)>>(3));
-        thrd_src[2] = ((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE)>>(6));
-        thrd_src[3] =  ((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE)>>(9));
-        thrd_src[4] =   ((brkptinfo & BRKPTINFO_THREAD4_BRKPT_SOURCE)>>(12));
-        thrd_src[5] =  ((brkptinfo & BRKPTINFO_THREAD5_BRKPT_SOURCE)>>(15));
+
+    for (hw_thread_idx = 0; hw_thread_idx < hexa_info->config.maxHwThreads; hw_thread_idx++) {
+        if (hw_thread_idx < NUM_HW_THREAD_IN_TILE0)
+            thrd_src[hw_thread_idx] = (brkptinfo >> (hw_thread_idx * BPT_SRC_BITS_PER_THREAD)) & BPT_SRC_MASK;
+        else
+            thrd_src[hw_thread_idx] = (brkptinfo1 >> ((hw_thread_idx - NUM_HW_THREAD_IN_TILE0) * BPT_SRC_BITS_PER_THREAD)) & BPT_SRC_MASK;
     }
         
-    for(uint32_t i =0; i < hexa_info->config.maxHwThreads; i++){
+    for(hw_thread_idx = 0; hw_thread_idx < hexa_info->config.maxHwThreads; hw_thread_idx++){
             
-            LOG_DEBUG("Debug reason  thrd_src[%d]= %llx", i,thrd_src[i]);
+            LOG_DEBUG("Debug reason  thrd_src[%d]= %llx", hw_thread_idx, thrd_src[hw_thread_idx]);
 
-            switch(thrd_src[i])
+            switch(thrd_src[hw_thread_idx])
             {
                 case 0b000:
-                    LOG_DEBUG("Thread num %d has hit Hardware breakpoint 0\n", i);
+                    LOG_DEBUG("Thread num %d has hit Hardware breakpoint 0\n", hw_thread_idx);
                     LOG_INFO("HW Breakpoint 0 hit" );
+                    hw_brkpt_hit = true;
                     break;
                     
                 case 0b001:
-                    LOG_DEBUG("Thread num %d has hit Hardware breakpoint 1\n", i);
+                    LOG_DEBUG("Thread num %d has hit Hardware breakpoint 1\n", hw_thread_idx);
                     LOG_INFO("HW Breakpoint 1 hit" );
+                    hw_brkpt_hit = true;
                     break;
                 
                 case 0b010:
-                    LOG_DEBUG("Thread num %d has hexecuted BRKPT instruction\n", i);
+                    LOG_DEBUG("Thread num %d has hexecuted BRKPT instruction\n", hw_thread_idx);
                     LOG_INFO("SW Breakpoint hit" );
                     break;
                     
                 case 0b011:
-                    LOG_DEBUG("Thread num %d has hit ETM Breakpoint\n", i);
+                    LOG_DEBUG("Thread num %d has hit ETM Breakpoint\n", hw_thread_idx);
                     break;
                     
                 case 0b100:
-                    LOG_DEBUG("Thread num %d has hit APB Breakpoint\n", i);
+                    LOG_DEBUG("Thread num %d has hit APB Breakpoint\n", hw_thread_idx);
                     break;
                     
                 case 0b101:
-                    LOG_DEBUG("Thread num %d has External breakpoint\n", i);
+                    LOG_DEBUG("Thread num %d has External breakpoint\n", hw_thread_idx);
                     break;
                     
                 default:
-                    LOG_DEBUG("Default case: Thread num %d Breakpoint source = %llx\n", i, thrd_src[i]);
+                    LOG_DEBUG("Default case: Thread num %d Breakpoint source = %llx\n", hw_thread_idx, thrd_src[hw_thread_idx]);
                     break;        
             }    
         }
@@ -5543,41 +5649,65 @@ static int hexagon_debug_entry(struct target *target)
     hexa_info->brkptinfo = brkptinfo;
     
     /* Examine debug reason */
-    //hexagon_debug_reason(target, brkptinfo);
-    
-    //Assuming all threads are halted for the same reason.
     hexagon_debug_reason(target, thrd_src[0]);
     hexagon_read_current_registers(target, hexa_info->config.maxHwThreads);
-    
-//  san - update mmu on halt
-#if 1
-    // hexagon_sync(target,);
-        // if (mmu_init)
 
-    if (hexa_info->multi_thr_enabled)
-        if(!qurt_context->vtlb_initialized)
-        {
-            LOG_DEBUG("hexagon_populate_vtlb_data ");
+    /* Identify thread ID which had hit HW breakpoint */
+    if (hw_brkpt_hit)
+    {
+        cache = hexa_info->core_cache;
 
-            hexagon_populate_vtlb_data(target);
-            if(hexagon_vtlb_data.vtlb_no_of_entries > 0)
-                qurt_context->vtlb_initialized = 1;
-        }
-// #endif    
-    // if (mmu_init)
-        if(qurt_context->vtlb_initialized > 1)
-        {
-            LOG_DEBUG("hexagon_populate_vtlb_refresh_entries");
+        hw_brkpt0 = brp_list[0].value;
+        hw_brkpt1 = brp_list[1].value;
 
-            hexagon_populate_vtlb_refresh_entries(target);
-        }
-        else
+        LOG_DEBUG("%s: HW BP0 addr=0x%llx, HW BP1 addr=0x%llx",
+                  __FUNCTION__, hw_brkpt0, hw_brkpt1);
+
+        for (hw_thread_idx = 0;
+             hw_thread_idx < hexa_info->config.maxHwThreads;
+             hw_thread_idx++, cache = cache->next)
         {
-            if(hexagon_vtlb_data.vtlb_no_of_entries > 0)
-                qurt_context->vtlb_initialized++;
+            thread_pc_value = *((uint64_t *)cache->reg_list[HEXAGON_PC].value);
+
+            LOG_DEBUG("%s : PC value of HW thread %u : 0x%llx",
+                      __FUNCTION__, hw_thread_idx, thread_pc_value);
+
+            /*
+             * NOTE:
+             * HEXAGON_PC is a 64-bit register that may include non-address metadata
+             * in the upper bits (e.g. execution context). Hardware instruction
+             * breakpoints are matched only against the instruction address field,
+             * which is the lower 32 bits. Therefore, comparison is done on the
+             * lower 32 bits of both PC and breakpoint address.
+             */
+
+            /* HW Breakpoint 0 */
+            if (thrd_src[hw_thread_idx] == 0 && 
+                (uint32_t)thread_pc_value == (uint32_t)hw_brkpt0)
+            {
+                hexa_info->thread_id_thread_select = hw_thread_idx;
+
+                /* Thread IDs are internally 0-based; adjust to 1-based for display */
+                LOG_DEBUG("HW breakpoint 0 hit by HW thread %llu",
+                          hexa_info->thread_id_thread_select + 1);
+                break;
+            }
+        
+            /* HW breakpoint 1 */
+            else if (thrd_src[hw_thread_idx] == 1 && 
+                (uint32_t)thread_pc_value == (uint32_t)hw_brkpt1)
+            {
+                hexa_info->thread_id_thread_select = hw_thread_idx;
+
+                /* Thread IDs are internally 0-based; adjust to 1-based for display */
+                LOG_DEBUG("HW breakpoint 1 hit by HW thread %llu",
+                          hexa_info->thread_id_thread_select + 1);
+                break;
+            }
         }
-    
-#endif
+    }
+
+    hexagon_memory_map_refresh(target);
     
     //*****************************************************//
     if(((hexa_info->brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE)>>(0)) == HEXA_DBG_SWBRKPT)
@@ -5586,7 +5716,7 @@ static int hexagon_debug_entry(struct target *target)
         LOG_DEBUG("Halted reason HEXA_DBG_SWBRKPT");
         struct breakpoint *current_breakpoint = target->breakpoints;
         uint8_t PC_matched_with_sbp_addr = 0;
-        struct reg_cache *cache = hexa_info->core_cache;
+        cache = hexa_info->core_cache;
         uint8_t i = 0;
 
         for( i =0; i < hexa_info->config.maxHwThreads; i++)
@@ -5609,9 +5739,15 @@ static int hexagon_debug_entry(struct target *target)
             while ( i <  hexa_info->config.maxHwThreads)
             {
                 LOG_DEBUG("*((uint64_t*)cache->reg_list[HEXAGON_PC].value) = 0x%p", hexa_info->pSbpHaltedThreadsPC[i]);
-                // comparison between pointer and integer
+                
+                /* Identify the HW thread that hit the software breakpoint.
+                 * Software breakpoints advance PC by one instruction (PC + 4),
+                 * so compare adjusted PC value with breakpoint address.
+                 */
                 if (*hexa_info->pSbpHaltedThreadsPC[i] == ((current_breakpoint->address) + 4))
                 {
+                    hexa_info->thread_id_thread_select = i;
+                    LOG_INFO("Software breakpoint 0x%llx hit on hw thread : %u", current_breakpoint->address, i+1);
                     LOG_DEBUG("breakpoint address match with PC found in the bp-list, Replacing the original instruction in place of breakpoint");
                     PC_matched_with_sbp_addr = 1;
                     break;
@@ -5669,7 +5805,60 @@ static int hexagon_debug_entry(struct target *target)
     free(thrd_src);
     return ERROR_OK;
 }
+static void hexagon_memory_map_refresh(struct target *target)
+{
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    // struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    bool mmu_enabled = hexagon_is_mmu_enabled(target);
+    uint32_t output = 0;    /* Bug fix: initialize to avoid undefined behaviour */
 
+    if (mmu_enabled == true && qurt_context->tlb_fetched == false){
+        hexagon_read_tlb_entry(target);
+        qurt_context->tlb_lldb_query_done = true;
+    }
+
+    if (qurt_context->QURTK_vtlb_revision != 0x0 && qurt_context->vtlb_bitmap_logic_init_done)
+    {
+        qurt_context->refresh_indicator = qurt_context->QURTK_vtlb_revision;
+        hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
+        qurt_context->refresh_indicator = output;
+        hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
+        #ifdef HEXAGON_DEBUG_LOGS
+            LOG_INFO("QURTK_vtlb_revision at 0x%x is 0x%x and the previous revision number is 0x%x", qurt_context.refresh_indicator, output, qurt_context.revision_num );
+        #endif
+    }
+
+    if (mmu_enabled && hexagon_is_vtlb_initialized(target))    /* Bug fix: use cached mmu_enabled */
+    {
+        if (qurt_context->vtlb_initialized == true)
+        {
+            // before bitmap array has been read once and cleared, we need to populate all entries once
+            if (qurt_context->bitmap_init == false)
+            {
+                hexagon_populate_vtlb_refresh_entries(target);
+                /* Bug fix: mark bitmap as initialized after first full populate.
+                 * This is safe because when hexagon_vtlb_enable_bitmap() has not yet
+                 * succeeded, vtlb_bitmap_logic_init_done stays false, which means the
+                 * revision block is skipped (output stays 0), and revision_num is also 0
+                 * (never updated). So the else-if condition (output != revision_num) is
+                 * always false, and hexagon_update_modified_vtlb_entry() is never called. */
+                qurt_context->bitmap_init = true;
+            }
+            else if(output != qurt_context->revision_num) 
+            {
+                qurt_context->revision_num = output;
+                LOG_DEBUG("updating modified vtlb entries");
+
+                hexagon_update_modified_vtlb_entry(target);
+            }
+        }else{
+            LOG_INFO("hexagon_populate_vtlb_data");
+            hexagon_populate_vtlb_data(target);
+        }
+    }
+    return;
+}
 
 void hexagon_debug_reason(struct target *target, uint64_t brkptinfo)
 {
@@ -5699,18 +5888,21 @@ void hexagon_debug_reason(struct target *target, uint64_t brkptinfo)
 
 static int hexagon_poll(struct target *target)
 {
+    struct hexagon_common *hexagon = target_to_hexagon(target);
     enum target_state prev_target_state;
     int retval = ERROR_OK;
     uint32_t debug_thread = 0;
     bool halted = false;
 
+    if (hexagon->is_hexagon_untrusted == true){
+        LOG_DEBUG("There is no need to halt Q6 to perform OEMPD Debug, skipping");
+        return ERROR_OK;
+    }
     retval = hexagon_check_state_one(target, ISDBST_DEBUG_MODE_STATUS, &halted, &debug_thread);
 #ifdef HEXAGON_DEBUG
     LOG_DEBUG("hexagon_check_state_one returned %d",retval);
 #endif
 
-    //if (retval != ERROR_OK)
-        //return retval;
     static int cnt = 0;
     if((++cnt % 1000)==0){
         LOG_DEBUG("At FUNCTION:%s\t LINE:%d\n",__FUNCTION__, __LINE__);
@@ -5794,7 +5986,6 @@ static int hexagon_init_debug_access(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     int retval = ERROR_OK;
     uint64_t isdbcmd, isdbcsts;
     uint32_t isdbsts = 0, bpinfo =0;
@@ -5808,26 +5999,21 @@ static int hexagon_init_debug_access(struct target *target)
     LOG_DEBUG("Number of threads is %d",gHexConfig.maxHwThreads);
 #endif
 
-    if(hexa_info->config.maxHwThreads == 2)
-    {
-        isdbcmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_BREAK,ISDBCMD_USER_LVL,
-                            ISDBCMD_TNUM_MASK_2);
-    }    
-    else if(hexa_info->config.maxHwThreads == 4)
-    {
-        isdbcmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_BREAK,ISDBCMD_USER_LVL,
-                            ISDBCMD_TNUM_MASK_4);
+    uint32_t thread_mask = 0;
+
+    if (hexa_info->multi_thr_enabled){
+        thread_mask = ISDBCMD_ALL_THREADS_MASK(hexa_info->config.maxHwThreads);
     }
-    else     if(hexa_info->config.maxHwThreads == 6)
-    {
-        isdbcmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_BREAK, ISDBCMD_USER_LVL,
-                            ISDBCMD_TNUM_MASK_6);
+    else{
+        thread_mask = ISDBCMD_TNUM_MASK_THREAD(0);
     }
+    // Final ISDB command
+    isdbcmd = ISDBCMD_CMD_BREAK | ISDBCMD_MONITOR_LVL | thread_mask;
+
 #ifdef HEXAGON_DEBUG
     LOG_DEBUG("halting with isdbcmd : 0x%x",isdbcmd);
 #endif
 
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdbcmd);
 #ifdef HEXAGON_DEBUG
@@ -5847,7 +6033,6 @@ static int hexagon_init_debug_access(struct target *target)
     LOG_DEBUG(" hexagon_wait_loop");
 #endif
     /*    Check ISDB status for threads entering debug mode */
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
     if (retval != ERROR_OK)
@@ -5857,8 +6042,6 @@ static int hexagon_init_debug_access(struct target *target)
     }
     
     /* check ISDB core status - reset/PC to access ISDB*/
-    retval = enable_dbg_sys_pwr(swddp);
-
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO, &bpinfo);
     if (retval != ERROR_OK)
@@ -6061,27 +6244,83 @@ void decToBinary(unsigned int n, unsigned int binaryNum[])
     }
 }
 
-
-COMMAND_HANDLER(hexagon_set_vtlb_params)
+/* Reusable core: apply a VTLB bitmap and update entries. */
+int hexagon_vtlb_enable_bitmap(struct target *target,
+                              uint32_t bitmap_ptr_addr,
+                              uint32_t entries_ptr_addr,
+                              unsigned int entry_count)
 {
-    struct target *target = get_current_target (CMD_CTX);
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct qurt_context_t *qurt_context = &hexagon->qurt_context;
 
-    // uint64_t output;
-    uint32_t output;
-    unsigned int vtlb_entry_count = hexagon_vtlb_data.vtlb_no_of_entries ;
-    uint64_t vtlb_entries_read[vtlb_entry_count];
-    unsigned int vtlb_notify_size;
-    vtlb_notify_size = (vtlb_entry_count%32)? ((vtlb_entry_count/32)+1): vtlb_entry_count/32;
-    unsigned int bitmap_array_contents[vtlb_notify_size];
-    unsigned int size_vtlb_binary = (vtlb_entry_count*4);
-    // target_addr_t bitmap_addr_temp ;
-    // target_addr_t vtlb_entries_temp;
-    uint32_t bitmap_addr_temp, vtlb_entries_temp;
-    unsigned int* final_str = (unsigned int *)calloc(size_vtlb_binary, sizeof(unsigned int));
-    unsigned int final_str_ind = 0;
-    target_addr_t vtlb_entries;
+    if (entry_count == 0)
+        return ERROR_OK;
+
+    /* 1) Read the addresses the QuRT layer points us to */
+    uint32_t bitmap_base = 0;
+    uint32_t entries_base = 0;
+    int retval;
+
+    retval = hexagon_memw_read(target, bitmap_ptr_addr, &bitmap_base);
+    if (retval != ERROR_OK) 
+        return retval;
+
+    retval = hexagon_memw_read(target, entries_ptr_addr, &entries_base);
+    if (retval != ERROR_OK) 
+        return retval;
+
+    /* 2) Walk each bit in order; for each position we always advance by 8 bytes.
+          If bit is set, read two words (lo, hi) and update the VTLB structure. */
+    uint32_t bm_word = 0;
+    unsigned curr_word_idx = (unsigned)-1; /* force first reload */
+    uint32_t read_lo = 0, read_hi = 0;
+
+    for (unsigned idx = 0; idx < entry_count; ++idx) {
+        unsigned word_idx = idx / 32u;
+        unsigned bit_idx  = idx % 32u;
+
+        if (word_idx != curr_word_idx) {
+            /* fetch next bitmap word */
+            retval = hexagon_memw_read(target, bitmap_base + (word_idx * 4u), &bm_word);
+            if (retval != ERROR_OK) 
+                return retval;
+            curr_word_idx = word_idx;
+        }
+
+        const bool bit_set = ((bm_word >> bit_idx) & 0x1u) != 0u;
+
+        if (bit_set) {
+            /* read lo/hi 32-bit words for this entry */
+            retval = hexagon_memw_read(target, entries_base, &read_lo);
+            if (retval != ERROR_OK) 
+                return retval;
+
+            retval = hexagon_memw_read(target, entries_base + 4u, &read_hi);
+            if (retval != ERROR_OK) 
+                return retval;
+
+            /* push into your global VTLB structure */
+            hexagon_update_vtlb_entry_in_structure((uint64_t)read_lo,
+                                                   (uint64_t)read_hi,
+                                                   (uint64_t)idx);
+        }
+
+        /* advance to next pair (8 bytes) unconditionally */
+        entries_base += 8u;
+    }
+
+    /* Optional: mark bitmap as initialized just like the command did */
+    qurt_context->bitmap_init = true;
+
+    return ERROR_OK;
+}
+
+COMMAND_HANDLER(hexagon_set_vtlb_params)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
+    target_addr_t vtlb_entries = 0;
 
     if (CMD_ARGC < 2)
     {
@@ -6096,59 +6335,30 @@ COMMAND_HANDLER(hexagon_set_vtlb_params)
         qurt_context->qurtk_vtlb_entries = vtlb_entries;
         command_print(CMD, " QURTK_vtlb_entries = 0x%llx", vtlb_entries);
     }
-    hexagon_memw_read(target, qurt_context->bitmap_addr, &bitmap_addr_temp);
-    for (unsigned int i = 0; i < vtlb_notify_size; i++)
-    {   
-        hexagon_memw_read(target, bitmap_addr_temp, &output);
-        bitmap_array_contents[i] = output;
-        bitmap_addr_temp = bitmap_addr_temp + 4;
-    } 
-    for(unsigned int i = 0; i < (vtlb_notify_size); i++) 
-    {
-        unsigned int binaryNum[32] = {0};
-        decToBinary(bitmap_array_contents[i], binaryNum);
-        for(int j = 0; j < 32; j++) 
-    {
-            final_str[final_str_ind] = binaryNum[j];
-            final_str_ind++;
-        }
-    }
-    hexagon_memw_read(target, qurt_context->qurtk_vtlb_entries, &vtlb_entries_temp);
-    for(unsigned int i = 0; i < final_str_ind; i++)
-    {
-        if (final_str[i] !=0)
-        {    
-            if (i < vtlb_entry_count)
-            {
-                hexagon_memw_read(target, vtlb_entries_temp, &output);
-                vtlb_entries_read[i] = output;
-                vtlb_entries_temp = vtlb_entries_temp + 4; 
-                hexagon_memw_read(target, vtlb_entries_temp, &output);
-                vtlb_entries_read[i+1] = output;
-                LOG_INFO("0x%llx\t", vtlb_entries_read[i+1]);
-                vtlb_entries_temp = vtlb_entries_temp + 4;
-            }
-            if (i < (sizeof(vtlb_entries_read) / sizeof(vtlb_entries_read[0])))
-            {
-                hexagon_update_vtlb_entry_in_structure(vtlb_entries_read[i],vtlb_entries_read[i+1],i);
-            }
-        }
-        else
-        {
-            vtlb_entries_temp = vtlb_entries_temp + 8;
-        }
-        i++;
-    }
-    free(final_str);
-    qurt_context->bitmap_init = true;
+    
     return ERROR_OK;
 }
+/* Core routine to set/read VTLB revision/refresh chain and cache it into qurt_context. */
+static int hexagon_update_vtlb_revision(struct target *target)
+    {
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
 
+    uint32_t output = 0;
+
+    LOG_INFO("QURTK_vtlb_revision  at = 0x%llx ", qurt_context->QURTK_vtlb_revision);
+    hexagon_memw_read (target, qurt_context->QURTK_vtlb_revision, &output);
+    qurt_context->refresh_indicator = output;
+    hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
+    qurt_context->revision_num = output;
+    LOG_INFO("revision num is = 0x%x ", qurt_context->revision_num);
+
+    return ERROR_OK;
+}
 
 COMMAND_HANDLER(hexagon_set_revision_addr)
 {
     target_addr_t input;
-    uint32_t output;
     struct target *target = get_current_target(CMD_CTX);
     struct hexagon_common *hexagon = target_to_hexagon (target);
     struct qurt_context_t *qurt_context = &hexagon->qurt_context;
@@ -6162,40 +6372,9 @@ COMMAND_HANDLER(hexagon_set_revision_addr)
         qurt_context->QURTK_vtlb_revision = input;
         command_print(CMD, " QURTK_vtlb_revision = 0x%llx", qurt_context->QURTK_vtlb_revision);
     }
-    // QURTK_vtlb_revision addr is read from elf
-    // to which we perform a read that returns refresh indicator address
-    // returned address is 32 bit
-    LOG_INFO("QURTK_vtlb_revision  at = 0x%llx ", qurt_context->QURTK_vtlb_revision);
-    hexagon_memw_read (target, qurt_context->QURTK_vtlb_revision, &output);
-    qurt_context->refresh_indicator = output;
-    hexagon_memw_read (target, qurt_context->refresh_indicator, &output);
-    qurt_context->revision_num = output;
-    LOG_INFO("revision num is = 0x%x ", qurt_context->revision_num);
     return ERROR_OK;
 }
 
-
-COMMAND_HANDLER(hexagon_mmu_init)
-{
-    struct target *target = get_current_target (CMD_CTX);
-    struct hexagon_common *hexagon = target_to_hexagon(target);
-    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
-
-    if (CMD_ARGC > 1)
-        return ERROR_COMMAND_SYNTAX_ERROR;
-
-    if (CMD_ARGC == 0)
-    {
-        hexagon->hexa_info.mmu_init = true;    
-        qurt_context->vtlb_initialized = 1;
-
-        command_print(CMD, "only vtlb logic is initialized");
-        LOG_INFO("only vtlb logic initialized");
-
-    }
-
-    return ERROR_OK;
-}
 
 
 COMMAND_HANDLER(hexagon_multi_th_init)
@@ -6210,7 +6389,9 @@ COMMAND_HANDLER(hexagon_multi_th_init)
     {
         LOG_INFO("multithreading mode command");
 
-        hexagon->hexa_info.mmu_init = true;    
+        bool mmu_enabled = hexagon_is_mmu_enabled(target);
+
+        hexagon->hexa_info.mmu_init = mmu_enabled;  
         hexagon->hexa_info.multi_thr_enabled = true;
         LOG_INFO("multi_thr_enabled : %d",hexagon->hexa_info.multi_thr_enabled);
 
@@ -6239,44 +6420,6 @@ COMMAND_HANDLER(hexagon_refresh_registers)
     }
     hexagon_read_gpr_registers(target, hexa_info->config.maxHwThreads);
     hexagon_read_ctrl_registers(target, hexa_info->config.maxHwThreads);
-
-    return ERROR_OK;
-}
-
-
-COMMAND_HANDLER(hexagon_clear_bitmap_array)
-{
-    uint32_t output;
-    int retval;
-    struct target *target = get_current_target(CMD_CTX);
-    struct hexagon_common *hexagon = target_to_hexagon (target);
-    struct qurt_context_t *qurt_context = &hexagon->qurt_context;
-
-    qurt_context->bitmap_addr = qurt_context->qurtk_vtlb_bitmap;
-    // target_addr_t bitmap_addr_temp ;
-    uint32_t bitmap_addr_temp;
-    LOG_INFO("QURTK_vtlb_bitmap array at = 0x%llx ", qurt_context->bitmap_addr);
-    hexagon_memw_read(target, qurt_context->bitmap_addr, &bitmap_addr_temp);
-
-    for (unsigned int i = 0; i < hexagon_vtlb_data.vtlb_no_of_entries/32; i++)
-    {   
-        retval = hexagon_memw_write(target, bitmap_addr_temp, 0x0 , 4);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("clear bitmap write failed");
-        }
-        bitmap_addr_temp = bitmap_addr_temp + 4;
-    } 
-
-    qurt_context->bitmap_addr = qurt_context->qurtk_vtlb_bitmap;
-    hexagon_memw_read(target, qurt_context->bitmap_addr, &bitmap_addr_temp);
-
-    for (unsigned int i = 0; i < hexagon_vtlb_data.vtlb_no_of_entries/32; i++)
-    {   
-        hexagon_memw_read(target, bitmap_addr_temp, &output);
-        LOG_INFO("bitmap content at 0x%x is 0x%x",bitmap_addr_temp, output);
-        bitmap_addr_temp = bitmap_addr_temp + 4;
-    } 
 
     return ERROR_OK;
 }
@@ -6399,18 +6542,11 @@ COMMAND_HANDLER(hexagon_SetETMclkAddress)
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
 
     target_addr_t etm_clk_en_Addr=0;
-    target_addr_t etm_clk_Res_Addr = 0;
 
     COMMAND_PARSE_ADDRESS(CMD_ARGV[0], etm_clk_en_Addr);
-    hexa_info->config.etmClkenAddr = etm_clk_en_Addr;
-    command_print(CMD, " ETM clock enable address = 0x%x", hexa_info->config.etmClkenAddr);
-    LOG_INFO(" ETM clock enable address = 0x%x", hexa_info->config.etmClkenAddr);
-    COMMAND_PARSE_ADDRESS(CMD_ARGV[1], etm_clk_Res_Addr);
-    hexa_info->config.etmResetAddr = etm_clk_Res_Addr;
-    command_print(CMD, " ETM clock Reset address = 0x%x", hexa_info->config.etmResetAddr);
-    LOG_INFO(" ETM clock reset address = 0x%x", hexa_info->config.etmResetAddr);
-
-    // }
+    hexa_info->etm_base = etm_clk_en_Addr;
+    command_print(CMD, " ETM clock enable address = 0x%x", hexa_info->etm_base);
+    LOG_INFO(" ETM clock enable address = 0x%x", hexa_info->etm_base);
 
     return ERROR_OK;
 }
@@ -6457,15 +6593,11 @@ COMMAND_HANDLER(hexagon_mem_dap)
 
     if (CMD_ARGC > 2)
         return ERROR_COMMAND_SYNTAX_ERROR;
-
-    // hexagon_populate_vtlb_entries(target);
-    // hexagon_read_tlb_entry(target);
-
     
     if (CMD_ARGC == 0)
     {
         LOG_INFO ("DUMPING VTLB ENTRIES");
-        hexagon_print_vtlb_entries();
+        hexagon_print_vtlb_data();
         LOG_INFO ("DUMPING TLB ENTRIES");
         hexagon_read_tlb_entry(target);
         return ERROR_OK;
@@ -6497,8 +6629,7 @@ COMMAND_HANDLER(hexagon_mem_dap)
         command_print(CMD, " value = 0x%llx", value);
         LOG_INFO("value = 0x%llx ", value);
         // retval = hexagon_new_memw_write(target, virt_addr, value, 1);
-        // hexagon_stuff_reg_restore(target);
-        retval = hexagon_memw_write(target, virt_addr, value, 1);
+        retval = hexagon_physical_addr_store(target, virt_addr, value, 1);
 
         LOG_DEBUG("hexagon_memw_write  Exit");
     }
@@ -6529,6 +6660,16 @@ COMMAND_HANDLER(hexagon_handle_untrusted_command)
 }
 
 
+/* Forward declarations for the QuRT enable/disable/status command handlers.
+ * Their bodies are defined just after this table, but the table references
+ * them, so declare the prototypes first. (COMMAND_HANDLER(name) expands to a
+ * function prototype/definition with the standard command-handler signature.) */
+COMMAND_HANDLER(hexagon_qurt_enable_cmd);
+COMMAND_HANDLER(hexagon_qurt_disable_cmd);
+COMMAND_HANDLER(hexagon_qurt_status_cmd);
+COMMAND_HANDLER(hexagon_qurt_stack_cmd);
+COMMAND_HANDLER(hexagon_qurt_set_offsets_cmd);
+
 static const struct command_registration hexagon_exec_command_handlers[] = {
     {
         .name = "cache_info",
@@ -6551,13 +6692,7 @@ static const struct command_registration hexagon_exec_command_handlers[] = {
         .help = "to help ignore or consider the first breakpoint sent from lldb while establishing gdb connection",
         .usage = "",
     },
-    {
-        .name = "mmu_init",
-        .handler = hexagon_mmu_init,
-        .mode = COMMAND_EXEC,
-        .help = "vtlb has been initialized",
-        .usage = "",
-    },
+
     {
         .name = "dbginit",
         .handler = hexagon_handle_dbginit_command,
@@ -6628,13 +6763,50 @@ static const struct command_registration hexagon_exec_command_handlers[] = {
         .help = "set vtlb entries",
         .usage = "[]",
     },
-    {   
-        .name = "clear_vtlb_entries",
-        .handler = hexagon_clear_bitmap_array,
-        .mode = COMMAND_ANY,
-        .help = "clear bitmap array",
-        .usage = "[]",
+    {
+        .name = "qurtEnable",
+        .handler = hexagon_qurt_enable_cmd,
+        .mode = COMMAND_EXEC,
+        .help = "Enable QuRT SW-thread awareness walk (run AFTER reaching main/QURTOS_init)",
+        .usage = "",
     },
+    {
+        .name = "qurtDisable",
+        .handler = hexagon_qurt_disable_cmd,
+        .mode = COMMAND_EXEC,
+        .help = "Disable QuRT SW-thread awareness walk (HW threads only)",
+        .usage = "",
+    },
+    {
+        .name = "qurtStatus",
+        .handler = hexagon_qurt_status_cmd,
+        .mode = COMMAND_EXEC,
+        .help = "Show whether the QuRT SW-thread walk is enabled",
+        .usage = "",
+    },
+    {
+        .name = "qurtStack",
+        .handler = hexagon_qurt_stack_cmd,
+        .mode = COMMAND_EXEC,
+        .help = "Print FRAMEKEY-unscrambled deep backtrace of a parked QuRT SW thread",
+        .usage = "<sw_thread_id>",
+    },
+    {
+        .name = "qurtSetOffsets",
+        .handler = hexagon_qurt_set_offsets_cmd,
+        .mode = COMMAND_ANY,
+        /* Push the TCB layout (SIZEOF + per-field offsets) that the lldb-side
+         * OSAM has resolved from the ELF's DWARF by struct member NAME. This
+         * makes the qurt.c SW walk authoritative across build variants
+         * (SIZEOF_TCB 384/448, utcb_name 28/32, ...) without hardcoding
+         * anything in the C driver. Invoked automatically by the OSAM init
+         * hook -- users should not need to run it manually. */
+        .help = "Push DWARF-resolved QuRT TCB offsets to the RTOS backend",
+        .usage = "<ctx_size> <prio> <tid> <ugpgp> <hthread> <ssrelr> "
+                 "<r0100> <r2928> <r3130> <framelimit> <framekey> "
+                 "<guest_info> <utcb_name>",
+    },
+ 
     // {
     //     .name = "mem_dap",
     //     .handler = hexagon_mem_dap,
@@ -6711,6 +6883,124 @@ static const struct command_registration hexagon_exec_command_handlers[] = {
     },
     COMMAND_REGISTRATION_DONE};
 
+/* QuRT RTOS-awareness enable/disable command hooks and the FRAMEKEY-aware
+ * FP-chain stack walker are declared in rtos/qurt.h (implemented in
+ * src/rtos/qurt.c). */
+
+COMMAND_HANDLER(hexagon_qurt_enable_cmd)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    if (!target || !target->rtos) {
+        command_print(CMD, "qurt: no RTOS attached to target");
+        return ERROR_FAIL;
+    }
+    qurt_set_walk_enabled(target, true);
+    command_print(CMD, "qurt: SW-thread walk ENABLED");
+    return ERROR_OK;
+}
+
+COMMAND_HANDLER(hexagon_qurt_disable_cmd)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    if (!target || !target->rtos) {
+        command_print(CMD, "qurt: no RTOS attached to target");
+        return ERROR_FAIL;
+    }
+    qurt_set_walk_enabled(target, false);
+    command_print(CMD, "qurt: SW-thread walk DISABLED");
+    return ERROR_OK;
+}
+
+COMMAND_HANDLER(hexagon_qurt_status_cmd)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    if (!target || !target->rtos) {
+        command_print(CMD, "qurt: no RTOS attached to target");
+        return ERROR_FAIL;
+    }
+    command_print(CMD, "qurt: SW-thread walk is %s",
+                  qurt_get_walk_enabled(target) ? "ENABLED" : "DISABLED");
+    return ERROR_OK;
+}
+
+/* hexagon qurtStack <swid> : print the FRAMEKEY-unscrambled deep backtrace of
+ * a parked QuRT SW thread (the authoritative trace lldb's native unwinder
+ * cannot produce). Symbolize the printed addresses on the host with
+ * `image lookup -a <addr>`. */
+COMMAND_HANDLER(hexagon_qurt_stack_cmd)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    if (!target || !target->rtos) {
+        command_print(CMD, "qurt: no RTOS attached to target");
+        return ERROR_FAIL;
+    }
+    if (CMD_ARGC != 1) {
+        command_print(CMD, "usage: hexagon qurtStack <sw_thread_id>");
+        return ERROR_COMMAND_SYNTAX_ERROR;
+    }
+    target_addr_t swid = 0;
+    COMMAND_PARSE_ADDRESS(CMD_ARGV[0], swid);
+    return qurt_stack_walk(target, (int64_t)swid, CMD);
+}
+
+/* hexagon qurtSetOffsets <ctx_size> <prio> <tid> <ugpgp> <hthread> <ssrelr>
+ *                        <r0100> <r2928> <r3130> <framelimit> <framekey>
+ *                        <guest_info> <utcb_name>
+ *
+ * Push authoritative TCB layout (SIZEOF and per-field byte offsets) resolved
+ * from the ELF's DWARF by struct member NAME into the QuRT RTOS backend.
+ * Issued by the lldb-side OSAM init hook (utils.py) via
+ *   `process plugin packet monitor hexagon qurtSetOffsets ...`
+ * after the ELF has been loaded and BEFORE the first halt-driven
+ * qXfer:threads:read, so the SW-thread walk is authoritative from the very
+ * first read. Idempotent: pushing again just overwrites and forces a re-cache
+ * on the next update.
+ *
+ * All 13 args are unsigned 32-bit values (context size + 12 offsets). If the
+ * target was not created with `-rtos qurt` the command reports an error;
+ * the OSAM tolerates that (some sub-targets don't attach a QuRT RTOS). */
+COMMAND_HANDLER(hexagon_qurt_set_offsets_cmd)
+{
+    struct target *target = get_current_target(CMD_CTX);
+    if (!target || !target->rtos) {
+        command_print(CMD, "qurt: no RTOS attached to target -- "
+                           "qurtSetOffsets requires `-rtos qurt` on this target");
+        return ERROR_FAIL;
+    }
+    if (CMD_ARGC != 13) {
+        command_print(CMD, "usage: hexagon qurtSetOffsets <ctx_size> "
+                           "<prio> <thread_id> <ugpgp> <hthread> <ssrelr> "
+                           "<r0100> <r2928> <r3130> <framelimit> <framekey> "
+                           "<guest_info> <utcb_name>");
+        return ERROR_COMMAND_SYNTAX_ERROR;
+    }
+
+    uint32_t v[13];
+    for (unsigned i = 0; i < 13; i++)
+        COMMAND_PARSE_NUMBER(u32, CMD_ARGV[i], v[i]);
+
+    int retval = qurt_apply_pushed_offsets(target,
+            v[0],                  /* context_size                     */
+            v[1], v[2], v[3],      /* prio, thread_id, ugpgp           */
+            v[4], v[5],            /* hthread, ssrelr                  */
+            v[6], v[7], v[8],      /* r0100, r2928, r3130              */
+            v[9], v[10],           /* framelimit, framekey             */
+            v[11], v[12]);         /* guest_info, utcb_name            */
+    if (retval != ERROR_OK) {
+        command_print(CMD, "qurt: apply_pushed_offsets failed (retval=%d)",
+                      retval);
+        return retval;
+    }
+
+    command_print(CMD, "qurt: TCB layout pushed (OSAM/DWARF): "
+                       "ctx_size=%u prio=%u tid=%u ugpgp=%u hthread=%u "
+                       "ssrelr=%u r0100=%u r2928=%u r3130=%u flim=%u "
+                       "fkey=%u ginfo=%u utcb=%u",
+                  v[0], v[1], v[2], v[3], v[4], v[5],
+                  v[6], v[7], v[8], v[9], v[10], v[11], v[12]);
+    return ERROR_OK;
+}
+
 static const struct command_registration hexagon_command_handlers[] = {
     {
         .name = "hexagon",
@@ -6744,6 +7034,7 @@ static int hexagon_handle_target_request(void *priv)
     struct target *target = priv;
     struct hexagon_common *hexagon = target->arch_info;
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    uint32_t brkptinfo = 0, brkptinfo1 = 0;
     int retval;
     static int cnt = 0;
     uint32_t *thrd_src;
@@ -6759,37 +7050,32 @@ static int hexagon_handle_target_request(void *priv)
         LOG_DEBUG("TARGET_HALTED\n"); 
         // Check the halt reason
 
-        uint32_t brkptinfo = 0;
         retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                 hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO, &brkptinfo); 
         if (retval != ERROR_OK) {
-            LOG_DEBUG("Could not read brkptinfo, retval = %d", retval);
+            LOG_DEBUG("BRKPTINFO read failed 0x%x", brkptinfo);
+            free(thrd_src);
             return retval;
         }
 
-        LOG_DEBUG("TARGET_HALTED, HEXAGON_ISDB_BRKPTINFO = 0x%x \n", brkptinfo);
+        if (hexa_info->config.maxHwThreads > NUM_HW_THREAD_IN_TILE0) {
+            retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                    hexa_info->debug_base + HEXAGON_ISDB_BRKPTINFO1, &brkptinfo1);
+            if (retval != ERROR_OK) {
+                LOG_DEBUG("BRKPTINFO read failed 0x%x", brkptinfo);
+                free(thrd_src);
+                return retval;
+            }    
+        }
 
-        if (hexa_info->config.maxHwThreads == 2)
-        {
-            thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE) >> (0));
-            thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE) >> (3));
+        for (uint32_t i = 0; i < hexa_info->config.maxHwThreads; i++) {
+            if (i < NUM_HW_THREAD_IN_TILE0)
+                thrd_src[i] = (brkptinfo >> (i * BPT_SRC_BITS_PER_THREAD)) & BPT_SRC_MASK;
+            else
+                thrd_src[i] = (brkptinfo1 >> ((i - NUM_HW_THREAD_IN_TILE0) * BPT_SRC_BITS_PER_THREAD)) & BPT_SRC_MASK;
         }
-        else if (hexa_info->config.maxHwThreads == 4)
-        {
-            thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE) >> (0));
-            thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE) >> (3));
-            thrd_src[2] = ((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE) >> (6));
-            thrd_src[3] = ((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE) >> (9));
-        }
-        else if (hexa_info->config.maxHwThreads == 6)
-        {
-            thrd_src[0] = ((brkptinfo & BRKPTINFO_THREAD0_BRKPT_SOURCE) >> (0));
-            thrd_src[1] = ((brkptinfo & BRKPTINFO_THREAD1_BRKPT_SOURCE) >> (3));
-            thrd_src[2] = ((brkptinfo & BRKPTINFO_THREAD2_BRKPT_SOURCE) >> (6));
-            thrd_src[3] = ((brkptinfo & BRKPTINFO_THREAD3_BRKPT_SOURCE) >> (9));
-            thrd_src[4] = ((brkptinfo & BRKPTINFO_THREAD4_BRKPT_SOURCE) >> (12));
-            thrd_src[5] = ((brkptinfo & BRKPTINFO_THREAD5_BRKPT_SOURCE) >> (15));
-        }
+
+        LOG_DEBUG("TARGET_HALTED, HEXAGON_ISDB_BRKPTINFO = 0x%x \n", brkptinfo);
 
         for (uint32_t i = 0; i < hexa_info->config.maxHwThreads; i++)
         {
@@ -6846,7 +7132,7 @@ static int hexagon_init_arch_info(struct target *target,
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
     struct qurt_context_t *qurt_context = &hexagon->qurt_context;
 
-      LOG_INFO("hexagon_init_arch_info");
+    LOG_DEBUG("hexagon_init_arch_info");
 
     hexagon->common_magic = HEXAGON_COMMON_MAGIC; 
 
@@ -6877,9 +7163,10 @@ static int hexagon_init_arch_info(struct target *target,
     qurt_context->QURTK_vtlb_revision = 0x0;
     qurt_context->qurtk_vtlb_bitmap = 0x0;
     qurt_context->bitmap_addr = 0x0;
-    qurt_context->vtlb_initialized = 0x0;
+    qurt_context->vtlb_initialized = false;
     qurt_context->bitmap_init = false;
-
+    qurt_context->tlb_fetched = false;
+    qurt_context->tlb_lldb_query_done = false;
 
     return ERROR_OK;
 }
@@ -6891,7 +7178,7 @@ static int hexagon_target_create(struct target *target, Jim_Interp *interp)
     struct hexagon_private_config *pc = target->private_config;
     struct hexagon_common *hexagon;
 
-    LOG_INFO("hexagon_target_create");
+    LOG_DEBUG("hexagon_target_create");
     
     if (adiv5_verify_config(&pc->adiv5_config) != ERROR_OK)
         return ERROR_FAIL;
@@ -6912,8 +7199,6 @@ static int hexagon_jim_configure(struct target *target, struct jim_getopt_info *
     struct hexagon_private_config *pc;
     struct jim_nvp *n;
     int e;
-
-    LOG_INFO("hexagon_jim_configure");
 
     pc = (struct hexagon_private_config *)target->private_config;
     if (pc == NULL) 
@@ -6963,9 +7248,14 @@ static int hexagon_jim_configure(struct target *target, struct jim_getopt_info *
     return JIM_OK;
 }
 
+void micro_second_sleep(uint32_t microseconds) {
+    struct timespec sleep_time;
+    sleep_time.tv_sec = 0;
+    sleep_time.tv_nsec = microseconds * 1000; // convert microseconds to nanoseconds
+    nanosleep(&sleep_time, NULL);
+}
 
-static void hexagon_wait_loop(void)
-{
+static void hexagon_wait_loop(void){
      uint16_t i, loop = 0;
 
     for (i = 0; i < loop_count; i++)
@@ -6982,21 +7272,15 @@ static uint64_t hexagon_etm_on(struct target *target)
 {
     struct hexagon_common *hexagon = target->arch_info;
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     static int initialized;
     uint64_t retval = ERROR_OK;
     uint32_t tmp;
 
-    // gHexConfig.etmResetAddr = 0x86988008,
-    // gHexConfig.etmClkenAddr = 0x86988000,
-
-
     if(!initialized)
     {
-        retval = enable_dbg_sys_pwr(swddp);
         LOG_INFO("Enabling ETM ");
         tmp = 0x3;
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->config.etmClkenAddr, tmp);
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base, tmp);
 
         if (retval != ERROR_OK)
         {
@@ -7006,7 +7290,7 @@ static uint64_t hexagon_etm_on(struct target *target)
         hexagon_wait_loop();
         tmp = 0x1;
         // retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,etm_clk_reset_addr, tmp);
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->config.etmResetAddr , tmp);
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base , tmp);
 
         if (retval != ERROR_OK)
         {
@@ -7014,8 +7298,12 @@ static uint64_t hexagon_etm_on(struct target *target)
             return retval;
         }
         hexagon_wait_loop();
-        tmp = 0x0;
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->config.etmResetAddr, tmp);
+
+
+        // assert resert
+        tmp = 0x1;
+
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base + HEXAGON_ETM_RESET, tmp);
 
         if (retval != ERROR_OK)
         {
@@ -7024,17 +7312,21 @@ static uint64_t hexagon_etm_on(struct target *target)
         }
         hexagon_wait_loop();
         LOG_INFO("After Enabling ETM ");
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap, hexa_info->config.etmClkenAddr , &tmp);
+        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base , &tmp);
         if (retval != ERROR_OK)
         {
-            LOG_DEBUG("unable to read ETM clk 0x%x", tmp);
+            LOG_DEBUG("unable to write to ETM reset 0x%x", tmp);
             return retval;
         }
         LOG_DEBUG("ETM clk 0x%x", tmp);
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->config.etmResetAddr, tmp);
+
+        // deassert resert
+        tmp = 0x0;
+
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base + HEXAGON_ETM_RESET, tmp);
         if (retval != ERROR_OK)
         {
-            LOG_DEBUG("unable to read ETM reset 0x%x", tmp);
+            LOG_DEBUG("unable to write to ETM reset0x%x", tmp);
             return retval;
         }
         LOG_DEBUG("ETM reset 0x%x", tmp);
@@ -7132,6 +7424,39 @@ static void hexagon_enable_clock(struct target *target)
 }
 #endif
 
+static int hexagon_examine_writes(struct target *target) {
+    struct hexagon_common *hexagon = target_to_hexagon(target);
+    struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
+    int retval = 0;
+
+    int num_writes = sizeof(examine_writes_dbg_base) / sizeof(examine_writes_dbg_base[0]);
+
+    for (int i = 0; i < num_writes; i++) {
+        uint32_t addr = examine_writes_dbg_base[i][0];
+        uint32_t val  = examine_writes_dbg_base[i][1];
+
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->debug_base + addr, val);
+        if (retval != ERROR_OK) {
+            LOG_DEBUG("Write failed at address 0x%llx", hexa_info->debug_base + addr);
+        }
+        LOG_INFO("After writing 0x%llx with value 0x%08x", hexa_info->debug_base + addr, val);
+    }
+    num_writes = sizeof(examine_writes_etm_base) / sizeof(examine_writes_etm_base[0]);
+
+    for (int i = 0; i < num_writes; i++) {
+        uint32_t addr = examine_writes_etm_base[i][0];
+        uint32_t val  = examine_writes_etm_base[i][1];
+
+        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->etm_base + addr, val);
+        if (retval != ERROR_OK) {
+            LOG_DEBUG("Write failed at address 0x%x", hexa_info->etm_base + addr);
+        }
+        LOG_INFO("After writing 0x%x with value 0x%08x", hexa_info->etm_base + addr, val);
+    }
+    return ERROR_OK;
+}
+
+
 static int hexagon_examine_first(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
@@ -7142,9 +7467,9 @@ static int hexagon_examine_first(struct target *target)
     LOG_DEBUG("Number of bp available brp_num_available= %d", hexagon->brp_num_available);
     LOG_DEBUG("Number of bp available brp_num= %d", hexagon->brp_num);
     LOG_DEBUG("Number of bp available brp_num_context= %d", hexagon->brp_num_context);
-    //Hard coding brp_num_available = 2 for now, need to find a permanent solution. *hexagon = target_to_hexagon(target); should give valid data.
-    hexagon->brp_num_available = 2;             //this value is constant to future ref
-    hexagon->brp_num = 2;                        //upon setting/removing HW breakpoint this value will be decreased/increased 
+    //Hard coding brp_num_available = HEXAGON_MAX_HW_BRKPT for now, need to find a permanent solution. *hexagon = target_to_hexagon(target); should give valid data.
+    hexagon->brp_num_available = HEXAGON_MAX_HW_BRKPT;             //this value is constant to future ref
+    hexagon->brp_num = HEXAGON_MAX_HW_BRKPT;                        //upon setting/removing HW breakpoint this value will be decreased/increased 
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
     //struct hexagon_private_config *pc;
     struct adiv5_dap *swddp = hexa_info->dap;
@@ -7174,8 +7499,6 @@ static int hexagon_examine_first(struct target *target)
             }
         }
     }
-
-    retval = enable_dbg_sys_pwr(swddp);
 
     retval = mem_ap_init(hexa_info->debug_ap);
     if (retval != ERROR_OK) {
@@ -7222,8 +7545,6 @@ static int hexagon_examine_first(struct target *target)
     if (retval != ERROR_OK)
         LOG_DEBUG("ETM enablement fail"); 
     
-
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
                 hexa_info->debug_base + HEXAGON_ISDB_ISDBCST, &isdbcstat);
     if (retval != ERROR_OK) {
@@ -7236,23 +7557,21 @@ static int hexagon_examine_first(struct target *target)
     return ERROR_FAIL;
     }
     
-    retval = hexagon_etm_on(target);
-    if (retval != ERROR_OK)
-        LOG_DEBUG("ETM enablement fail");
 
         /** check ISDB version details **/
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBVER, &isdbver);
     if (retval != ERROR_OK) {
         LOG_DEBUG("ISDBVER read failed 0x%x", isdbver);
         return retval;
     }
-    LOG_DEBUG(" ISDBver 0x%x  ", isdbver);
-        
+    LOG_DEBUG("ISDBver 0x%x  ", isdbver);
+    hexa_info->isdbver = isdbver;
+
+    if (hexa_info->isdbver == HEXAGON_V81)        
+        hexagon_examine_writes(target);
 
         /** check core version details **/
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_COREVER, &corever);
     if (retval != ERROR_OK) {
@@ -7261,9 +7580,6 @@ static int hexagon_examine_first(struct target *target)
     }
     LOG_DEBUG(" core ver 0x%x ", corever);
 
-
-
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBEN, &isdben);
     if (retval != ERROR_OK)
@@ -7282,7 +7598,6 @@ static int hexagon_examine_first(struct target *target)
         isdben |= ISDBEN_APB_ISDB_EN;
         isdben |= ISDBEN_ISDB_PREVNT_PWRDWN;
 
-        retval = enable_dbg_sys_pwr(swddp);
         retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                 hexa_info->debug_base + HEXAGON_ISDB_ISDBEN, isdben);
     if (retval != ERROR_OK)
@@ -7300,7 +7615,6 @@ static int hexagon_examine_first(struct target *target)
 
     hexagon_wait_loop();
 
-    retval = enable_dbg_sys_pwr(swddp);
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBEN, &isdben);
     if (retval != ERROR_OK)
@@ -7309,10 +7623,6 @@ static int hexagon_examine_first(struct target *target)
         return retval;
     }
     LOG_DEBUG("After ISDBEN read 0x%x ", isdben);
-
-
-
-    retval = enable_dbg_sys_pwr(swddp);
 
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbst);
@@ -7323,14 +7633,8 @@ static int hexagon_examine_first(struct target *target)
     }
     LOG_DEBUG("After ISDB status  0x%x ", isdbst);
     
-
-    
-
-//#if 0
-
-    
     //---------------Hexagon breakpoint global data structure setup---------------//
-    hexagon->brp_num = 2;
+    hexagon->brp_num = HEXAGON_MAX_HW_BRKPT;
     hexagon->brp_num_available = hexagon->brp_num;
     hexagon->brp_list = calloc(hexagon->brp_num, sizeof(struct hexagon_brp));
     for (int i = 0; i < hexagon->brp_num; i++) 
@@ -7349,9 +7653,6 @@ static int hexagon_examine_first(struct target *target)
     //hexagon_setup_isdb_config(target);
     //hexagon breakpoint config setup    
 
-
-    hexa_info->isdb_ver = isdbver;
-    hexa_info->corever= corever;
     if((isdben == 0x0) && (isdbver == 0x0) &&  (corever == 0x0))
     {
         LOG_ERROR("Not able to communicate with device , Reboot the device and try again");
@@ -7731,15 +8032,9 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
-
-    //struct adiv5_dap *swddp = hexa_info->dap;
     int retval , i=0;
     uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
-
-
-    
+    uint32_t isdb_mmode_cmd;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_write_global_ctrl_register: hw thrd: %d, regnum %d, value %d", hwthrd, regnum, value);
@@ -7756,13 +8051,6 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
     #endif
     isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
                                             ISDBCMD_TNUM_MASK_THREAD(hwthrd));
-
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    }
-    // */
 
     /* run the 1st instruction */
     retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
@@ -7783,52 +8071,16 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
 
     //  ensure that regnum-HEXAGON_SGP0 is not out of bounds before accessing it
     if ((regnum - HEXAGON_SGP0) >= 0 && (regnum - HEXAGON_SGP0) < 16) {
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap, hexa_info->debug_base + HEXAGON_ISDB_STFINST,
-                                        stuff_inst_global_reg_write[regnum-HEXAGON_SGP0][0]);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+
+        retval = hexagon_isdb_cmd_status(target, stuff_inst_global_reg_write[regnum-HEXAGON_SGP0][0],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
+            return ERROR_OK;
         }
     } else {
         LOG_ERROR("Array index out of bounds: %d", regnum - HEXAGON_SGP0);
     }
 
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-    LOG_DEBUG("ISDB status after ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-    }
-
-    /* wait till the stuff instruction is executed */
-    hexagon_wait_loop();
-
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-    LOG_DEBUG("ISDB status after ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-
-    /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-
-    if (isdb_cmd_status)
-    {
-         LOG_DEBUG("ISDBcommand failed in monitor  mode");
-         return ERROR_OK;
-    }
-    else
-    {    
         if (isdbsts & ISDBST_ISDB_MAILBOX_IN)
         {
             i = 0;
@@ -7843,7 +8095,7 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
                 LOG_DEBUG("ISDB status read for Mboxin %d time", i);
                 #endif
                 i++;
-                if (i==10)
+                if (i == HEXAGON_MAX_REG_RETRY)
                     break;
             }
             if(isdbsts & ISDBST_ISDB_MAILBOX_IN)
@@ -7854,39 +8106,17 @@ static int hexagon_write_global_ctrl_register(struct target *target, int regnum,
         }
         /* run the 2nd instruction */
         if ((regnum - HEXAGON_SGP0) >= 0 && (regnum - HEXAGON_SGP0) < 16) {
-            retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,hexa_info->debug_base + HEXAGON_ISDB_STFINST, 
-                                    stuff_inst_global_reg_write[regnum - HEXAGON_SGP0][1]);
-            if (retval != ERROR_OK) {
-                LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+
+        retval = hexagon_isdb_cmd_status(target, stuff_inst_global_reg_write[regnum - HEXAGON_SGP0][1],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
+            return ERROR_OK;
             }
+
         } else {
             LOG_ERROR("Array index out of bounds: %d", regnum - HEXAGON_SGP0);
         }
 
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-
-
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-        if (isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in monitor  mode");
-             return ERROR_OK;
-        }
-    }
     global_reg[regnum-HEXAGON_EVB]  = value;
     #ifdef  _HEXAGON_TARGET_TIME_PROFILING
         hexagon_end_time_cal_ms();
@@ -7903,17 +8133,13 @@ static int hexagon_write_ctrl_register(struct target *target, int regnum, uint32
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     int retval , i=0;
     uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd;
 
     #ifdef  _DEBUG_HEXAGON_
     LOG_DEBUG("hexagon_write_ctrl_register: hw thrd: %d, regnum %d, value 0x%x", hwthrd, regnum, value);
     #endif
-
-
-    
 
     if ((regnum == HEXAGON_C5_RESRV) || (regnum >= HEXAGON_C20_RESRV && regnum <= HEXAGON_C20_RESRV))
     {
@@ -7924,71 +8150,15 @@ static int hexagon_write_ctrl_register(struct target *target, int regnum, uint32
     isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
                     ISDBCMD_TNUM_MASK_THREAD(hwthrd));
 
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    }
-    // */
-
-    /* run the 1st instruction */
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status before ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-    
-
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, value);
     if (retval != ERROR_OK) {
         LOG_DEBUG("HEXAGON_ISDB_ISDBMBXIN return value is not OK");
     }
 
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,hexa_info->debug_base + HEXAGON_ISDB_STFINST, 
-                                stuff_inst_ctrl_reg_write[regnum-HEXAGON_SA0][0]);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-    }
-
-
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status after ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-       
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-    }
-
-    /* wait till the stuff instruction is executed */
-    hexagon_wait_loop();
-
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status after ISDBCMD run 0x%x", isdbsts);
-    #endif
-
-
-    /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-
-    if (isdb_cmd_status)
-    {
-         LOG_DEBUG("ISDBcommand failed in monitor  mode");
+    retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_write[regnum-HEXAGON_SA0][0],isdb_mmode_cmd);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDBcommand failed in monitor mode");
          return ERROR_OK;
     }
     else
@@ -8007,7 +8177,7 @@ static int hexagon_write_ctrl_register(struct target *target, int regnum, uint32
                 #endif
                     
                 i++;
-                if (i==10)
+                if (i == HEXAGON_MAX_REG_RETRY)
                     break;
             }
             if(isdbsts & ISDBST_ISDB_MAILBOX_IN)
@@ -8017,35 +8187,9 @@ static int hexagon_write_ctrl_register(struct target *target, int regnum, uint32
             }
         }
 
-        /* run the 2nd instruction */
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,hexa_info->debug_base + HEXAGON_ISDB_STFINST,
-                            stuff_inst_ctrl_reg_write[regnum-HEXAGON_SA0][1]);
-        if (retval != ERROR_OK) {
-            LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
-        }
-
-        retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-        }
-
-        /* wait till the stuff instruction is executed */
-        hexagon_wait_loop();
-    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-        if (retval != ERROR_OK)
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-        }
-        /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-        isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
-
-        if (isdb_cmd_status)
-        {
-             LOG_DEBUG("ISDBcommand failed in monitor  mode");
+        retval = hexagon_isdb_cmd_status(target, stuff_inst_ctrl_reg_write[regnum-HEXAGON_SA0][1],isdb_mmode_cmd);
+        if (retval != ERROR_OK){
+            LOG_DEBUG("ISDBcommand failed in monitor mode");
              return ERROR_OK;
         }
     }
@@ -8066,17 +8210,13 @@ static int hexagon_write_gpr_register(struct target *target, int regnum, uint32_
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     int retval , i=0;
     uint32_t isdbsts;
-    uint32_t isdb_mmode_cmd, isdb_cmd_status;
+    uint32_t isdb_mmode_cmd;
 
     #ifdef  _DEBUG_HEXAGON_
         LOG_DEBUG("hexagon_write_gpr_register: hw thrd: %d, regnum %d, value 0x%x", hwthrd, regnum, value);
     #endif
-
-
-    
 
     isdb_mmode_cmd = hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL,
                                             ISDBCMD_TNUM_MASK_THREAD(hwthrd));
@@ -8085,74 +8225,31 @@ static int hexagon_write_gpr_register(struct target *target, int regnum, uint32_
         hexagon_start_time_cal_ms();
     #endif
     
-    // /*
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
-    }
-    // */
-
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK) {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status before ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-    
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
             hexa_info->debug_base + HEXAGON_ISDB_ISDBMBXIN, value);
     if (retval != ERROR_OK) {
         LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
     }
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_STFINST, stuff_inst_gpr_write[regnum]);
-    if (retval != ERROR_OK)
-    {
-        LOG_DEBUG("HEXAGON_ISDB_STFINST return value is not OK");
+
+    retval = hexagon_poll_mbxin(target);
+    if (retval != ERROR_OK){
+        LOG_DEBUG("ISDB MBX_IN not found to be full");
     }
 
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK)
-    {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status after ISDBMBXIN write 0x%x", isdbsts);
-    #endif
-
-    retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
-                                     hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
-    if (retval != ERROR_OK)
-    {
-        LOG_DEBUG("HEXAGON_ISDB_ISDBCMD return value is not OK");
-    }
-
-    /* wait till the stuff instruction is executed */
-    hexagon_wait_loop();
-
-    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
-    if (retval != ERROR_OK)
-    {
-        LOG_DEBUG("ISDBST read failed 0x%x", isdbsts);
-    }
-    #ifdef  _DEBUG_HEXAGON_
-        LOG_DEBUG("ISDB status after ISDBCMD write 0x%x", isdbsts);
-    #endif
-
+    retval = hexagon_isdb_cmd_status(target, stuff_inst_gpr_write[regnum],isdb_mmode_cmd);
 
     /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-    isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
+    // isdb_cmd_status = isdbsts & ISDBST_ISDB_CMD_STATUS;
 
-    if (isdb_cmd_status)
-    {
-         LOG_DEBUG("ISDBcommand failed in user mode");
+    if (retval != ERROR_OK){
+         LOG_DEBUG("ISDBcommand failed");
          return ERROR_OK;
     }
-    else if(isdbsts & ISDBST_ISDB_MAILBOX_IN)
+
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+            hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts);
+
+    if(isdbsts & ISDBST_ISDB_MAILBOX_IN)
     {
         i = 0;
         while (isdbsts & ISDBST_ISDB_MAILBOX_IN)
@@ -8166,7 +8263,7 @@ static int hexagon_write_gpr_register(struct target *target, int regnum, uint32_
             #endif 
                 
             i++;
-            if (i==10)
+            if (i == HEXAGON_MAX_REG_RETRY)
                 break;
         }
         if(isdbsts & ISDBST_ISDB_MAILBOX_IN)
@@ -8222,7 +8319,7 @@ static int hexagon_read_core_reg(struct target *target, struct reg *r, int regnu
 static int hexagon_init_target(struct command_context *cmd_ctx,
     struct target *target)
 {
-    LOG_INFO(" hexagon_init_target");
+    LOG_DEBUG(" hexagon_init_target");
     return ERROR_OK;
 }
 
@@ -8256,50 +8353,30 @@ static void hexagon_deinit_target(struct target *target)
         free(hexagon_vtlb_entries);
 }
 
-
-static int hexagon_read_ISDB(struct target *target, uint32_t isdbsts, uint64_t stuffcmdStatusCheck)
+/* Function to read ISDBST register */
+static int hexagon_read_ISDBST(struct target *target, uint32_t *isdbst)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    int retval , count=0;
-    uint32_t isdbsts_new = isdbsts, isdb_cmd_status;
+    int retval;
 
-    while (isdbsts == isdbsts_new && count <= 1000)
-    {    
-        retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
-                    hexa_info->debug_base + HEXAGON_ISDB_ISDBST, &isdbsts_new);
+    retval = mem_ap_read_atomic_u32(hexa_info->debug_ap,
+                hexa_info->debug_base + HEXAGON_ISDB_ISDBST, isdbst);
 
-        if (retval != ERROR_OK) 
-        {
-            LOG_DEBUG("ISDBST read failed 0x%x", isdbsts_new);
-            return retval;
-        }
+    if (retval != ERROR_OK) {
+        LOG_DEBUG("HEXAGON_ISDB_ISDBST read failed, retval=%d", retval);
+        return retval;
     }
-    if (count>= 1000)
-    {
-        LOG_DEBUG("ISDBST COMMAND failed 0x%x", isdbsts_new);
-        return ERROR_FAIL;
-    }
-    LOG_DEBUG("HEXAGON_ISDB_ISDBST value : 0x%x after ISDBSTUFF COMMAND : 0x%llx", isdbsts_new , stuffcmdStatusCheck);
-    isdb_cmd_status = isdbsts_new & stuffcmdStatusCheck;
 
-    if(isdb_cmd_status)
-    {
-        LOG_DEBUG("ISDBcommand  failed ");
-    }
-    /* if isdb_cmd_status 0 in cmd was successfull in case of 1 failed */ 
-    LOG_DEBUG("HEXAGON_ISDB_ISDBCMD write successful ");
-
+    LOG_DEBUG("HEXAGON_ISDB_ISDBST value: 0x%08x", *isdbst);
     return ERROR_OK;
 }
-
 
 static int hexagon_mmu(struct target *target, int *enabled)
 {
     uint64_t syscfg,retval;
 
     retval = hexagon_read_syscfg_register(target);
-    // hexagon_stuff_reg_restore_r7(target);
     hexagon_stuff_reg_restore(target);
     if(retval == ERROR_OK)
         syscfg= hexagon_syscfg_reg;
@@ -8313,8 +8390,10 @@ static int hexagon_mmu(struct target *target, int *enabled)
         return ERROR_TARGET_INVALID;
     }
     LOG_DEBUG("SYSCFG register is  0x%llx", syscfg);
-    if(syscfg & 1)
-        mmu->mmu_enabled = 1;
+    if(syscfg & 1){
+        mmu->mmu_enabled = true;
+    }
+    
     if(syscfg & (1<<1))
         mmu->instrution_cache_enabled = 1;
     if(syscfg & (1<<2))
@@ -8322,8 +8401,6 @@ static int hexagon_mmu(struct target *target, int *enabled)
     
     *enabled = target_to_hexagon(target)->hexa_info.hexagon_mmu.mmu_enabled;
 
-    
-    
     return ERROR_OK;
 }
 
@@ -8733,13 +8810,10 @@ int send_isdb_interrupt(struct target *target)
 {
     struct hexagon_common *hexagon = target_to_hexagon(target);
     struct hexagon_arch_info *hexa_info = &hexagon->hexa_info;
-    struct adiv5_dap *swddp = hexa_info->dap;
     uint32_t isdb_mmode_cmd = ISDBCMD_CMD_INTRPT | ISDBCMD_MONITOR_LVL;
     uint32_t isdb_cmd_status, isdbsts;
     int retval;
-    retval = enable_dbg_sys_pwr(swddp);
-    if (retval != ERROR_OK)
-        LOG_DEBUG("enable_dbg_sys_pwr return value is not OK");
+
     retval = mem_ap_write_atomic_u32(hexa_info->debug_ap,
                                      hexa_info->debug_base + HEXAGON_ISDB_ISDBCMD, isdb_mmode_cmd);
     

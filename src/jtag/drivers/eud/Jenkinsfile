@@ -1,0 +1,29 @@
+pipeline {
+    agent {
+        node {
+            label 'hyd-lablnx456'
+        } 
+    }
+    stages {
+        stage('Build') { 
+            steps {
+                sh 'pwd'
+                sh 'autoreconf --verbose --force --install'
+                sh './configure --enable-dll'
+                sh 'make -j 14'
+            }
+        }
+    }
+    post {
+        success {
+            withCredentials([usernamePassword(credentialsId: 'cbsp-gh-tkn', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                sh 'curl -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${PASSWORD}" "https://github.qualcomm.com/api/v3/repos/${USERNAME}/eud/statuses/${GIT_COMMIT}" -d "{\\"state\\": \\"success\\",\\"context\\": \\"CI/jenkins\\", \\"description\\": \\"Build-Compilation-Passed\\", \\"target_url\\": \\"${BUILD_URL}console\\"}"'
+            }
+        }
+        failure {
+            withCredentials([usernamePassword(credentialsId: 'cbsp-gh-tkn', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                sh 'curl -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${PASSWORD}" "https://github.qualcomm.com/api/v3/repos/${USERNAME}/eud/statuses/${GIT_COMMIT}" -d "{\\"state\\": \\"failure\\",\\"context\\": \\"CI/jenkins\\", \\"description\\": \\"Build-Compilation-Failed\\", \\"target_url\\": \\"${BUILD_URL}console\\"}"'
+            }
+        }
+    }
+}

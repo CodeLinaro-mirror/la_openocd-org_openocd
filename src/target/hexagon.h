@@ -21,7 +21,10 @@
 #define OPENOCD_TARGET_HEXAGON_H
 
 #include "armv8.h"
+#include <helper/time_support.h>
+
 #define RSPVERSION 0x1
+//  to be enabled during debug - causes delay if not
 
 /*******************************Common MACRO for Feature control********************************************/
 
@@ -47,9 +50,15 @@
 #define  HEXAGON_MSS_QDSP6SS_WDOG_DISABLE  0x0
 #define  HEXAGON_MSS_QDSP6SS_WDOG_ENABLE   0x7
 
+/* HEXAGON VERSION */
+#define HEXAGON_V81                    0x81
 
-
-#define HEXAGON_MAX_ISDB_REG 17
+#define HEXAGON_MAX_ISDB_REG           17
+/* Temporary MACRO*/
+#define HEXAGON_MAX_HW_BRKPT           0x2
+#define HEXAGON_DEFAULT_WAIT_LOOP      1000
+#define HEXAGON_MAX_REG_RETRY          10
+#define HEXAGON_MAX_BKPT_RETRY         5
 
 /** ISDB register offsets w.r.t Hexagon debug_base (Sec:13.5) **/
 #define HEXAGON_ISDB_ISDBST            0x00
@@ -69,14 +78,41 @@
 #define HEXAGON_ISDB_COREVER           0x38
 #define HEXAGON_ISDB_ISDBGPR           0x3C
 #define HEXAGON_ISDB_ISDBCST           0x40
+/* Hexagon v81 ISDB Registers */
+#define HEXAGON_ISDB_ISDBST1           0x44
+#define HEXAGON_ISDB_ISDBST2           0x48
+#define HEXAGON_ISDB_BRKPTINFO1        0x4C
 
 #define HEXAGON_ALL_ISDB_REG           0xAA
 
-/** SYSCFG register field **/
-#define SYSCFG_L2NRA                   (0x1 << 22)
-#define SYSCFG_L2NWA                   (0x1 << 21)
-#define SYSCFG_L2WB                    (0x1 << 23)
+#define HEXAGON_APB_SPACE_UNLOCK       0xFB0
 
+/** SYSCFG register field **/
+#define SYSCFG_L2_CACHE                0x10
+#define SYSCFG_L2_CACHE_BIT_MASK       0x7
+#define SYSCFG_MMU_BIT                 (0x1 << 0)
+#define SYSCFG_I                       (0x1 << 1)
+#define SYSCFG_D_CACHE                 (0x1 << 2)
+#define SYSCFG_T                       (0x1 << 3)
+#define SYSCFG_G                       (0x1 << 4)
+#define SYSCFG_R                       (0x1 << 5)
+#define SYSCFG_C                       (0x1 << 6)
+#define SYSCFG_V2X                     (0x1 << 7)
+#define SYSCFG_IDA                     (0x1 << 8)
+#define SYSCFG_PM                      (0x1 << 9)
+#define SYSCFG_TL                      (0x1 << 11)
+#define SYSCFG_KL                      (0x1 << 12)
+#define SYSCFG_BQ                      (0x1 << 13)
+#define SYSCFG_PRIO                    (0x1 << 14)
+#define SYSCFG_DMT                     (0x1 << 15)
+#define SYSCFG_L2CFG                   (0x7 << 16)
+#define SYSCFG_ITCM                    (0x1 << 19)
+#define SYSCFG_CCE                     (0x1 << 20)
+#define SYSCFG_L2NWA                   (0x1 << 21)
+#define SYSCFG_L2NRA                   (0x1 << 22)
+#define SYSCFG_L2WB                    (0x1 << 23)
+#define SYSCFG_L2P                     (0x1 << 24)
+#define SYSCFG_SLV_CTL0                (0x2 << 25)
 
 /** ISDB status register fields **/
 #define ISDBST_ISDB_READY              (0x1 << 0)
@@ -85,8 +121,27 @@
 #define ISDBST_ISDB_CMD_STATUS         (0x1 << 4)
 #define ISDBST_STUFF_CMD_STATUS        (0x1 << 5)
 #define ISDBST_DEBUG_MODE_STATUS       (0xFF << 8)
-#define ISDBST_OFF_MODE_STATUS         (0xF << 16)
-#define ISDBST_WAITRUN_MODE_STATUS     (0xF << 24)
+#define ISDBST_OFF_MODE_STATUS         (0xFF << 16)
+#define ISDBST_WAITRUN_MODE_STATUS     (0xFF << 24)
+
+/** Shift values to extract ISDB status bits **/
+#define ISDBST_OFF_MODE_STATUS_SHIFT       16
+#define ISDBST_DEBUG_MODE_STATUS_SHIFT     8
+#define ISDBST_WAITRUN_MODE_STATUS_SHIFT   24
+
+/** ISDBST1 fields **/
+#define ISDBST1_OFF_MODE_STATUS         (0xFFFF << 0)
+#define ISDBST1_WAITRUN_MODE_STATUS     (0xFFFF << 16)
+
+/** ISDBST2 fields  **/
+// bit fields 0 - 5 repeat of ISDBST bit fields
+#define ISDBST2_ISDB_READY              (0x1 << 0)
+#define ISDBST2_ISDB_MAILBOX_OUT        (0x1 << 1)
+#define ISDBST2_ISDB_MAILBOX_IN         (0x1 << 2)
+#define ISDBST2_ISDB_CMD_STATUS         (0x1 << 4)
+#define ISDBST2_STUFF_CMD_STATUS        (0x1 << 5)
+#define ISDBST2_RESERVED_MASK           (0x3FF << 6)
+#define ISDBST2_DEBUG_MODE_STATUS       (0xFFFF << 16)
 
 /** ISDB configuration register0 fields **/
 #define ISDBCFG0_ETMBRKPT_TNUM_MASK    (0x3F << 0)
@@ -131,9 +186,14 @@
 #define ISDBCMD_TNUM_MASK_4             (0xF << 8)
 #define ISDBCMD_TNUM_MASK_6             (0x3F << 8)
 #define ISDBCMD_TNUM_MASK_8	            (0xFF << 8)
-// #define ISDBCMD_TNUM_RESUME_ALL_THREADS(A)    (((1 << (A)) - 1) << 8)
-#define ISDBCMD_TNUM_MASK_THREAD(A)    (0x1 << (8+A))
- 
+#define ISDBCMD_ALL_THREADS_MASK(A)     (((1 << (A)) - 1) << 8)
+#define ISDBCMD_TNUM_MASK_THREAD(A)     (0x1 << (8+A))
+#define ISDBCMD_TNUM_SHIFT              8
+
+#define NUM_HW_THREAD_IN_TILE0          0x8
+#define BPT_SRC_BITS_PER_THREAD         3
+#define BPT_SRC_MASK                    0x7  // 3 bits
+
 
 /** ISDB Enable register fields **/
 #define ISDBEN_APB_ISDB_EN             (0x1 << 0)
@@ -152,13 +212,33 @@
 #define COREVER_UID            (0xF << 20)
 #define COREVER_METAL          (0xFF << 24)
 
+/* HEXAGON ETM REGISTERS */
+#define HEXAGON_ETM_CLKEN               0x0
+#define HEXAGON_ETM_CTRL0               0x4
+#define HEXAGON_ETM_RESET               0x8
+#define HEXAGON_ETM_TRIG0_SAC0_ADDR     0x10
+#define HEXAGON_ETM_TRIG0_CTRL2         0xDC
+#define HEXAGON_ETM_PROF_SRC_CTRL3      0x100
+#define HEXAGON_ETM_ASYNC_PERIOD        0xB8
+#define HEXAGON_ETM_ISYNC_PERIOD        0xBC
+#define HEXAGON_ETM_GSYNC_PERIOD        0xC0
+#define HEXAGON_ETM_TEST_BUS_CTRL0      0xCC
+#define HEXAGON_ETM_TEST_BUS_CTRL1      0xF4
 
+#define HEXAGON_ETM_CTRL1               0xF0
+#define HEXAGON_ETM_ATID                0xD4
+#define HEXAGON_ETM_ATID_TILE1          0xCC
 
 /** ISDB Core Status register fields **/
 #define ISDBCST_ALLWIAT        (0x1 << 1)
 #define ISDBCST_RESET_OR_PC    (0x1 << 2)
 #define ISDBCST_AXIM_BUS_ISO   (0x1 << 3)
 #define ISDBCST_AXIM2_BUS_ISO  (0x1 << 4)
+
+/** Instruction Packet Parse Field Macros **/
+#define INSTRUCTION_PARSE_FIELD (0x3U << 14)
+#define END_OF_PACKET 0x3U
+#define DUPLEX_PACKET 0x0U
 
 /** page table related macros **/
 #define VIRT_PAGE(hi)  (hi & 0xfffff)
@@ -188,6 +268,20 @@
 #define HEXAGON_PAGE_SIZE_4M         (0x00400000)
 #define HEXAGON_PAGE_SIZE_16M        (0x01000000)
 
+#define MAX_RSP_BUF_SIZE           890U
+
+#define SIZE_4K    (0x00001000)
+#define SIZE_16K   (0x00004000)
+#define SIZE_64K   (0x00010000)
+#define SIZE_256K  (0x00040000)
+#define SIZE_1M    (0x00100000)
+#define SIZE_4M    (0x00400000)
+#define SIZE_16M   (0x01000000)
+#define SIZE_64M   (0x04000000)
+#define SIZE_256M  (0x10000000)
+#define SIZE_1G    (0x40000000)
+
+#define MAX_NUM_SUPPORTED_PAGE_SIZE  10U
 
 enum hexagon_hw_thread {
     HEXAGON_HW_THREAD0=0,
@@ -364,6 +458,24 @@ enum hexagon_registers {
 
 #define hexagon_pack_isdbcmd(cmd, prilvl, thrdmsk) ((cmd) | (prilvl) | (thrdmsk))
 
+/* MMODE cmd status register for a 32 bit stuff instruction execution on thread 0 in monitor mode.*/
+#define HEXAGON_ISDB_MMODE_CMD  (hexagon_pack_isdbcmd(ISDBCMD_CMD_STUFF, ISDBCMD_MONITOR_LVL, ISDBCMD_TNUM_MASK_THREAD(0)))
+#define HEXAGON_MOD_4_BINARY_MASK            0x3 //binary 0011
+#define HEXAGON_ALIGN_MASK                   (~HEXAGON_MOD_4_BINARY_MASK)
+#define HEXAGON_ROUND_UP_TO_4(bytes)         (((bytes) + 3U) & HEXAGON_ALIGN_MASK)
+#define BYTE_SIZE                            0x1
+#define WORD_SIZE                            0x4
+#define HEXAGON_STUFF_MBXIN_TO_R0            0x6ea8c000
+#define HEXAGON_STUFF_MBXIN_TO_R1            0x6ea8c001
+#define HEXAGON_STUFF_MBXIN_TO_R7            0x6ea8c007
+#define HEXAGON_STUFF_MBXOUT_TO_R7           0x6707c029
+#define HEXAGON_STUFF_R7_TO_MEMB             0xa100c700
+#define HEXAGON_STUFF_R7_TO_MEMH             0xa140c700
+#define HEXAGON_STUFF_R7_TO_MEMW             0xa180c700
+#define HEXAGON_STUFF_R7_TO_MEMW_PHYS        0x9200e107
+#define HEXAGON_STUFF_ISYNC_INST             0x57c0c002
+#define HEXAGON_STUFF_BARRIER_INST           0xa800c000
+#define HEXAGON_STUFF_SYNCHT_INST            0xa840c000
 
 typedef struct {
     unsigned id;
@@ -485,6 +597,7 @@ static const uint32_t hexagon_opcodes[HEXA_OPCODE_MAX] = {
 #define HEXA_DBG_APBBRKPT      (0x4)
 #define HEXA_DBG_EXTBRKPT      (0x5)
 
+#define MAX_STR_LEN_THREAD_NAME  20
 
 struct hexagon_brp {
     int used;
@@ -623,23 +736,20 @@ typedef struct
     uint8_t U  : 1;
 } tlb_entries;
 
-typedef struct hexagon_config
-{
+typedef struct hexagon_config{
     uint32_t maxHwThreads;
-    char (*pThreadNameArray)[20];
+    char (*pThreadNameArray)[MAX_STR_LEN_THREAD_NAME];
     uint32_t qpss6WDOGCtl;
     uint32_t numTlbEntries;
     tlb_entries *pTlbEntries;
     uint32_t clkEnAddr[8];
-    uint32_t etmClkenAddr;
-    uint32_t etmResetAddr;
 } hexagon_config;
 
 struct hexagon_arch_info {
     hexagon_config config;
 
     /* Hold the last read ISDB registers values */
-    uint32_t isdb_ver;
+    uint32_t isdbver;
     uint32_t corever;
     uint32_t isdb_enable;
     uint32_t isdb_status;
@@ -659,6 +769,7 @@ struct hexagon_arch_info {
     struct adiv5_dap *dap;
     // uint32_t debug_base; - mem_ap_read/writes all expect debug_base to be target_addr_t type
     target_addr_t debug_base;
+    uint32_t etm_base;
     struct adiv5_ap *debug_ap;
     struct reg_cache *core_cache;
 
@@ -695,24 +806,26 @@ typedef struct{
     uint16_t pid;
 } process_pd;
 
-typedef struct qurt_context_t
-{
+typedef struct qurt_context_t{
     uint32_t refresh_indicator;
     uint32_t revision_num;
-
     uint32_t debug_thread_id;
     int      selected_process;
     uint16_t total_process;
     uint64_t hexagon_debug_process_id;
-
     uint32_t qurtk_vtlb_main_addr;
     target_addr_t qurtk_vtlb_entries; 
     target_addr_t QURTK_vtlb_revision;
     uint64_t qurtk_vtlb_bitmap;  // Initialize to 0 - AGNELO
     uint64_t bitmap_addr;
-    uint8_t  vtlb_initialized;
+    bool  vtlb_initialized;
     bool bitmap_init;
+    bool tlb_fetched;
+    bool tlb_lldb_query_done;
     process_pd process_list[4];
+    bool vtlb_bitmap_logic_init_done;
+
+    double delay;
 } qurt_context_t;
 
 typedef struct {
@@ -854,7 +967,8 @@ typedef struct{
 } untrusted_payload;
 
 // extern bool is_hexagon_untrusted; // AGNELO - XXXXX
-
+extern vtlb_data hexagon_vtlb_data;
+extern tlb_entries *hexagon_vtlb_entries;
 /*
 hexagon-Untrusted mode function prototypes
 */
@@ -868,6 +982,20 @@ extern bool hexagon_is_spurious_breakpoint(struct target *target);
 extern void hexagon_clear_spurious_breakpoint_flag(struct target *target);
 extern void hexagon_breakpoint_address_thread_select(struct target *target, uint64_t address);
 extern int hexagon_thread_id_thread_select(struct target *target);
+
+/* NOTE: the QuRT OS-awareness read hooks (hexagon_rtos_read_u32,
+ * hexagon_rtos_read_u32_phys, hexagon_rtos_read_buffer_asid,
+ * hexagon_rtos_get_hwthread_reg_list, hexagon_rtos_current_hwthread,
+ * hexagon_rtos_vtlb_ready) are declared in src/rtos/qurt.h now — the single
+ * source of truth for the qurt<->hexagon interface. Do not re-declare them
+ * here; that would produce a -Wredundant-decls warning in hexagon.c which
+ * includes both headers. */
+
+void hexagon_print_single_vtlb_entry(unsigned int tlblo, unsigned int tlbhi, char *op_buf);
+void hexagon_print_single_tlb_entry(int32_t *index, tlb_entries *entry, int32_t max_entires, char *op_buf);
+
+int handle_tlb_state_machine(struct target *target, const char *packet, char *op_buf);
+int handle_pagetable_state_machine(const char *packet, char *op_buf);
 
 
 #endif  /* OPENOCD_TARGET_HEXAGON_H */

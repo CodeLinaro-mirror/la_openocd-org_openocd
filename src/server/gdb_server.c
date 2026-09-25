@@ -21,6 +21,9 @@
  *                                                                         *
  *   Copyright (C) 2013 Franck Jullien                                     *
  *   elec4fun@gmail.com                                                    *
+ *                                                                         *
+ *   Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.    *
+ *   All rights reserved.                                                  *
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -181,7 +184,7 @@ char *hexagon_registerinfo[] = {
 	"name:r19;alt-name:R19;bitsize:32;variable-size:0;offset:76;encoding:uint;format:hex;set:Thread Registers;gcc:19;dwarf:19;generic:;",
 	"name:r20;alt-name:R20;bitsize:32;variable-size:0;offset:80;encoding:uint;format:hex;set:Thread Registers;gcc:20;dwarf:20;generic:;",
 	"name:r21;alt-name:R21;bitsize:32;variable-size:0;offset:84;encoding:uint;format:hex;set:Thread Registers;gcc:21;dwarf:21;generic:;",
-	"name:r22;alt-name:R22;bitsize:32;variable-size:0;offset:88;encoding:uint;format:hex;set:Thread Registers;gcc:21;dwarf:22;generic:;",
+	"name:r22;alt-name:R22;bitsize:32;variable-size:0;offset:88;encoding:uint;format:hex;set:Thread Registers;gcc:22;dwarf:22;generic:;",
 	"name:r23;alt-name:R23;bitsize:32;variable-size:0;offset:92;encoding:uint;format:hex;set:Thread Registers;gcc:23;dwarf:23;generic:;",
 	"name:r24;alt-name:R24;bitsize:32;variable-size:0;offset:96;encoding:uint;format:hex;set:Thread Registers;gcc:24;dwarf:24;generic:;",
 	"name:r25;alt-name:R25;bitsize:32;variable-size:0;offset:100;encoding:uint;format:hex;set:Thread Registers;gcc:25;dwarf:25;generic:;",
@@ -373,8 +376,6 @@ char *qregiterinfo_aarch32[] = {
 	"name:fpscr;bitsize:32;offset:322;encoding:uint;format:hex;set:float;",
 	"E45"};
 
-/*  current_target_hexagon variable contains info if current debug target is hexagon modem*/
-unsigned int current_target_hexagon = 0;
 
 /*  hexagon_no_of_threads  variable contains info regarding no of HW threads in system*/
 unsigned int hexagon_no_of_threads = 0;
@@ -905,7 +906,7 @@ static inline int fetch_packet(struct connection *connection,
 	struct target *target = get_target_from_connection(connection);
 
 	/*Hexagon untrusted mode changes*/
-	if (current_target_hexagon  &&  is_hexagon_mode_untrusted(target) == true)
+	if ((strncmp(target->type->name, "hexagon", 7) == 0)  &&  is_hexagon_mode_untrusted(target) == true)
 	{
 		retval = hexagon_untrusted_update_packet(target, buffer, count);
 		if (retval != ERROR_OK)
@@ -1097,7 +1098,10 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 
 		current_thread[0] = '\0';
 
-		if (current_target_hexagon)
+		/* When an RTOS (e.g. qurt) is attached, report the current thread
+		 * from the RTOS layer rather than the hexagon HW-thread index so the
+		 * IDE selects the correct QuRT thread on a stop. */
+		if (strncmp(target->type->name, "hexagon", 7) == 0 && !target->rtos)
 		{   
 		#ifdef BREAKPOINT_THREAD_SELECT
 			current_thread_id_hexagon = hexagon_thread_id_thread_select(target);
@@ -1299,12 +1303,10 @@ static int gdb_new_connection(struct connection *connection)
 
     if (strncmp(target->type->name, "hexagon", 7) == 0)
 	{
-		current_target_hexagon = 1;
         hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
         LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
-
 	}
-	LOG_DEBUG("current_target_hexagon=%d", current_target_hexagon);
+  
 	/* initialize gdb connection information */
 	gdb_connection->buf_p = gdb_connection->buffer;
 	gdb_connection->buf_cnt = 0;
@@ -1422,7 +1424,6 @@ static int gdb_connection_closed(struct connection *connection)
 	 * cleaning up connection.
 	 */
 	log_remove_callback(gdb_log_callback, connection);
-	current_target_hexagon = 0;
 	hexagon_no_of_threads = 0;
 
 	gdb_actual_connections--;
@@ -1677,7 +1678,7 @@ static int gdb_qregister_packet(struct connection *connection,
 								char const *packet, int packet_size)
 {
 	struct target *target = get_target_from_connection(connection);
-	struct arm *arm = target_to_arm(target);
+
 	char *reg_packet = NULL;
 	int reg_num;
 	
@@ -1690,14 +1691,42 @@ static int gdb_qregister_packet(struct connection *connection,
 	{
 		reg_packet = hexagon_registerinfo[reg_num];
 	}
-	else if (arm->core_state == ARM_STATE_AARCH64)
+
+	else
+
 	{
-		reg_packet = qregiterinfo_aarch64[reg_num];
+
+		/* Only access arm->core_state for actual ARM targets */
+		struct arm *arm = target_to_arm(target);
+		if (arm->core_state == ARM_STATE_AARCH64)
+		{
+			reg_packet = qregiterinfo_aarch64[reg_num];
+		}
+		else if (arm->core_state == ARM_STATE_ARM)
+		{
+			reg_packet = qregiterinfo_aarch32[reg_num];
+		}
+		else
+		{
+			/* ARM_STATE_THUMB (Cortex-M) and any other ARM state:
+			 * qRegisterInfo is an LLDB extension not supported for
+			 * this target type. Reply with an empty error packet
+			 * instead of crashing with a NULL dereference. */
+			LOG_WARNING("qRegisterInfo[%d] not supported for target '%s' "
+					"(arm core_state=%d), sending empty reply",
+					reg_num, target_name(target), arm->core_state);
+			gdb_put_packet(connection, "", 0);
+			return ERROR_OK;
+		}
 	}
-	else if (arm->core_state == ARM_STATE_ARM)
-	{
-		reg_packet = qregiterinfo_aarch32[reg_num];
+
+	if (!reg_packet) {
+		LOG_ERROR("qRegisterInfo[%d]: no register info available for target '%s', "
+				"sending empty reply", reg_num, target_name(target));
+		gdb_put_packet(connection, "", 0);
+		return ERROR_OK;
 	}
+
 	gdb_put_packet(connection, reg_packet, strlen(reg_packet));
 
 	return ERROR_OK;
@@ -1733,7 +1762,7 @@ static int gdb_get_register_packet(struct connection *connection,
 		return ERROR_SERVER_REMOTE_CLOSED;
 	}
 
-	if (current_thread_id_hexagon > 1 && (current_target_hexagon))
+	if (current_thread_id_hexagon > 1 && (strncmp(target->type->name, "hexagon", 7) == 0))
 	{
 		temp_reg_num = reg_num;
 		LOG_DEBUG("reg_list_size = %d reg_num =  %d and  current_thread_id_hexagon = %d ", reg_list_size,reg_num,current_thread_id_hexagon);
@@ -1759,7 +1788,7 @@ static int gdb_get_register_packet(struct connection *connection,
 			gdb_str_to_target(target, hexagon_pc, reg_list[reg_num + 10]);
 		}
 	}
-	if (current_thread_id_hexagon == 1 && (current_target_hexagon ))
+	if (current_thread_id_hexagon == 1 && (strncmp(target->type->name, "hexagon", 7) == 0))
 	{
 		if (reg_num == 40)
 		{
@@ -1808,7 +1837,7 @@ static void gdb_hexagon_fetch_fp_pc_sp(struct connection *connection)
 	struct target *target = get_target_from_connection(connection);
 	unsigned int sp, fp, pc;
 	struct reg reg_list = {0};
-    if (current_target_hexagon)
+    if (strncmp(target->type->name, "hexagon", 7) == 0)
 	{
 		hexagon_update_sp_pc_fp_gdb_server(target, current_thread_id_hexagon - 1, &pc, &fp, &sp);
 	}
@@ -1878,7 +1907,7 @@ static int gdb_set_register_packet(struct connection *connection,
 
 	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	if (current_target_hexagon)
+	if (strncmp(target->type->name, "hexagon", 7) == 0)
 	{
 
 		// struct reg *reg;
@@ -2222,7 +2251,7 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 
 	address = strtoull(separator + 1, &separator, 16);
 #ifdef BREAKPOINT_THREAD_SELECT	
-	if (current_target_hexagon == 1){
+	if (strncmp(target->type->name, "hexagon", 7) == 0){
 		hexagon_breakpoint_address_thread_select(target, address);
 	}
 #endif
@@ -2241,7 +2270,7 @@ static int gdb_breakpoint_watchpoint_packet(struct connection *connection,
 			#if 0
 			    /* This logic will be required if we are using root pd elf as primary target in lldb
 				as lldb tries to set a breakpoint with root pd elf */
-				if(current_target_hexagon==1  &&  hexagon_is_spurious_breakpoint(target) == 1)
+				if((strncmp(target->type->name, "hexagon", 7) == 0) &&  hexagon_is_spurious_breakpoint(target) == 1)
 				{
 					LOG_INFO("Ignoring spurious breakpoint request sent by lldb");
 					gdb_put_packet(connection, "OK", 2);
@@ -3137,14 +3166,37 @@ static int gdb_generate_thread_list(struct target *target, char **thread_list_ou
 			if (!thread_detail->exists)
 				continue;
 
-			if (thread_detail->thread_name_str)
+			/* Optional grouping attributes (core / handle / tier) let IDE
+			 * front-ends (e.g. VS Code) group threads into a hierarchy.
+			 * Only emitted for RTOS modules that opt in by setting `tier`
+			 * to a non-empty string (currently only qurt.c). Every other
+			 * RTOS backend leaves `tier` untouched; gate on both non-NULL
+			 * AND non-empty so a backend that zero-inits the struct (tier
+			 * == NULL) OR one that leaves it as an empty string is treated
+			 * as "no tier" and takes the original minimal path below. */
+			if (thread_detail->tier && thread_detail->tier[0]) {
+				xml_printf(&retval, &thread_list, &pos, &size,
+					   "<thread id=\"%" PRIx64 "\"", thread_detail->threadid);
+				if (thread_detail->thread_name_str)
+					xml_printf(&retval, &thread_list, &pos, &size,
+						   " name=\"%s\"", thread_detail->thread_name_str);
+				if (thread_detail->core_id >= 0)
+					xml_printf(&retval, &thread_list, &pos, &size,
+						   " core=\"%d\"", thread_detail->core_id);
+				if (thread_detail->handle)
+					xml_printf(&retval, &thread_list, &pos, &size,
+						   " handle=\"%" PRIx64 "\"", thread_detail->handle);
+				xml_printf(&retval, &thread_list, &pos, &size,
+					   " tier=\"%s\">", thread_detail->tier);
+			} else if (thread_detail->thread_name_str) {
 				xml_printf(&retval, &thread_list, &pos, &size,
 					   "<thread id=\"%" PRIx64 "\" name=\"%s\">",
 					   thread_detail->threadid,
 					   thread_detail->thread_name_str);
-			else
+			} else {
 				xml_printf(&retval, &thread_list, &pos, &size,
 					   "<thread id=\"%" PRIx64 "\">", thread_detail->threadid);
+			}
 
 			if (thread_detail->thread_name_str)
 				xml_printf(&retval, &thread_list, &pos, &size,
@@ -3357,7 +3409,7 @@ static int gdb_query_packet(struct connection *connection,
 			gdb_target_desc_supported = 0;
 		}
 
-		if ((current_target_hexagon ))
+		if (strncmp(target->type->name, "hexagon", 7) == 0)
 		{
 			qxfer_packet = "PacketSize=%x;qXfer:features:read%c;qXfer:threads:read+;QStartNoAckMode+;vContSupported+";
 		}
@@ -3390,6 +3442,46 @@ static int gdb_query_packet(struct connection *connection,
 	} else if ((strncmp(packet, "qXfer:memory-map:read::", 23) == 0)
 		   && (flash_get_bank_count() > 0))
 		return gdb_memory_map(connection, packet, packet_size);
+	else if ((strncmp(packet, "qXfer:osdata:read:pagetable:", 28) == 0) ||
+			(strncmp(packet, "qXfer:osdata:read:tlbinfo:", 26) == 0))
+	{
+		int ret_val = ERROR_OK;
+		/* Packet for pagetable data retreival*/
+		char *buffer = (char*)malloc(MAX_RSP_BUF_SIZE);
+		if(buffer == NULL)
+		{
+			LOG_ERROR("Memory malloc failed for pagetable/tlb command");
+			//Send E01 to lldb.
+			gdb_send_error(connection, 01);
+			ret_val = 01;
+			goto RETURN;
+		}
+		memset(buffer,0x0,MAX_RSP_BUF_SIZE);
+
+		
+		if ((strncmp(packet, "qXfer:osdata:read:pagetable:", 28) == 0))
+		{	
+			ret_val = handle_pagetable_state_machine(packet,buffer);
+		}
+		else
+		{
+			ret_val = handle_tlb_state_machine(target,packet,buffer);
+		}
+
+		/*Handle return vlaue from state machine.*/
+		if(ret_val != ERROR_OK)
+		{
+			gdb_send_error(connection,ret_val);
+		}
+		else
+		{
+			gdb_put_packet(connection,buffer,strlen(buffer));
+		}
+
+		RETURN:
+		free(buffer);
+		return ret_val;
+	}
 	else if (strncmp(packet, "qXfer:features:read:", 20) == 0) {
 		char *xml = NULL;
 		int retval = ERROR_OK;
@@ -3540,16 +3632,28 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			thread_id = 0; 
 		}
 			
-		if (current_target_hexagon)
+		/* Legacy hexagon thread validation: only applies when NO RTOS is
+		 * attached. The legacy model uses 1-based HW thread ids (1..N). When
+		 * the QuRT RTOS is active, thread ids are RTOS-encoded (HW threads use
+		 * 0x40000000+tnum, SW threads use QuRT swids like 0xd), so this 1..N
+		 * range check would wrongly reject them ("Invalid thread ID 13"). In
+		 * that case we defer entirely to the standard RTOS step path below
+		 * (gdb_target_for_threadid + fake_step), which maps the id correctly. */
+		if (strncmp(target->type->name, "hexagon", 7) == 0 && !target->rtos)
 		{
 			/*if(current_thread_id_hexagon != current_thread_id_hexagon)
 			{
 				fake_step = true;
 				LOG_INFO("fake_step = true for hexagon target'");
 			}*/
-			if (thread_id >= 1 && thread_id <= 8)
+			if (thread_id >= 1 && thread_id <= hexagon_no_of_threads)
 			{
 				current_thread_id_hexagon = thread_id;
+			}
+			else {
+				LOG_ERROR("Invalid thread ID %lld for target with %u threads", 
+					thread_id, hexagon_no_of_threads);
+				return false;
 			}
 			LOG_DEBUG("current_thread_id_hexagon = %lld'", thread_id);
 		}
@@ -3639,7 +3743,17 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 				gdb_connection->frontend_state = TARGET_RUNNING;
 			return true;
 		}
-        if (current_target_hexagon)
+		/* current_debug_thread() interprets its argument as a 1-based HW
+		 * thread id and stores (id - 1) as the hexagon step's target HW
+		 * thread. That mapping is ONLY valid in the legacy (no-RTOS) model.
+		 * With the QuRT RTOS attached, thread_id is RTOS-encoded (e.g. SW swid
+		 * 0xd=13, or HW id 0x40000000+tnum), so (thread_id - 1) would select a
+		 * bogus HW thread (e.g. 12, which doesn't exist) and the step would
+		 * target nothing / never report a halt. When the RTOS is active the
+		 * hexagon driver's thread_id_thread_select is already set to the
+		 * actually-halted HW thread by hexagon_debug_entry(), so we must NOT
+		 * override it here. */
+		if (strncmp(target->type->name, "hexagon", 7) == 0 && !target->rtos)
 		{
 			current_debug_thread(target, thread_id);
 		}
@@ -4060,7 +4174,7 @@ static int gdb_input_inner(struct connection *connection)
 			char rsp_response[1024];
 			/*hexagon untrusted changes*/
 			uint16_t len_of_response;
-			if (current_target_hexagon)
+			if (strncmp(target->type->name, "hexagon", 7) == 0)
 				retval = hexagon_untrusted_forward_rsp(get_target_from_connection(connection), rsp_response, &len_of_response);
 
 			if (retval != ERROR_OK)
@@ -4090,7 +4204,9 @@ static int gdb_input_inner(struct connection *connection)
 			switch (packet[0])
 			{
 			case 'T': /* Is thread alive? */
-				if (current_target_hexagon)
+				/* With an RTOS attached, let the RTOS layer answer so it can
+				 * validate the (possibly SW) thread id. */
+				if ((strncmp(target->type->name, "hexagon", 7) == 0) && !target->rtos)
 				{
 					gdb_put_packet(connection, "OK", 2); /* thread alive */
 				}
@@ -4102,11 +4218,12 @@ static int gdb_input_inner(struct connection *connection)
 			case 'H': /* Set current thread ( 'c' for step and continue,
 					   * 'g' for all other operations ) */
 
-				if ((strncmp(packet, "Hg", 2) == 0) && (current_target_hexagon))
+				/* When an RTOS (e.g. qurt) is attached, defer thread packets
+				 * to the RTOS layer (gdb_thread_packet -> gdb_query_packet)
+				 * instead of the hexagon HW-thread intercept. */
+				if ((strncmp(packet, "Hg", 2) == 0) && (strncmp(target->type->name, "hexagon", 7) == 0) && !target->rtos)
 				{
-					LOG_DEBUG("current_target_hexagon =%d and current_target_hexagon = %d", current_target_hexagon,
-							  current_target_hexagon);
-					sscanf(packet, "Hg%16" SCNx32, &current_thread_id_hexagon);
+					sscanf(packet, "Hg%x", &current_thread_id_hexagon); // Parsing thread ID as hex (per GDB Remote Serial Protocol)
 					LOG_DEBUG("current_thread_id_hexagon = 0x%x ", current_thread_id_hexagon);
 					gdb_put_packet(connection, "OK", 2);
 					break;
@@ -4121,14 +4238,15 @@ static int gdb_input_inner(struct connection *connection)
 					retval = gdb_qregister_packet(connection, packet, packet_size);
 					break;
 				}
-				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && current_target_hexagon)
+				/* RTOS-attached: let the RTOS layer answer qfThreadInfo so the
+				 * QuRT two-tier (HW + SW) thread list is published. */
+				if ((strncmp(packet, "qfThreadInfo", 12) == 0) && (strncmp(target->type->name, "hexagon", 7) == 0) && !target->rtos)
 				{
 					hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
 					gdb_hexagon_fetch_fp_pc_sp(connection); // to get  the updated PC information for corresponding threads 
 					LOG_DEBUG("hexagon_no_of_threads=%d", hexagon_no_of_threads);
-					LOG_DEBUG("current_target_hexagon =%d ", current_target_hexagon);
 
-					if (hexagon_no_of_threads > 1)
+					if (hexagon_no_of_threads > 0)
 					{
 						char *pkt = NULL;
 						int pkt_size = pkt_size_calculate(hexagon_no_of_threads);
@@ -4159,7 +4277,8 @@ static int gdb_input_inner(struct connection *connection)
 						gdb_put_packet(connection, "QC1", 3);
 						break;
 				}*/
-				if (strncmp(packet, "qC", 2) == 0 && (current_target_hexagon))
+				/* RTOS-attached: let the RTOS layer answer qC (current thread). */
+				if (strncmp(packet, "qC", 2) == 0 && (strncmp(target->type->name, "hexagon", 7) == 0) && !target->rtos)
 				{
 					hexagon_no_of_threads = hexagon_no_of_hw_threads(target);
 					LOG_INFO("hexagon_no_of_threads=%d", hexagon_no_of_threads);
@@ -4402,6 +4521,7 @@ static int gdb_input_inner(struct connection *connection)
 			} else {
 				LOG_INFO("The target is not running when halt was requested, stopping GDB.");
 				target_call_event_callbacks(target, TARGET_EVENT_GDB_HALT);
+				gdb_con->ctrl_c = false;
 			}
 		}
 
@@ -4831,7 +4951,7 @@ char*  form_thread_id_packet (unsigned int thread_number, char* pkt)
         return NULL;
     }
 
-    snprintf(pkt, pkt_size, "QC%d", thread_number); // pkt = QC81798217
+    snprintf(pkt, pkt_size, "QC%x", thread_number); // pkt = QC81798217
 
 	return pkt;
 }
@@ -4856,7 +4976,7 @@ char* form_thread_list_packet(unsigned int hexagon_no_of_hw_threads, char* pkt) 
     for (unsigned int i = 2; i <= hexagon_no_of_hw_threads; i++) 
     {
         char num_str[6];
-        snprintf(num_str, sizeof(num_str), ",%d", i);
+        snprintf(num_str, sizeof(num_str), ",%x", i);
         strncat(pkt, num_str, strnlen(num_str, sizeof(num_str)));
     }
 

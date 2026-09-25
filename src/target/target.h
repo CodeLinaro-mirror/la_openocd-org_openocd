@@ -139,6 +139,17 @@ struct target {
 	bool examined;
 
 	/**
+	 * Indicates that this (already examined) target is temporarily
+	 * unreachable (e.g. a RISC-V hart that has entered deep sleep /
+	 * power collapse) and must not be touched by polling or any other
+	 * background debug access until explicitly resumed.
+	 *
+	 * Do @b not access this field directly, use
+	 * target_is_debug_suspended() or target_set_debug_suspended().
+	 */
+	bool debug_suspended;
+
+	/**
 	 * true if the  target is currently running a downloaded
 	 * "algorithm" instead of arbitrary user code. OpenOCD code
 	 * invoking algorithms is trusted to maintain correctness of
@@ -448,6 +459,20 @@ static inline bool target_was_examined(struct target *target)
 static inline void target_set_examined(struct target *target)
 {
 	target->examined = true;
+}
+
+/** @returns @c true if the target is temporarily suspended and must not
+ * be polled or otherwise accessed (see target_set_debug_suspended()). */
+static inline bool target_is_debug_suspended(struct target *target)
+{
+	return target->debug_suspended;
+}
+
+/** Marks an examined target as temporarily unreachable (@c suspend true)
+ * or reachable again (@c suspend false), without touching @c examined. */
+static inline void target_set_debug_suspended(struct target *target, bool suspend)
+{
+	target->debug_suspended = suspend;
 }
 
 /**

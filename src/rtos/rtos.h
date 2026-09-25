@@ -3,6 +3,9 @@
 /***************************************************************************
  *   Copyright (C) 2011 by Broadcom Corporation                            *
  *   Evan Hunter - ehunter@broadcom.com                                    *
+ *                                                                         *
+ *   Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.    *
+ *   All rights reserved.                                                  *
  ***************************************************************************/
 
 #ifndef OPENOCD_RTOS_RTOS_H
@@ -31,6 +34,20 @@ struct thread_detail {
 	bool exists;
 	char *thread_name_str;
 	char *extra_info_str;
+	/* Optional grouping/identity hints for the gdb thread-list XML
+	 * (qXfer:threads:read). Populated by RTOS modules that want IDE
+	 * front-ends (e.g. VS Code) to group threads. Modules that do not
+	 * set these leave the defaults below.
+	 *   core_id     : >=0 emits core="N" so the IDE groups by it; -1 = omit
+	 *   handle      : opaque per-thread handle (e.g. TCB ptr); 0 = omit
+	 *   tier        : custom attribute string (e.g. "hw"/"sw"); NULL = omit
+	 *   hide_from_cli: keep entry in qXfer XML but skip in qfThreadInfo
+	 *                  (used for inert/synthetic helper threads)
+	 */
+	int core_id;
+	uint64_t handle;
+	const char *tier;
+	bool hide_from_cli;
 };
 
 struct rtos {

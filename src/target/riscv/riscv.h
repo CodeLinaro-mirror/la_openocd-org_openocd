@@ -2,7 +2,6 @@
 
 #ifndef RISCV_H
 #define RISCV_H
-
 struct riscv_program;
 
 #include <stdint.h>
@@ -229,6 +228,15 @@ struct riscv_info {
 
 	riscv_sample_config_t sample_config;
 	struct riscv_sample_buf sample_buf;
+
+	/** For targets conforming to ARM Debug Interface v5,
+     * this handle references the Debug Access Port (DAP)
+     * used to make requests to the target.
+     */
+    struct adiv5_dap *dap;
+	struct adiv5_ap *debug_ap;
+	target_addr_t debug_base;
+
 };
 
 COMMAND_HELPER(riscv_print_info_line, const char *section, const char *key,

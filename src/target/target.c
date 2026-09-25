@@ -318,6 +318,9 @@ const char *target_state_name(struct target *t)
 	if (!target_was_examined(t) && t->defer_examine)
 		cp = "examine deferred";
 
+	if (target_was_examined(t) && target_is_debug_suspended(t))
+		cp = "debug suspended";
+
 	return cp;
 }
 
@@ -568,6 +571,12 @@ int target_poll(struct target *target)
 		/* Fail silently lest we pollute the log */
 		return ERROR_FAIL;
 	}
+
+	/* Target has been put to sleep (e.g. deep sleep / power collapse) and
+	 * must not be accessed until explicitly resumed. Fail silently, same
+	 * as the not-examined-yet case above. */
+	if (target_is_debug_suspended(target))
+		return ERROR_FAIL;
 
 	retval = target->type->poll(target);
 	if (retval != ERROR_OK)
@@ -3042,6 +3051,9 @@ static int handle_target(void *priv)
 			target = target->next) {
 
 		if (!target_was_examined(target))
+			continue;
+
+		if (target_is_debug_suspended(target))
 			continue;
 
 		if (!target->tap->enabled)

@@ -1760,7 +1760,8 @@
 #define CSR_TEXTRA64_SSELECT_OFFSET         0
 #define CSR_TEXTRA64_SSELECT_LENGTH         2
 #define CSR_TEXTRA64_SSELECT                3
-#define DM_DMSTATUS                         0x11
+// #define DM_DMSTATUS                         0x11 
+#define DM_DMSTATUS                         0x44 // Based on Qualcomm design
 #define DM_DMSTATUS_NDMRESETPENDING_OFFSET  0x18
 #define DM_DMSTATUS_NDMRESETPENDING_LENGTH  1
 #define DM_DMSTATUS_NDMRESETPENDING         0x1000000
@@ -1958,7 +1959,8 @@
  * available version of this spec.
  */
 #define DM_DMSTATUS_VERSION_CUSTOM          15
-#define DM_DMCONTROL                        0x10
+// #define DM_DMCONTROL                        0x10
+#define DM_DMCONTROL                        0x40 // Based on Qualcomm design
 /*
  * Writing 0 clears the halt request bit for all currently selected
  * harts. This may cancel outstanding halt requests for those harts.
@@ -2156,7 +2158,9 @@
  * debugging, for example by preventing the Debug Module from being
  * power gated while debugging is active.
  */
-#define DM_HARTINFO                         0x12
+// #define DM_HARTINFO                         0x12
+#define DM_HARTINFO                         0x48 // Based on Qualcomm design
+
 /*
  * Number of {\tt dscratch} registers available for the debugger
  * to use during program buffer execution, starting from \RcsrDscratchZero.
@@ -2222,7 +2226,8 @@
 #define DM_HAWINDOW_MASKDATA_OFFSET         0
 #define DM_HAWINDOW_MASKDATA_LENGTH         0x20
 #define DM_HAWINDOW_MASKDATA                0xffffffffU
-#define DM_ABSTRACTCS                       0x16
+// #define DM_ABSTRACTCS                       0x16
+#define DM_ABSTRACTCS                       0x58 // Based on Qualcomm design
 /*
  * Size of the Program Buffer, in 32-bit words. Valid sizes are 0 - 16.
  */
@@ -2314,7 +2319,10 @@
 #define DM_ABSTRACTCS_DATACOUNT_OFFSET      0
 #define DM_ABSTRACTCS_DATACOUNT_LENGTH      4
 #define DM_ABSTRACTCS_DATACOUNT             0xf
-#define DM_COMMAND                          0x17
+// #define DM_COMMAND                       0x17
+#define DM_COMMAND                          0x5C // Based on Qualcomm design
+
+
 /*
  * The type determines the overall functionality of this
  * abstract command.
@@ -2329,7 +2337,8 @@
 #define DM_COMMAND_CONTROL_OFFSET           0
 #define DM_COMMAND_CONTROL_LENGTH           0x18
 #define DM_COMMAND_CONTROL                  0xffffff
-#define DM_ABSTRACTAUTO                     0x18
+// #define DM_ABSTRACTAUTO                     0x18
+#define DM_ABSTRACTAUTO                     0x60 // Based on Qualcomm design
 /*
  * When a bit in this field is 1, read or write accesses to the
  * corresponding {\tt progbuf} word cause the DM to act as if the
@@ -2368,11 +2377,18 @@
 #define DM_NEXTDM_ADDR_OFFSET               0
 #define DM_NEXTDM_ADDR_LENGTH               0x20
 #define DM_NEXTDM_ADDR                      0xffffffffU
-#define DM_DATA0                            0x04
+
+// #define DM_DATA0                            0x04
+
+#define DM_DATA0                            0x10 // Based on Qualcomm design
 #define DM_DATA0_DATA_OFFSET                0
 #define DM_DATA0_DATA_LENGTH                0x20
 #define DM_DATA0_DATA                       0xffffffffU
-#define DM_DATA1                            0x05
+
+// #define DM_DATA1                            0x05
+
+#define DM_DATA1                            0x14 // Based on Qualcomm design
+
 #define DM_DATA2                            0x06
 #define DM_DATA3                            0x07
 #define DM_DATA4                            0x08
@@ -2383,30 +2399,52 @@
 #define DM_DATA9                            0x0d
 #define DM_DATA10                           0x0e
 #define DM_DATA11                           0x0f
-#define DM_PROGBUF0                         0x20
+// #define DM_PROGBUF0                         0x20
+#define DM_PROGBUF0                         0x80 // Based on Qualcomm design
 #define DM_PROGBUF0_DATA_OFFSET             0
 #define DM_PROGBUF0_DATA_LENGTH             0x20
 #define DM_PROGBUF0_DATA                    0xffffffffU
-#define DM_PROGBUF1                         0x21
-#define DM_PROGBUF2                         0x22
-#define DM_PROGBUF3                         0x23
-#define DM_PROGBUF4                         0x24
-#define DM_PROGBUF5                         0x25
-#define DM_PROGBUF6                         0x26
-#define DM_PROGBUF7                         0x27
-#define DM_PROGBUF8                         0x28
-#define DM_PROGBUF9                         0x29
-#define DM_PROGBUF10                        0x2a
-#define DM_PROGBUF11                        0x2b
-#define DM_PROGBUF12                        0x2c
-#define DM_PROGBUF13                        0x2d
-#define DM_PROGBUF14                        0x2e
-#define DM_PROGBUF15                        0x2f
-#define DM_AUTHDATA                         0x30
+// #define DM_PROGBUF1                         0x21
+// #define DM_PROGBUF2                         0x22
+// #define DM_PROGBUF3                         0x23
+// #define DM_PROGBUF4                         0x24
+// #define DM_PROGBUF5                         0x25
+// #define DM_PROGBUF6                         0x26
+// #define DM_PROGBUF7                         0x27
+// #define DM_PROGBUF8                         0x28
+// #define DM_PROGBUF9                         0x29
+// #define DM_PROGBUF10                        0x2a
+// #define DM_PROGBUF11                        0x2b
+// #define DM_PROGBUF12                        0x2c
+// #define DM_PROGBUF13                        0x2d
+// #define DM_PROGBUF14                        0x2e
+// #define DM_PROGBUF15                        0x2f
+
+// Based on Qualcomm design
+#define DM_PROGBUF1                         0x84
+#define DM_PROGBUF2                         0x88
+#define DM_PROGBUF3                         0x8C
+#define DM_PROGBUF4                         0x90
+#define DM_PROGBUF5                         0x94
+#define DM_PROGBUF6                         0x98
+#define DM_PROGBUF7                         0x9C
+#define DM_PROGBUF8                         0xA0
+#define DM_PROGBUF9                         0xA4
+#define DM_PROGBUF10                        0xA8
+#define DM_PROGBUF11                        0xAC
+#define DM_PROGBUF12                        0xB0
+#define DM_PROGBUF13                        0xB4
+#define DM_PROGBUF14                        0xB8
+#define DM_PROGBUF15                        0xBC
+
+
+// #define DM_AUTHDATA                         0x30
+#define DM_AUTHDATA                         0xC0 // Based on Qualcomm design
 #define DM_AUTHDATA_DATA_OFFSET             0
 #define DM_AUTHDATA_DATA_LENGTH             0x20
 #define DM_AUTHDATA_DATA                    0xffffffffU
-#define DM_DMCS2                            0x32
+// #define DM_DMCS2                            0x32
+#define DM_DMCS2                            0xC8 // Based on Qualcomm design
 #define DM_DMCS2_GROUPTYPE_OFFSET           0xb
 #define DM_DMCS2_GROUPTYPE_LENGTH           1
 #define DM_DMCS2_GROUPTYPE                  0x800
@@ -2479,11 +2517,13 @@
 /*
  * If there are no DM external triggers, this field must be tied to 0.
  */
-#define DM_HALTSUM0                         0x40
+// #define DM_HALTSUM0                         0x40
+#define DM_HALTSUM0                         0x100 // Based on Qualcomm design
 #define DM_HALTSUM0_HALTSUM0_OFFSET         0
 #define DM_HALTSUM0_HALTSUM0_LENGTH         0x20
 #define DM_HALTSUM0_HALTSUM0                0xffffffffU
-#define DM_HALTSUM1                         0x13
+// #define DM_HALTSUM1                         0x13
+#define DM_HALTSUM1                         0x4C // Based on Qualcomm design
 #define DM_HALTSUM1_HALTSUM1_OFFSET         0
 #define DM_HALTSUM1_HALTSUM1_LENGTH         0x20
 #define DM_HALTSUM1_HALTSUM1                0xffffffffU
@@ -2495,7 +2535,8 @@
 #define DM_HALTSUM3_HALTSUM3_OFFSET         0
 #define DM_HALTSUM3_HALTSUM3_LENGTH         0x20
 #define DM_HALTSUM3_HALTSUM3                0xffffffffU
-#define DM_SBCS                             0x38
+// #define DM_SBCS                             0x38
+#define DM_SBCS                             0xE0 // Based on Qualcomm design
 #define DM_SBCS_SBVERSION_OFFSET            0x1d
 #define DM_SBCS_SBVERSION_LENGTH            3
 #define DM_SBCS_SBVERSION                   0xe0000000U
@@ -2660,14 +2701,18 @@
 #define DM_SBCS_SBACCESS8_OFFSET            0
 #define DM_SBCS_SBACCESS8_LENGTH            1
 #define DM_SBCS_SBACCESS8                   1
-#define DM_SBADDRESS0                       0x39
+// #define DM_SBADDRESS0                       0x39
+#define DM_SBADDRESS0                       0xE4 // Based on Qualcomm design
+
 /*
  * Accesses bits 31:0 of the physical address in {\tt sbaddress}.
  */
 #define DM_SBADDRESS0_ADDRESS_OFFSET        0
 #define DM_SBADDRESS0_ADDRESS_LENGTH        0x20
 #define DM_SBADDRESS0_ADDRESS               0xffffffffU
-#define DM_SBADDRESS1                       0x3a
+// #define DM_SBADDRESS1                       0x3a
+#define DM_SBADDRESS1                       0xE8 // Based on Qualcomm design
+
 /*
  * Accesses bits 63:32 of the physical address in {\tt sbaddress} (if
  * the system address bus is that wide).
@@ -2691,14 +2736,16 @@
 #define DM_SBADDRESS3_ADDRESS_OFFSET        0
 #define DM_SBADDRESS3_ADDRESS_LENGTH        0x20
 #define DM_SBADDRESS3_ADDRESS               0xffffffffU
-#define DM_SBDATA0                          0x3c
+// #define DM_SBDATA0                          0x3c
+#define DM_SBDATA0                          0xF0 // Based on Qualcomm design
 /*
  * Accesses bits 31:0 of {\tt sbdata}.
  */
 #define DM_SBDATA0_DATA_OFFSET              0
 #define DM_SBDATA0_DATA_LENGTH              0x20
 #define DM_SBDATA0_DATA                     0xffffffffU
-#define DM_SBDATA1                          0x3d
+// #define DM_SBDATA1                          0x3d
+#define DM_SBDATA1                          0xF4 // Based on Qualcomm design
 /*
  * Accesses bits 63:32 of {\tt sbdata} (if the system bus is that
  * wide).

@@ -89,7 +89,7 @@ struct adiv5_dap *dap_instance_by_jim_obj(Jim_Interp *interp, Jim_Obj *o)
 	return NULL;
 }
 
-// QCOM added function to get ADI Version in EUD Adapter file
+// qcom added function to get ADI Version in EUD Adapter file
 // Need to find a proper way to get ADI Version before upstreaming this change
 uint32_t get_adi_version(void)
 {

@@ -29,6 +29,9 @@
 #include "asm.h"
 #include "batch.h"
 
+// Required for atomic memory access functions (read/write)
+#include "target/arm_adi_v5.h" 
+ 
 static int riscv013_on_step_or_resume(struct target *target, bool step);
 static int riscv013_step_or_resume_current_hart(struct target *target,
 		bool step, bool use_hasel);
@@ -241,15 +244,20 @@ static dm013_info_t *get_dm(struct target *target)
 	RISCV013_INFO(info);
 	if (info->dm)
 		return info->dm;
-
-	int abs_chain_position = target->tap->abs_chain_position;
-
-	dm013_info_t *entry;
+	
 	dm013_info_t *dm = NULL;
-	list_for_each_entry(entry, &dm_list, list) {
-		if (entry->abs_chain_position == abs_chain_position) {
-			dm = entry;
-			break;
+	int abs_chain_position = 0;
+
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if (target->has_dap == false) {
+		dm013_info_t *entry;
+		abs_chain_position = target->tap->abs_chain_position;
+		list_for_each_entry(entry, &dm_list, list) {
+			if (entry->abs_chain_position == abs_chain_position) {
+				dm = entry;
+				break;
+			}
 		}
 	}
 
@@ -258,7 +266,13 @@ static dm013_info_t *get_dm(struct target *target)
 		dm = calloc(1, sizeof(dm013_info_t));
 		if (!dm)
 			return NULL;
-		dm->abs_chain_position = abs_chain_position;
+		
+		/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+		 * else use the ARM DAP configurations. */
+		if (target->has_dap == false) {
+			dm->abs_chain_position = abs_chain_position;
+		}
+		
 		dm->current_hartid = -1;
 		dm->hart_count = -1;
 		INIT_LIST_HEAD(&dm->target_list);
@@ -413,6 +427,10 @@ static void dump_field(int idle, const struct scan_field *field)
 
 static void select_dmi(struct target *target)
 {
+	/* If there is ARM DAP, use the ARM dap configuration. */
+	if(target->has_dap == true)
+		return;
+
 	if (bscan_tunnel_ir_width != 0) {
 		select_dmi_via_bscan(target);
 		return;
@@ -650,8 +668,33 @@ static int dmi_op(struct target *target, uint32_t *data_in,
 		bool *dmi_busy_encountered, int dmi_op, uint32_t address,
 		uint32_t data_out, bool exec, bool ensure_success)
 {
-	int result = dmi_op_timeout(target, data_in, dmi_busy_encountered, dmi_op,
+	int result = ERROR_FAIL;
+
+	/* Target has been put to sleep (e.g. deep sleep / power collapse).
+	 * Its Debug Module is unreachable, and on a has_dap target this DMI
+	 * access would otherwise become an AP transaction on a DAP that may
+	 * be shared with other, still-active targets -- do not touch the
+	 * link at all while suspended. */
+	if (target_is_debug_suspended(target))
+		return ERROR_TARGET_NOT_EXAMINED;
+
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if (target->has_dap == false) {
+		result = dmi_op_timeout(target, data_in, dmi_busy_encountered, dmi_op,
 			address, data_out, riscv_command_timeout_sec, exec, ensure_success);
+	}
+	else {
+		RISCV_INFO(rv_info);
+		if (dmi_op == DMI_OP_WRITE) {
+			result = mem_ap_write_atomic_u32(rv_info->debug_ap, rv_info->debug_base + address, data_out);
+		}
+		else if (dmi_op == DMI_OP_READ) {
+			result = mem_ap_read_atomic_u32(rv_info->debug_ap, rv_info->debug_base + address, data_in);
+		}
+		return result;
+	}
+	
 	if (result == ERROR_TIMEOUT_REACHED) {
 		LOG_ERROR("DMI operation didn't complete in %d seconds. The target is "
 				"either really slow or broken. You could increase the "
@@ -678,7 +721,7 @@ static int dmi_write(struct target *target, uint32_t address, uint32_t value)
 }
 
 static int dmi_write_exec(struct target *target, uint32_t address,
-		uint32_t value, bool ensure_success)
+	uint32_t value, bool ensure_success)
 {
 	return dmi_op(target, NULL, NULL, DMI_OP_WRITE, address, value, true, ensure_success);
 }
@@ -686,10 +729,19 @@ static int dmi_write_exec(struct target *target, uint32_t address,
 static int dmstatus_read_timeout(struct target *target, uint32_t *dmstatus,
 		bool authenticated, unsigned timeout_sec)
 {
-	int result = dmi_op_timeout(target, dmstatus, NULL, DMI_OP_READ,
+	int result = ERROR_FAIL;
+
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if (target->has_dap == false)
+		result = dmi_op_timeout(target, dmstatus, NULL, DMI_OP_READ,
 			DM_DMSTATUS, 0, timeout_sec, false, true);
-	if (result != ERROR_OK)
-		return result;
+	else {
+		result = dmi_read(target, dmstatus, DM_DMSTATUS);
+		if (result != ERROR_OK)
+			return result;
+	}
+
 	int dmstatus_version = get_field(*dmstatus, DM_DMSTATUS_VERSION);
 	if (dmstatus_version != 2 && dmstatus_version != 3) {
 		LOG_ERROR("OpenOCD only supports Debug Module version 2 (0.13) and 3 (1.0), not "
@@ -702,7 +754,7 @@ static int dmstatus_read_timeout(struct target *target, uint32_t *dmstatus,
 				"`riscv authdata_write` commands to authenticate.", *dmstatus);
 		return ERROR_FAIL;
 	}
-	return ERROR_OK;
+	return result;
 }
 
 static int dmstatus_read(struct target *target, uint32_t *dmstatus,
@@ -822,7 +874,12 @@ static riscv_reg_t read_abstract_arg(struct target *target, unsigned index,
 			LOG_ERROR("Unsupported size: %d bits", size_bits);
 			return ~0;
 		case 64:
-			dmi_read(target, &v, DM_DATA0 + offset + 1);
+			/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 		 * else use the ARM DAP configurations. */
+			if (target->has_dap == false)
+				dmi_read(target, &v, DM_DATA0 + offset + 1);
+			else
+				dmi_read(target, &v, DM_DATA0 + offset + 4);
 			value |= ((uint64_t) v) << 32;
 			/* falls through */
 		case 32:
@@ -841,7 +898,12 @@ static int write_abstract_arg(struct target *target, unsigned index,
 			LOG_ERROR("Unsupported size: %d bits", size_bits);
 			return ERROR_FAIL;
 		case 64:
-			dmi_write(target, DM_DATA0 + offset + 1, value >> 32);
+			/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 		* else use the ARM DAP configurations. */
+			if (target->has_dap == false)
+				dmi_write(target, DM_DATA0 + offset + 1, value >> 32);
+			else
+				dmi_write(target, DM_DATA0 + offset + 4, value >> 32);
 			/* falls through */
 		case 32:
 			dmi_write(target, DM_DATA0 + offset, value);
@@ -1565,33 +1627,39 @@ static int discover_vlenb(struct target *target)
 
 static int examine(struct target *target)
 {
-	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
-
-	uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
-	LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
-	LOG_DEBUG("  dmireset=%d", get_field(dtmcontrol, DTM_DTMCS_DMIRESET));
-	LOG_DEBUG("  idle=%d", get_field(dtmcontrol, DTM_DTMCS_IDLE));
-	LOG_DEBUG("  dmistat=%d", get_field(dtmcontrol, DTM_DTMCS_DMISTAT));
-	LOG_DEBUG("  abits=%d", get_field(dtmcontrol, DTM_DTMCS_ABITS));
-	LOG_DEBUG("  version=%d", get_field(dtmcontrol, DTM_DTMCS_VERSION));
-	if (dtmcontrol == 0) {
-		LOG_ERROR("dtmcontrol is 0. Check JTAG connectivity/board power.");
-		return ERROR_FAIL;
-	}
-	if (get_field(dtmcontrol, DTM_DTMCS_VERSION) != 1) {
-		LOG_ERROR("Unsupported DTM version %d. (dtmcontrol=0x%x)",
-				get_field(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
-		return ERROR_FAIL;
-	}
-
 	riscv013_info_t *info = get_info(target);
+
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if(target->has_dap == false) {
+		/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
+		uint32_t dtmcontrol = dtmcontrol_scan(target, 0);
+		LOG_DEBUG("dtmcontrol=0x%x", dtmcontrol);
+		LOG_DEBUG("  dmireset=%d", get_field(dtmcontrol, DTM_DTMCS_DMIRESET));
+		LOG_DEBUG("  idle=%d", get_field(dtmcontrol, DTM_DTMCS_IDLE));
+		LOG_DEBUG("  dmistat=%d", get_field(dtmcontrol, DTM_DTMCS_DMISTAT));
+		LOG_DEBUG("  abits=%d", get_field(dtmcontrol, DTM_DTMCS_ABITS));
+		LOG_DEBUG("  version=%d", get_field(dtmcontrol, DTM_DTMCS_VERSION));
+		if (dtmcontrol == 0) {
+			LOG_ERROR("dtmcontrol is 0. Check JTAG connectivity/board power.");
+			return ERROR_FAIL;
+		}
+		if (get_field(dtmcontrol, DTM_DTMCS_VERSION) != 1) {
+			LOG_ERROR("Unsupported DTM version %d. (dtmcontrol=0x%x)",
+					get_field(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
+			return ERROR_FAIL;
+		}
+
+		info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
+		info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
+	}
+
 	/* TODO: This won't be true if there are multiple DMs. */
 	info->index = target->coreid;
-	info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
-	info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
 
 	/* Reset the Debug Module. */
 	dm013_info_t *dm = get_dm(target);
+
 	if (!dm)
 		return ERROR_FAIL;
 	if (!dm->was_reset) {
@@ -1603,6 +1671,7 @@ static int examine(struct target *target)
 	dmi_write(target, DM_DMCONTROL, DM_DMCONTROL_HARTSELLO |
 			DM_DMCONTROL_HARTSELHI | DM_DMCONTROL_DMACTIVE |
 			DM_DMCONTROL_HASEL);
+
 	uint32_t dmcontrol;
 	if (dmi_read(target, &dmcontrol, DM_DMCONTROL) != ERROR_OK)
 		return ERROR_FAIL;
@@ -2705,11 +2774,16 @@ static int read_memory_bus_v1(struct target *target, target_addr_t address,
 		if (sb_write_address(target, next_address, true) != ERROR_OK)
 			return ERROR_FAIL;
 
-		if (info->bus_master_read_delay) {
-			jtag_add_runtest(info->bus_master_read_delay, TAP_IDLE);
-			if (jtag_execute_queue() != ERROR_OK) {
-				LOG_ERROR("Failed to scan idle sequence");
-				return ERROR_FAIL;
+		/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+		 * else use the ARM DAP configurations. */
+		if (target->has_dap == false) {
+			count = count - 1;
+			if (info->bus_master_read_delay) {
+				jtag_add_runtest(info->bus_master_read_delay, TAP_IDLE);
+				if (jtag_execute_queue() != ERROR_OK) {
+					LOG_ERROR("Failed to scan idle sequence");
+					return ERROR_FAIL;
+				}
 			}
 		}
 
@@ -2719,25 +2793,38 @@ static int read_memory_bus_v1(struct target *target, target_addr_t address,
 		static int sbdata[4] = {DM_SBDATA0, DM_SBDATA1, DM_SBDATA2, DM_SBDATA3};
 		assert(size <= 16);
 		target_addr_t next_read = address - 1;
-		for (uint32_t i = (next_address - address) / size; i < count - 1; i++) {
+
+		for (uint32_t i = (next_address - address) / size; i < count; i++) {
 			for (int j = (size - 1) / 4; j >= 0; j--) {
 				uint32_t value;
 				unsigned attempt = 0;
 				while (1) {
 					if (attempt++ > 100) {
 						LOG_ERROR("DMI keeps being busy in while reading memory just past " TARGET_ADDR_FMT,
-								  next_read);
+								   next_read);
 						return ERROR_FAIL;
 					}
+					
 					keep_alive();
-					dmi_status_t status = dmi_scan(target, NULL, &value,
-												   DMI_OP_READ, sbdata[j], 0, false);
-					if (status == DMI_STATUS_BUSY)
-						increase_dmi_busy_delay(target);
-					else if (status == DMI_STATUS_SUCCESS)
-						break;
-					else
-						return ERROR_FAIL;
+					/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+					 * else use the ARM DAP configurations. */
+					if (target->has_dap == false) {
+						dmi_status_t status = dmi_scan(target, NULL, &value,
+													DMI_OP_READ, sbdata[j], 0, false);
+						if (status == DMI_STATUS_BUSY)
+							increase_dmi_busy_delay(target);
+						else if (status == DMI_STATUS_SUCCESS)
+							break;
+						else
+							return ERROR_FAIL;
+					}
+					else {
+						int result = dmi_read(target, &value, sbdata[j]);
+						if (result != ERROR_OK)
+							return result;
+						else 	
+							break;
+					}
 				}
 				if (next_read != address - 1) {
 					buf_set_u32(buffer + next_read - address, 0, 8 * MIN(size, 4), value);
@@ -2751,23 +2838,26 @@ static int read_memory_bus_v1(struct target *target, target_addr_t address,
 		if (count > 1) {
 			uint32_t value;
 			unsigned attempt = 0;
-			while (1) {
-				if (attempt++ > 100) {
-					LOG_ERROR("DMI keeps being busy in while reading memory just past " TARGET_ADDR_FMT,
-								next_read);
-					return ERROR_FAIL;
-				}
-				dmi_status_t status = dmi_scan(target, NULL, &value, DMI_OP_NOP, 0, 0, false);
-				if (status == DMI_STATUS_BUSY)
-					increase_dmi_busy_delay(target);
-				else if (status == DMI_STATUS_SUCCESS)
-					break;
-				else
-					return ERROR_FAIL;
+			/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+			 * else use the ARM DAP configurations. */
+			if (target->has_dap == false) {
+				 while (1) {
+					 if (attempt++ > 100) {
+						 LOG_ERROR("DMI keeps being busy in while reading memory just past " TARGET_ADDR_FMT,
+									 next_read);
+						 return ERROR_FAIL;
+					 }
+					 dmi_status_t status = dmi_scan(target, NULL, &value, DMI_OP_NOP, 0, 0, false);
+					 if (status == DMI_STATUS_BUSY)
+						 increase_dmi_busy_delay(target);
+					 else if (status == DMI_STATUS_SUCCESS)
+						 break;
+					 else
+						 return ERROR_FAIL;
+				 }
+				 buf_set_u32(buffer + next_read - address, 0, 8 * MIN(size, 4), value);
+				 log_memory_access(next_read, value, MIN(size, 4), true);
 			}
-			buf_set_u32(buffer + next_read - address, 0, 8 * MIN(size, 4), value);
-			log_memory_access(next_read, value, MIN(size, 4), true);
-
 			/* "Writes to sbcs while sbbusy is high result in undefined behavior.
 			 * A debugger must not write to sbcs until it reads sbbusy as 0." */
 			if (read_sbcs_nonbusy(target, &sbcs_read) != ERROR_OK)
@@ -3149,190 +3239,302 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 		goto error;
 
 	/* read_addr is the next address that the hart will read from, which is the
-	 * value in s0. */
-	unsigned index = 2;
-	while (index < count) {
-		riscv_addr_t read_addr = address + index * increment;
-		LOG_DEBUG("i=%d, count=%d, read_addr=0x%" PRIx64, index, count, read_addr);
-		/* The pipeline looks like this:
-		 * memory -> s1 -> dm_data0 -> debugger
-		 * Right now:
-		 * s0 contains read_addr
-		 * s1 contains mem[read_addr-size]
-		 * dm_data0 contains[read_addr-size*2]
-		 */
+	 * value in s0.
+	 *
+	 * If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */	
+	if (target->has_dap == false) {
+		unsigned index = 2;
+		while (index < count) {
+			riscv_addr_t read_addr = address + index * increment;
+			LOG_DEBUG("i=%d, count=%d, read_addr=0x%" PRIx64, index, count, read_addr);
+			/* The pipeline looks like this:
+		 	* memory -> s1 -> dm_data0 -> debugger
+		 	* Right now:
+		 	* s0 contains read_addr
+		 	* s1 contains mem[read_addr-size]
+		 	* dm_data0 contains[read_addr-size*2]
+		 	*/
 
-		struct riscv_batch *batch = riscv_batch_alloc(target, 32,
-				info->dmi_busy_delay + info->ac_busy_delay);
-		if (!batch)
-			return ERROR_FAIL;
+			struct riscv_batch *batch = riscv_batch_alloc(target, 32,
+					info->dmi_busy_delay + info->ac_busy_delay);
+			if (!batch)
+				return ERROR_FAIL;
 
-		unsigned reads = 0;
-		for (unsigned j = index; j < count; j++) {
-			if (size > 4)
-				riscv_batch_add_dmi_read(batch, DM_DATA1);
-			riscv_batch_add_dmi_read(batch, DM_DATA0);
+			unsigned reads = 0;
+			for (unsigned j = index; j < count; j++) {
+				if (size > 4)
+					riscv_batch_add_dmi_read(batch, DM_DATA1);
 
-			reads++;
-			if (riscv_batch_full(batch))
-				break;
-		}
+				riscv_batch_add_dmi_read(batch, DM_DATA0);
+				reads++;
+				if (riscv_batch_full(batch))
+					break;
+			}
 
-		batch_run(target, batch);
+			batch_run(target, batch);
 
-		/* Wait for the target to finish performing the last abstract command,
-		 * and update our copy of cmderr. If we see that DMI is busy here,
-		 * dmi_busy_delay will be incremented. */
-		uint32_t abstractcs;
-		if (dmi_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
-			return ERROR_FAIL;
-		while (get_field(abstractcs, DM_ABSTRACTCS_BUSY))
+			/* Wait for the target to finish performing the last abstract command,
+			* and update our copy of cmderr. If we see that DMI is busy here,
+			* dmi_busy_delay will be incremented. */
+			uint32_t abstractcs;
 			if (dmi_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
 				return ERROR_FAIL;
-		info->cmderr = get_field(abstractcs, DM_ABSTRACTCS_CMDERR);
+			while (get_field(abstractcs, DM_ABSTRACTCS_BUSY))
+				if (dmi_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
+					return ERROR_FAIL;
+			info->cmderr = get_field(abstractcs, DM_ABSTRACTCS_CMDERR);
 
-		unsigned next_index;
-		unsigned ignore_last = 0;
-		switch (info->cmderr) {
-			case CMDERR_NONE:
-				LOG_DEBUG("successful (partial?) memory read");
-				next_index = index + reads;
-				break;
-			case CMDERR_BUSY:
-				LOG_DEBUG("memory read resulted in busy response");
+			unsigned next_index;
+			unsigned ignore_last = 0;
+			switch (info->cmderr) {
+				case CMDERR_NONE:
+					LOG_DEBUG("successful (partial?) memory read");
+					next_index = index + reads;
+					break;
+				case CMDERR_BUSY:
+					LOG_DEBUG("memory read resulted in busy response");
 
-				increase_ac_busy_delay(target);
-				riscv013_clear_abstract_error(target);
+					increase_ac_busy_delay(target);
+					riscv013_clear_abstract_error(target);
 
-				dmi_write(target, DM_ABSTRACTAUTO, 0);
+					dmi_write(target, DM_ABSTRACTAUTO, 0);
 
-				uint32_t dmi_data0, dmi_data1 = 0;
-				/* This is definitely a good version of the value that we
-				 * attempted to read when we discovered that the target was
-				 * busy. */
-				if (dmi_read(target, &dmi_data0, DM_DATA0) != ERROR_OK) {
+					uint32_t dmi_data0, dmi_data1 = 0;
+					/* This is definitely a good version of the value that we
+					* attempted to read when we discovered that the target was
+					* busy. */
+					if (dmi_read(target, &dmi_data0, DM_DATA0) != ERROR_OK) {
 					riscv_batch_free(batch);
-					goto error;
-				}
-				if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK) {
+						goto error;
+					}
+					if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK) {
 					riscv_batch_free(batch);
-					goto error;
-				}
+						goto error;
+					}
 
-				/* See how far we got, clobbering dmi_data0. */
-				if (increment == 0) {
-					uint64_t counter;
-					result = register_read_direct(target, &counter, GDB_REGNO_S2);
-					next_index = counter;
-				} else {
-					uint64_t next_read_addr;
-					result = register_read_direct(target, &next_read_addr,
-												  GDB_REGNO_S0);
-					next_index = (next_read_addr - address) / increment;
-				}
-				if (result != ERROR_OK) {
+					/* See how far we got, clobbering dmi_data0. */
+					if (increment == 0) {
+						uint64_t counter;
+						result = register_read_direct(target, &counter, GDB_REGNO_S2);
+						next_index = counter;
+					} else {
+						uint64_t next_read_addr;
+						result = register_read_direct(target, &next_read_addr,
+													GDB_REGNO_S0);
+						next_index = (next_read_addr - address) / increment;
+					}
+					if (result != ERROR_OK) {
 					riscv_batch_free(batch);
+						goto error;
+					}
+
+					uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
+					buf_set_u64(buffer + (next_index - 2) * size, 0, 8 * size, value64);
+					log_memory_access(address + (next_index - 2) * size, value64, size, true);
+
+					/* Restore the command, and execute it.
+					* Now DM_DATA0 contains the next value just as it would if no
+					* error had occurred. */
+					dmi_write_exec(target, DM_COMMAND, command, true);
+					next_index++;
+
+					dmi_write(target, DM_ABSTRACTAUTO,
+							1 << DM_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
+
+					ignore_last = 1;
+					break;
+				default:
+					LOG_DEBUG("error when reading memory, abstractcs=0x%08lx", (long)abstractcs);
+					riscv013_clear_abstract_error(target);
+					riscv_batch_free(batch);
+					result = ERROR_FAIL;
 					goto error;
-				}
-
-				uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
-				buf_set_u64(buffer + (next_index - 2) * size, 0, 8 * size, value64);
-				log_memory_access(address + (next_index - 2) * size, value64, size, true);
-
-				/* Restore the command, and execute it.
-				 * Now DM_DATA0 contains the next value just as it would if no
-				 * error had occurred. */
-				dmi_write_exec(target, DM_COMMAND, command, true);
-				next_index++;
-
-				dmi_write(target, DM_ABSTRACTAUTO,
-						1 << DM_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
-
-				ignore_last = 1;
-
-				break;
-			default:
-				LOG_DEBUG("error when reading memory, abstractcs=0x%08lx", (long)abstractcs);
-				riscv013_clear_abstract_error(target);
-				riscv_batch_free(batch);
-				result = ERROR_FAIL;
-				goto error;
-		}
-
-		/* Now read whatever we got out of the batch. */
-		dmi_status_t status = DMI_STATUS_SUCCESS;
-		unsigned read = 0;
-		assert(index >= 2);
-		for (unsigned j = index - 2; j < index + reads; j++) {
-			assert(j < count);
-			LOG_DEBUG("index=%d, reads=%d, next_index=%d, ignore_last=%d, j=%d",
-				index, reads, next_index, ignore_last, j);
-			if (j + 3 + ignore_last > next_index)
-				break;
-
-			status = riscv_batch_get_dmi_read_op(batch, read);
-			uint64_t value = riscv_batch_get_dmi_read_data(batch, read);
-			read++;
-			if (status != DMI_STATUS_SUCCESS) {
-				/* If we're here because of busy count, dmi_busy_delay will
-				 * already have been increased and busy state will have been
-				 * cleared in dmi_read(). */
-				/* In at least some implementations, we issue a read, and then
-				 * can get busy back when we try to scan out the read result,
-				 * and the actual read value is lost forever. Since this is
-				 * rare in any case, we return error here and rely on our
-				 * caller to reread the entire block. */
-				LOG_WARNING("Batch memory read encountered DMI error %d. "
-						"Falling back on slower reads.", status);
-				riscv_batch_free(batch);
-				result = ERROR_FAIL;
-				goto error;
 			}
-			if (size > 4) {
+
+			/* Now read whatever we got out of the batch. */
+			dmi_status_t status = DMI_STATUS_SUCCESS;
+			unsigned read = 0;
+			assert(index >= 2);
+			for (unsigned j = index - 2; j < index + reads; j++) {
+				assert(j < count);
+				LOG_DEBUG("index=%d, reads=%d, next_index=%d, ignore_last=%d, j=%d",
+					index, reads, next_index, ignore_last, j);
+				if (j + 3 + ignore_last > next_index)
+					break;
+
 				status = riscv_batch_get_dmi_read_op(batch, read);
+				uint64_t value = riscv_batch_get_dmi_read_data(batch, read);
+				read++;
 				if (status != DMI_STATUS_SUCCESS) {
+						/* If we're here because of busy count, dmi_busy_delay will
+						* already have been increased and busy state will have been
+						* cleared in dmi_read(). */
+						/* In at least some implementations, we issue a read, and then
+						* can get busy back when we try to scan out the read result,
+						* and the actual read value is lost forever. Since this is
+						* rare in any case, we return error here and rely on our
+						* caller to reread the entire block. */
 					LOG_WARNING("Batch memory read encountered DMI error %d. "
 							"Falling back on slower reads.", status);
 					riscv_batch_free(batch);
 					result = ERROR_FAIL;
 					goto error;
 				}
-				value <<= 32;
-				value |= riscv_batch_get_dmi_read_data(batch, read);
-				read++;
+				if (size > 4) {
+					status = riscv_batch_get_dmi_read_op(batch, read);
+					if (status != DMI_STATUS_SUCCESS) {
+						LOG_WARNING("Batch memory read encountered DMI error %d. "
+								"Falling back on slower reads.", status);
+						riscv_batch_free(batch);
+						result = ERROR_FAIL;
+						goto error;
+					}
+					value <<= 32;
+					value |= riscv_batch_get_dmi_read_data(batch, read);
+					read++;
+				}
+				riscv_addr_t offset = j * size;
+				buf_set_u64(buffer + offset, 0, 8 * size, value);
+				log_memory_access(address + j * increment, value, size, true);
 			}
-			riscv_addr_t offset = j * size;
-			buf_set_u64(buffer + offset, 0, 8 * size, value);
-			log_memory_access(address + j * increment, value, size, true);
+			index = next_index;
+			riscv_batch_free(batch);
 		}
+	}
+	else {
+		unsigned index = 0;
+		while (index < count) {
+			riscv_addr_t read_addr = address + index * increment;
+			LOG_DEBUG("i=%d, count=%d, read_addr=0x%" PRIx64, index, count, read_addr);
+			/* The pipeline looks like this:
+			* memory -> s1 -> dm_data0 -> debugger
+			* Right now:
+			* s0 contains read_addr
+			* s1 contains mem[read_addr-size]
+			* dm_data0 contains[read_addr-size*2]
+			*/
 
-		index = next_index;
+			unsigned reads = 0;
+			for (unsigned j = index; j < count; j++) {
+				uint32_t data_0 = 0, data_1 = 0;
+				uint64_t dmi_data = 0;
+				if (size > 4)
+					dmi_read(target, &data_1, DM_DATA1);
 
-		riscv_batch_free(batch);
+				dmi_read(target, &data_0, DM_DATA0);
+				
+				dmi_data = (((uint64_t)data_1 << 32) | data_0);
+				riscv_addr_t offset = j * size;
+				buf_set_u64(buffer + offset, 0, 8 * size, dmi_data);
+				log_memory_access(address + (j * increment), dmi_data, size, true);
+				reads++;
+			}
+
+			/* Wait for the target to finish performing the last abstract command,
+			* and update our copy of cmderr. If we see that DMI is busy here,
+			* dmi_busy_delay will be incremented. */
+			uint32_t abstractcs;
+			if (dmi_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
+				return ERROR_FAIL;
+
+			while (get_field(abstractcs, DM_ABSTRACTCS_BUSY)) {
+				if (dmi_read(target, &abstractcs, DM_ABSTRACTCS) != ERROR_OK)
+					return ERROR_FAIL;
+			}
+			
+			info->cmderr = get_field(abstractcs, DM_ABSTRACTCS_CMDERR);
+
+			unsigned next_index;
+			switch (info->cmderr) {
+				case CMDERR_NONE:
+					LOG_DEBUG("successful (partial?) memory read");
+					next_index = index + reads;
+					break;
+				case CMDERR_BUSY:
+					LOG_DEBUG("memory read resulted in busy response");
+
+					increase_ac_busy_delay(target);
+					riscv013_clear_abstract_error(target);
+
+					dmi_write(target, DM_ABSTRACTAUTO, 0);
+					
+					/* Read the last valid data */
+					uint32_t dmi_data0 = 0, dmi_data1 = 0;
+					uint64_t value64 = 0;
+
+					/* This is definitely a good version of the value that we
+					* attempted to read when we discovered that the target was
+					* busy. */
+					if (dmi_read(target, &dmi_data0, DM_DATA0) != ERROR_OK)
+						goto error;
+
+					if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK) 
+						goto error;
+				
+					/* See how far we got, clobbering dmi_data0. */
+					if (increment == 0) {
+						uint64_t counter;
+						result = register_read_direct(target, &counter, GDB_REGNO_S2);
+						next_index = counter;
+					} else {
+						uint64_t next_read_addr;
+						result = register_read_direct(target, &next_read_addr,
+													GDB_REGNO_S0);
+						next_index = (next_read_addr - address) / increment;
+					}
+
+					if (result != ERROR_OK)
+						goto error;
+
+					value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
+					buf_set_u64(buffer + (next_index - 1) * size, 0, 8 * size, value64);
+					log_memory_access(address + (next_index - 1) * size, value64, size, true);
+
+					/* Restore the command, and execute it.
+					* Now DM_DATA0 contains the next value just as it would if no
+					* error had occurred. */
+					dmi_write_exec(target, DM_COMMAND, command, true);
+					next_index++;
+
+					dmi_write(target, DM_ABSTRACTAUTO,
+							1 << DM_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
+					break;
+				default:
+					LOG_DEBUG("error when reading memory, abstractcs=0x%08lx", (long)abstractcs);
+					riscv013_clear_abstract_error(target);
+					result = ERROR_FAIL;
+					goto error;
+			}
+			index = next_index;
+		}
 	}
 
 	dmi_write(target, DM_ABSTRACTAUTO, 0);
+	
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	* else use the ARM DAP configurations. */
+	if (target->has_dap == false) {
+		if (count > 1) {
+			/* Read the penultimate word. */
+			uint32_t dmi_data0, dmi_data1 = 0;
+			if (dmi_read(target, &dmi_data0, DM_DATA0) != ERROR_OK)
+				return ERROR_FAIL;
+			if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK)
+				return ERROR_FAIL;
+			uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
+			buf_set_u64(buffer + size * (count - 2), 0, 8 * size, value64);
+			log_memory_access(address + size * (count - 2), value64, size, true);
+		}
 
-	if (count > 1) {
-		/* Read the penultimate word. */
-		uint32_t dmi_data0, dmi_data1 = 0;
-		if (dmi_read(target, &dmi_data0, DM_DATA0) != ERROR_OK)
-			return ERROR_FAIL;
-		if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK)
-			return ERROR_FAIL;
-		uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
-		buf_set_u64(buffer + size * (count - 2), 0, 8 * size, value64);
-		log_memory_access(address + size * (count - 2), value64, size, true);
+		/* Read the last word. */
+		uint64_t value;
+		result = register_read_direct(target, &value, GDB_REGNO_S1);
+		if (result != ERROR_OK)
+			goto error;
+		buf_set_u64(buffer + size * (count-1), 0, 8 * size, value);
+		log_memory_access(address + size * (count-1), value, size, true);
 	}
-
-	/* Read the last word. */
-	uint64_t value;
-	result = register_read_direct(target, &value, GDB_REGNO_S1);
-	if (result != ERROR_OK)
-		goto error;
-	buf_set_u64(buffer + size * (count-1), 0, 8 * size, value);
-	log_memory_access(address + size * (count-1), value, size, true);
-
 	return ERROR_OK;
 
 error:
@@ -3668,60 +3870,106 @@ static int write_memory_bus_v1(struct target *target, target_addr_t address,
 	while (next_address < end_address) {
 		LOG_DEBUG("transferring burst starting at address 0x%" TARGET_PRIxADDR,
 				next_address);
+		/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+		 * else use the ARM DAP configurations. */
+		if (target->has_dap == false) {
+			struct riscv_batch *batch = riscv_batch_alloc(
+					target,
+					32,
+					info->dmi_busy_delay + info->bus_master_write_delay);
+			
+			if (!batch)
+				return ERROR_FAIL;
 
-		struct riscv_batch *batch = riscv_batch_alloc(
-				target,
-				32,
-				info->dmi_busy_delay + info->bus_master_write_delay);
-		if (!batch)
-			return ERROR_FAIL;
+			for (uint32_t i = (next_address - address) / size; i < count; i++) {
+				const uint8_t *p = buffer + i * size;
 
-		for (uint32_t i = (next_address - address) / size; i < count; i++) {
-			const uint8_t *p = buffer + i * size;
+				if (riscv_batch_available_scans(batch) < (size + 3) / 4)
+					break;
 
-			if (riscv_batch_available_scans(batch) < (size + 3) / 4)
-				break;
-
-			if (size > 12)
-				riscv_batch_add_dmi_write(batch, DM_SBDATA3,
+				if (size > 12)
+					riscv_batch_add_dmi_write(batch, DM_SBDATA3,
 						((uint32_t) p[12]) |
 						(((uint32_t) p[13]) << 8) |
 						(((uint32_t) p[14]) << 16) |
 						(((uint32_t) p[15]) << 24));
-
-			if (size > 8)
-				riscv_batch_add_dmi_write(batch, DM_SBDATA2,
+				
+				if (size > 8)
+					riscv_batch_add_dmi_write(batch, DM_SBDATA2,
 						((uint32_t) p[8]) |
 						(((uint32_t) p[9]) << 8) |
 						(((uint32_t) p[10]) << 16) |
 						(((uint32_t) p[11]) << 24));
-			if (size > 4)
-				riscv_batch_add_dmi_write(batch, DM_SBDATA1,
+
+				if (size > 4) 
+					riscv_batch_add_dmi_write(batch, DM_SBDATA1,
 						((uint32_t) p[4]) |
 						(((uint32_t) p[5]) << 8) |
 						(((uint32_t) p[6]) << 16) |
 						(((uint32_t) p[7]) << 24));
-			uint32_t value = p[0];
-			if (size > 2) {
-				value |= ((uint32_t) p[2]) << 16;
-				value |= ((uint32_t) p[3]) << 24;
-			}
-			if (size > 1)
-				value |= ((uint32_t) p[1]) << 8;
-			riscv_batch_add_dmi_write(batch, DM_SBDATA0, value);
 
-			log_memory_access(address + i * size, value, size, false);
-			next_address += size;
+				uint32_t value = p[0];
+				if (size > 2) {
+					value |= ((uint32_t) p[2]) << 16;
+					value |= ((uint32_t) p[3]) << 24;
+				}
+				
+				if (size > 1)
+					value |= ((uint32_t) p[1]) << 8;
+				
+				riscv_batch_add_dmi_write(batch, DM_SBDATA0, value);
+
+				log_memory_access(address + i * size, value, size, false);
+				next_address += size;
+			}
+
+			/* Execute the batch of writes */
+			result = batch_run(target, batch);
+			riscv_batch_free(batch);
+			if (result != ERROR_OK)
+				return result;
+		}
+		else {
+			for (uint32_t i = (next_address - address) / size; i < count; i++) {
+				const uint8_t *p = buffer + i * size;
+
+				if (size > 12)
+					dmi_write(target, DM_SBDATA3, 
+						((uint32_t) p[12]) |
+						(((uint32_t) p[13]) << 8) |
+						(((uint32_t) p[14]) << 16) |
+						(((uint32_t) p[15]) << 24));
+				if (size > 8)
+					dmi_write(target, DM_SBDATA2,
+						((uint32_t) p[8]) |
+						(((uint32_t) p[9]) << 8) |
+						(((uint32_t) p[10]) << 16) |
+						(((uint32_t) p[11]) << 24));
+
+				if (size > 4)
+					dmi_write(target, DM_SBDATA1,
+						((uint32_t) p[4]) |
+						(((uint32_t) p[5]) << 8) |
+						(((uint32_t) p[6]) << 16) |
+						(((uint32_t) p[7]) << 24));
+						
+				uint32_t value = p[0];
+				if (size > 2) {
+					value |= ((uint32_t) p[2]) << 16;
+					value |= ((uint32_t) p[3]) << 24;
+				}
+				
+				if (size > 1)
+					value |= ((uint32_t) p[1]) << 8;
+				
+				dmi_write(target, DM_SBDATA0, value);
+				log_memory_access(address + i * size, value, size, false);
+				next_address += size;
+			}
 		}
 
-		/* Execute the batch of writes */
-		result = batch_run(target, batch);
-		riscv_batch_free(batch);
-		if (result != ERROR_OK)
-			return result;
-
 		/* Read sbcs value.
-		 * At the same time, detect if DMI busy has occurred during the batch write. */
+		* At the same time, detect if DMI busy has occurred during the batch write. */
 		bool dmi_busy_encountered;
 		if (dmi_op(target, &sbcs, &dmi_busy_encountered, DMI_OP_READ,
 				DM_SBCS, 0, false, true) != ERROR_OK)
@@ -3914,19 +4162,30 @@ static int write_memory_progbuf(struct target *target, target_addr_t address,
 
 				setup_needed = false;
 			} else {
-				if (size > 4)
-					riscv_batch_add_dmi_write(batch, DM_DATA1, value >> 32);
-				riscv_batch_add_dmi_write(batch, DM_DATA0, value);
-				if (riscv_batch_full(batch))
-					break;
+				/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+				 * else use the ARM DAP configurations. */
+				if (target->has_dap == false) {
+					if (size > 4)
+						riscv_batch_add_dmi_write(batch, DM_DATA1, value >> 32);
+					riscv_batch_add_dmi_write(batch, DM_DATA0, value);
+					if (riscv_batch_full(batch))
+						break;
+				}
+				else {
+					if (size > 4)
+						dmi_write(target, DM_DATA1, value >> 32); 
+					dmi_write(target, DM_DATA0, value);
+				}
 			}
 		}
-
-		result = batch_run(target, batch);
-		riscv_batch_free(batch);
-		if (result != ERROR_OK)
-			goto error;
-
+		/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 	 * else use the ARM DAP configurations. */
+		if (target->has_dap == false) {
+			result = batch_run(target, batch);
+			riscv_batch_free(batch);
+			if (result != ERROR_OK)
+				goto error;
+		}
 		/* Note that if the scan resulted in a Busy DMI response, it
 		 * is this read to abstractcs that will cause the dmi_busy_delay
 		 * to be incremented if necessary. */
@@ -4357,8 +4616,16 @@ int riscv013_write_debug_buffer(struct target *target, unsigned index, riscv_ins
 	if (!dm)
 		return ERROR_FAIL;
 	if (dm->progbuf_cache[index] != data) {
-		if (dmi_write(target, DM_PROGBUF0 + index, data) != ERROR_OK)
-			return ERROR_FAIL;
+		/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 	 * else use the ARM DAP configurations. */
+		if (target->has_dap == false) {
+			if (dmi_write(target, DM_PROGBUF0 + index, data) != ERROR_OK)
+				return ERROR_FAIL;
+		}
+		else {
+			if (dmi_write(target, DM_PROGBUF0 + (index * 4), data) != ERROR_OK)
+				return ERROR_FAIL;
+		}
 		dm->progbuf_cache[index] = data;
 	} else {
 		LOG_DEBUG("cache hit for 0x%" PRIx32 " @%d", data, index);
@@ -4369,7 +4636,12 @@ int riscv013_write_debug_buffer(struct target *target, unsigned index, riscv_ins
 riscv_insn_t riscv013_read_debug_buffer(struct target *target, unsigned index)
 {
 	uint32_t value;
-	dmi_read(target, &value, DM_PROGBUF0 + index);
+	/* If there is no ARM DAP, use the original RISC-V Debug Module configuration,
+	 * else use the ARM DAP configurations. */
+	if (target->has_dap == false)
+		dmi_read(target, &value, DM_PROGBUF0 + index);
+	else
+		dmi_read(target, &value, DM_PROGBUF0 + (index * 4));
 	return value;
 }
 

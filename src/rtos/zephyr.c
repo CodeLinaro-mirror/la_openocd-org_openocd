@@ -23,6 +23,7 @@
 #include "target/target_type.h"
 #include "target/armv7m.h"
 #include "target/arc.h"
+#include "target/riscv/riscv.h"
 
 #define UNIMPLEMENTED 0xFFFFFFFFU
 
@@ -105,6 +106,24 @@ static const struct stack_register_offset arc_callee_saved[] = {
 	{ ARC_FP,  56,  32 },
 	{ ARC_R30,  60,  32 }
 };
+
+static const struct stack_register_offset riscv_callee_saved[] = {
+    { GDB_REGNO_SP,  0x00, 32 }, 
+    { GDB_REGNO_RA,  0x04, 32 }, 
+    { GDB_REGNO_FP,  0x08, 32 },
+    { GDB_REGNO_S1,  0x0c, 32 },
+    { GDB_REGNO_S2,  0x10, 32 },
+    { GDB_REGNO_S3,  0x14, 32 },
+    { GDB_REGNO_S4,  0x18, 32 },
+    { GDB_REGNO_S5,  0x1c, 32 },
+    { GDB_REGNO_S6,  0x20, 32 },
+    { GDB_REGNO_S7,  0x24, 32 },
+    { GDB_REGNO_S8,  0x28, 32 },
+    { GDB_REGNO_S9,  0x2c, 32 },
+    { GDB_REGNO_S10, 0x30, 32 },
+    { GDB_REGNO_S11, 0x34, 32 },
+};
+
 static const struct rtos_register_stacking arm_callee_saved_stacking = {
 	.stack_registers_size = 36,
 	.stack_growth_direction = -1,
@@ -118,6 +137,15 @@ static const struct rtos_register_stacking arc_callee_saved_stacking = {
 	.num_output_registers = ARRAY_SIZE(arc_callee_saved),
 	.register_offsets = arc_callee_saved,
 };
+
+static const struct rtos_register_stacking riscv_callee_saved_stacking = {
+	.stack_registers_size   = 4 * ARRAY_SIZE(riscv_callee_saved),
+	.stack_growth_direction = -1,
+	.num_output_registers   = ARRAY_SIZE(riscv_callee_saved),
+	.calculate_process_stack = rtos_generic_stack_align8,
+	.register_offsets       = riscv_callee_saved,
+};
+
 
 static const struct stack_register_offset arm_cpu_saved[] = {
 	{ ARMV7M_R0,   0,  32 },
@@ -180,6 +208,41 @@ static struct stack_register_offset arc_cpu_saved[] = {
 	{ ARC_STATUS32,		 4,  32 }
 };
 
+static const struct stack_register_offset riscv_cpu_saved[] = {
+	{ GDB_REGNO_ZERO, -1, 32 },
+	{ GDB_REGNO_RA,   -1, 32 },
+	{ GDB_REGNO_SP,   -1, 32 },
+	{ GDB_REGNO_GP,   -1, 32 },
+	{ GDB_REGNO_TP,   -1, 32 },
+	{ GDB_REGNO_T0,   -1, 32 },
+	{ GDB_REGNO_T1,   -1, 32 },
+	{ GDB_REGNO_T2,   -1, 32 },
+	{ GDB_REGNO_FP,   -1, 32 },
+	{ GDB_REGNO_S1,   -1, 32 },
+	{ GDB_REGNO_A0,   -1, 32 },
+	{ GDB_REGNO_A1,   -1, 32 },
+	{ GDB_REGNO_A2,   -1, 32 },
+	{ GDB_REGNO_A3,   -1, 32 },
+	{ GDB_REGNO_A4,   -1, 32 },
+	{ GDB_REGNO_A5,   -1, 32 },
+	{ GDB_REGNO_A6,   -1, 32 },
+	{ GDB_REGNO_A7,   -1, 32 },
+	{ GDB_REGNO_S2,   -1, 32 },
+	{ GDB_REGNO_S3,   -1, 32 },
+	{ GDB_REGNO_S4,   -1, 32 },
+	{ GDB_REGNO_S5,   -1, 32 },
+	{ GDB_REGNO_S6,   -1, 32 },
+	{ GDB_REGNO_S7,   -1, 32 },
+	{ GDB_REGNO_S8,   -1, 32 },
+	{ GDB_REGNO_S9,   -1, 32 },
+	{ GDB_REGNO_S10,  -1, 32 },
+	{ GDB_REGNO_S11,  -1, 32 },
+	{ GDB_REGNO_T3,   -1, 32 },
+	{ GDB_REGNO_T4,   -1, 32 },
+	{ GDB_REGNO_T5,   -1, 32 },
+	{ GDB_REGNO_T6,   -1, 32 },
+	{ GDB_REGNO_PC,   -1, 32 },
+};
 
 enum zephyr_symbol_values {
 	ZEPHYR_VAL__KERNEL,
@@ -221,6 +284,15 @@ static struct rtos_register_stacking arc_cpu_saved_stacking = {
 	.num_output_registers = ARRAY_SIZE(arc_cpu_saved),
 	.register_offsets = arc_cpu_saved,
 };
+
+static const struct rtos_register_stacking riscv_cpu_saved_nofp_stacking = {
+	.stack_registers_size   = 4 * ARRAY_SIZE(riscv_cpu_saved),
+	.stack_growth_direction = -1,
+	.num_output_registers   = ARRAY_SIZE(riscv_cpu_saved),
+	.calculate_process_stack = rtos_generic_stack_align8,
+	.register_offsets       = riscv_cpu_saved,
+};
+
 
 /* ARCv2 specific implementation */
 static int zephyr_get_arc_state(struct rtos *rtos, target_addr_t *addr,
@@ -331,6 +403,79 @@ static int zephyr_get_arm_state(struct rtos *rtos, target_addr_t *addr,
 	return 0;
 }
 
+/* RISC-V specific implementation */
+static int zephyr_get_riscv_state(struct rtos *rtos, target_addr_t *addr,
+			 struct zephyr_params *params,
+			 struct rtos_reg *callee_saved_reg_list,
+			 struct rtos_reg **reg_list, int *num_regs)
+{
+	int retval = 0;
+	int num_callee_saved_regs;
+	const struct rtos_register_stacking *stacking;
+	int ra_offset = -1, pc_offset = -1;
+
+	/* Getting callee registers */
+	retval = rtos_generic_stack_read(rtos->target,
+			params->callee_saved_stacking,
+			*addr, &callee_saved_reg_list,
+			&num_callee_saved_regs);
+	if (retval != ERROR_OK){
+		LOG_ERROR("Failed to Get callee registers");
+		return retval;
+	}
+	
+		/* Getting stack address from Kernel thread struct */
+	*addr = target_buffer_get_u32(rtos->target,
+			callee_saved_reg_list[0].value);
+
+	stacking = params->cpu_saved_nofp_stacking;
+
+	/* Determine which stacking to use (FP or no FP) */
+	if (params->offsets[OFFSET_T_PREEMPT_FLOAT] != UNIMPLEMENTED) {
+		stacking = params->cpu_saved_fp_stacking;
+	}
+
+	/* Read CPU-saved registers */
+	retval = rtos_generic_stack_read(rtos->target, stacking, *addr, reg_list,
+			num_regs);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("Failed to read CPU-saved registers");
+		return retval;
+	}
+
+	for (int i = 0; i < num_callee_saved_regs; i++)
+		buf_cpy(callee_saved_reg_list[i].value,
+			(*reg_list)[callee_saved_reg_list[i].number].value,
+			callee_saved_reg_list[i].size);
+	
+	
+	/* Find RA and PC register offsets in the register list and copy RA to PC */
+	for (int i = 0; i < *num_regs; i++) {
+		if ((*reg_list)[i].number == GDB_REGNO_RA)
+			ra_offset = i;
+		else if ((*reg_list)[i].number == GDB_REGNO_PC)
+			pc_offset = i;
+		
+		/* Early exit if both registers found */
+		if (ra_offset >= 0 && pc_offset >= 0)
+			break;
+	}
+
+	if (ra_offset < 0 || pc_offset < 0) {
+		LOG_ERROR("RA or PC register not found in register list");
+		return ERROR_FAIL;
+	}
+
+	/* Copy RA value into PC (similar to ARC blink->PC) */
+	buf_cpy((*reg_list)[ra_offset].value,
+		(*reg_list)[pc_offset].value,
+		sizeof((*reg_list)[ra_offset].value));
+
+	LOG_DEBUG("Set PC to RA value");
+
+	return ERROR_OK;
+}
+
 static struct zephyr_params zephyr_params_list[] = {
 	{
 		.target_name = "cortex_m",
@@ -363,6 +508,14 @@ static struct zephyr_params zephyr_params_list[] = {
 		.callee_saved_stacking = &arc_callee_saved_stacking,
 		.cpu_saved_nofp_stacking = &arc_cpu_saved_stacking,
 		.get_cpu_state = &zephyr_get_arc_state,
+	},
+	{ 
+		.target_name = "riscv",
+		.pointer_width = 4,
+		.num_offsets = 0,
+		.callee_saved_stacking = &riscv_callee_saved_stacking,
+		.cpu_saved_nofp_stacking = &riscv_cpu_saved_nofp_stacking,
+		.get_cpu_state = &zephyr_get_riscv_state,
 	},
 	{
 		.target_name = NULL
